@@ -1,0 +1,75 @@
+# Edit every /home/ubuntu/twitch-sr-bot path below (WorkingDirectory,
+# Environment PATH/DENO_DIR, ExecStart, ReadWritePaths) to wherever you
+# actually checked this out, and User= to the account that should run it,
+# before installing this unit.
+
+[Unit]
+Description=Twitch Song-Request Bot
+After=network.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/twitch-sr-bot
+Environment="PATH=/home/ubuntu/twitch-sr-bot/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin"
+Environment="PYTHONMALLOC=malloc"
+# ProtectHome=read-only below blocks Deno's default cache dir (normally
+# under $HOME/.cache/deno) — redirected under data/, the one place this
+# unit can actually write, so it doesn't need to fall back to re-fetching/
+# recompiling on every run. Harmless if Node/Bun/QuickJS is used instead.
+Environment="DENO_DIR=/home/ubuntu/twitch-sr-bot/data/deno-cache"
+# No EnvironmentFile= for .env on purpose. config.py already loads it via
+# python-dotenv, so systemd reading it too would be pure duplication — and
+# the two parsers don't agree: systemd treats the whole unit as failed-to-
+# start on a line it can't parse and handles quoting differently, so a
+# .env that works fine when the bot is run by hand can make the service
+# refuse to start with a message that points at systemd rather than at the
+# file. Anything that genuinely must be in the unit's own environment
+# belongs in an Environment= line above (see DENO_DIR).
+ExecStart=/home/ubuntu/twitch-sr-bot/.venv/bin/python /home/ubuntu/twitch-sr-bot/bot.py
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+OOMScoreAdjust=-100
+LimitNOFILE=65536
+
+# Cgroup-level ceiling, independent of OOMScoreAdjust above (which only
+# affects the *global* OOM-killer's priority, not what happens if this
+# unit alone runs away) — protects the rest of a small box (Oracle Free
+# Tier) from a stuck ffmpeg/yt-dlp/Deno subprocess.
+# MemoryHigh throttles (reclaims memory, slows the process) before
+# MemoryMax hits and the kernel OOM-kills it outright. Tune both to the
+# box: these are conservative starting points, not a hard requirement —
+# raise them if the service gets killed under normal (not runaway) load.
+MemoryHigh=512M
+MemoryMax=768M
+CPUQuota=150%
+
+# No MemoryDenyWriteExecute and no SystemCallFilter: yt-dlp needs a working
+# V8 JS runtime (Deno by default) for YouTube, and both directives break it.
+# MDWE: Deno panics on ENOMEM on its very first script under it.
+# SystemCallFilter=@system-service: confirmed directly under this exact unit
+# — Deno's JS-challenge solver died with SIGSYS (-31) under it, surfacing as
+# an unrelated-looking yt-dlp error ("Requested format is not available").
+# Worked outside systemd, and under systemd-run without this directive.
+# Both would break song requests outright, so both stay off.
+ProtectSystem=full
+PrivateTmp=yes
+NoNewPrivileges=yes
+ProtectHome=read-only
+# Only data/ and logs/ are writable — everything this process persists
+# (tokens, tunables, toggles) lives under data/.
+ReadWritePaths=/home/ubuntu/twitch-sr-bot/data /home/ubuntu/twitch-sr-bot/logs
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=multi-user.target

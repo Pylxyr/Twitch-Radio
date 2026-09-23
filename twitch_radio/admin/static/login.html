@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<meta name="robots" content="noindex, nofollow">
+<title>Twitch Radio · Sign in</title>
+<link rel="icon" type="image/png" href="/logo.png?s=32">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<style>${css}</style>
+</head><body>
+<main class="wrap">
+  <form class="card" id="login-form" method="post" action="/login" autocomplete="on">
+    <header class="brand">
+      ${logo}
+      <div class="eq" id="eq" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div>
+    </header>
+    <h1>Sign in</h1>
+    <p class="lede">Settings and community tools for your radio.</p>
+
+    ${notice}
+
+    <input type="hidden" name="next" value="${next}">
+    <input class="ghost" type="text" name="username" value="settings" autocomplete="username"
+           tabindex="-1" aria-hidden="true">
+
+    <div class="field">
+      <label for="password">Password</label>
+      <div class="pw">
+        <input id="password" name="password" type="password" autocomplete="current-password"
+               required autofocus maxlength="1024" ${disabled}>
+        <button type="button" class="reveal" id="reveal" aria-controls="password" aria-pressed="false">Show</button>
+      </div>
+    </div>
+
+    ${remember}
+
+    <button type="submit" class="go" id="go" data-retry="${retry_seconds}" ${disabled}>Sign in</button>
+  </form>
+</main>
+<script>${js}</script>
+</body></html>
