@@ -139,7 +139,7 @@ Add two sources to your scene:
 
 | Source type | Value |
 |---|---|
-| **Media Source** (uncheck "Local File") | `http://127.0.0.1:8098/stream.mp3` |
+| **Media Source** (uncheck "Local File") | `http://127.0.0.1:8098/stream.opus` |
 | **Browser Source** | `http://127.0.0.1:8098/overlay` |
 
 ---
@@ -155,10 +155,56 @@ Add two sources to your scene:
   > check Task Manager for stray `ffmpeg.exe` / `python.exe` processes.
 
 - **Settings** (cooldowns, queue size, radio autoplay): visit
-  `http://127.0.0.1:8098/settings` while it's running.
+  `http://127.0.0.1:8098/settings` while it's running — see below for
+  whether you need a password for it.
 - **Chat commands:** `!sr`, `!queue`, `!position`, `!remove`,
   `!nowplaying`, `!skip`, `!voteskip`, `!radio` — mods also get
   `!pause`/`!resume`.
+
+---
+
+## Optional: password-protect `/settings`
+
+By default `/settings` has no password, and that's fine as long as the
+bot, OBS, and the browser you use to open `/settings` all stay on this
+one PC — the server only accepts connections from itself.
+
+| If you want to... | Do this in `.env` |
+|---|---|
+| Keep things as they are (recommended) | Leave `TWITCH_SETTINGS_PASSWORD` and `TWITCH_NOWPLAYING_HOST` blank |
+| Reach `/settings` from your phone or another PC on the same network | Set `TWITCH_NOWPLAYING_HOST=0.0.0.0`, **and** set a password (below) |
+
+The moment `/settings` is reachable off this PC, the bot requires a
+password and simply refuses to serve the page without one — it won't
+silently run unprotected.
+
+**To set a password:** double-click **`hash-password.bat`**, type a
+password when asked, and copy the `scrypt:...` line it prints into `.env`:
+
+```
+TWITCH_SETTINGS_PASSWORD=scrypt:...
+```
+
+This stores a hash, not the password itself — safer than pasting the
+plain password into `.env` directly (which also works, just isn't as
+safe if someone else can open that file).
+
+There's also `TWITCH_SETTINGS_ALLOW_OPEN=true`, which lets `/settings`
+run with no password even when reachable off this PC. Only use that on a
+network you fully trust — anyone on it could change your settings.
+
+---
+
+## Optional: a few other `.env` settings
+
+| Setting | What it does |
+|---|---|
+| `AUDIO_BITRATE_KBPS` | Stream quality (Opus), default `160`. That's already comfortably transparent — no real reason to go above `192`. |
+| `PAUSE_QUEUE_WHEN_NO_LISTENERS` | Set to `true` so the queue stops advancing while OBS isn't connected — songs won't quietly play through while you're offline. |
+| `TWITCH_NOWPLAYING_PORT` | Change if `8098` is already used by something else on this PC. |
+
+Everything else in `.env` has a comment above it explaining what it's
+for — safe to leave alone unless you have a specific reason to change it.
 
 ---
 
