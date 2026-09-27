@@ -30,7 +30,7 @@ _ROUTES: tuple[tuple[str, str, _Handler], ...] = (
     ("GET", "/overlay", live.handle_overlay),
     ("GET", "/logo.png", live.handle_logo),
     ("GET", "/thumb-proxy", media.handle_thumb_proxy),
-    ("GET", "/stream.mp3", media.handle_stream),
+    ("GET", "/stream.opus", media.handle_stream),
     ("GET", "/login", login.handle_login_get),
     ("POST", "/login", login.handle_login_post),
     ("POST", "/logout", login.handle_logout),
@@ -135,7 +135,7 @@ async def run_admin_server(
         await thumb_session.close()
         raise
     log.info(
-        "Admin server listening on http://%s:%d (/stream.mp3, /overlay, "
+        "Admin server listening on http://%s:%d (/stream.opus, /overlay, "
         "/nowplaying.json, /ws/nowplaying, /healthz, /logo.png, /login, /settings)",
         host,
         port,
