@@ -1,4 +1,4 @@
-"""Routes that move bytes: the continuous MP3 stream and the thumbnail relay."""
+"""Routes that move bytes: the continuous Opus stream and the thumbnail relay."""
 
 from __future__ import annotations
 
@@ -105,7 +105,7 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
     ctx = get_ctx(request)
     response = web.StreamResponse(
         status=200,
-        headers={"Content-Type": "audio/mpeg", "Cache-Control": "no-cache"},
+        headers={"Content-Type": "audio/ogg", "Cache-Control": "no-cache"},
     )
     await response.prepare(request)
     queue = ctx.player.subscribe()
