@@ -20,7 +20,7 @@ _CHUNK_DURATION = 0.1
 _CHUNK_BYTES = int(AUDIO_RATE * AUDIO_CHANNELS * 2 * _CHUNK_DURATION)
 _SILENCE_CHUNK = b"\x00" * _CHUNK_BYTES
 _STREAM_CHUNK_BYTES = 8192
-_SUBSCRIBER_QUEUE_SIZE = 50  # ~5-10s of MP3 at typical bitrates; a stalled listener gets dropped, not buffered forever
+_SUBSCRIBER_QUEUE_SIZE = 50  # ~5-10s of Opus at typical bitrates; a stalled listener gets dropped, not buffered forever
 
 _MIN_BACKOFF = 5.0
 _MAX_BACKOFF = 300.0
@@ -141,7 +141,7 @@ class _PreparedNext:
 
 
 class RadioPlayer:
-    """Owns one persistent ffmpeg encoder producing a continuous MP3 stream
+    """Owns one persistent ffmpeg encoder producing a continuous Opus stream
     from resolved tracks + silence between them, fanned out to any number of
     HTTP subscribers (see subscribe()/unsubscribe()) — e.g. an OBS Media
     Source. Nothing is pushed anywhere on its own; playback only happens
@@ -556,14 +556,18 @@ class RadioPlayer:
         cmd = [
             "ffmpeg", "-hide_banner", "-loglevel", "error",
             "-f", "s16le", "-ar", str(AUDIO_RATE), "-ac", str(AUDIO_CHANNELS), "-i", "-",
-            "-c:a", "libmp3lame", "-b:a", f"{self._audio_bitrate_kbps}k",
-            "-id3v2_version", "0", "-write_xing", "0",  # no tags/duration header on an infinite live stream
-            "-f", "mp3", "-",
+            # Opus over Ogg: Opus beats MP3 at the same bitrate (transparent
+            # well under half MP3's bitrate — see AUDIO_BITRATE_KBPS in
+            # .env), and Ogg is natively built for exactly this — an
+            # unbounded live stream muxed page-by-page — where MP3 only
+            # ever worked by omitting the tags/duration header it expects.
+            "-c:a", "libopus", "-b:a", f"{self._audio_bitrate_kbps}k", "-vbr", "on",
+            "-f", "ogg", "-",
         ]
         self._encoder = await asyncio.create_subprocess_exec(
             *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE
         )
-        log.info("Audio encoder started (%dkbps MP3).", self._audio_bitrate_kbps)
+        log.info("Audio encoder started (%dkbps Opus).", self._audio_bitrate_kbps)
 
     async def _pump_encoder_output(self) -> None:
         assert self._encoder is not None and self._encoder.stdout is not None
