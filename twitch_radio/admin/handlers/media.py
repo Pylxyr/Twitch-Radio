@@ -108,7 +108,12 @@ async def handle_stream(request: web.Request) -> web.StreamResponse:
         headers={"Content-Type": "audio/ogg", "Cache-Control": "no-cache"},
     )
     await response.prepare(request)
+    # Subscribe first, then replay the current Ogg header pages so this
+    # listener's stream is decodable from byte one.
     queue = ctx.player.subscribe()
+    header = ctx.player.ogg_header_snapshot()
+    if header:
+        await response.write(header)
     try:
         while True:
             chunk = await queue.get()
