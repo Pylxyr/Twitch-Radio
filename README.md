@@ -15,15 +15,53 @@ This guide assumes no prior setup. It takes about 15–20 minutes.
 
 ## 1. Install the prerequisites
 
-You need three things on your PC before the bot will run. Install all three,
-then **open a brand-new Command Prompt window** (the PATH changes below
-won't be picked up by a window that was already open).
+You need **Python**, **ffmpeg**, and **Deno** on your PC before the bot
+will run. The easiest way to get the latter two is **winget**, Windows'
+built-in package manager, so confirm that works first.
+
+### First, confirm winget works
+
+Windows 10 (version 1809 or later, fully updated) and Windows 11 come with
+winget built in, but it's occasionally missing or out of date. Open
+**Command Prompt** (Windows Search → type `cmd` → Enter) and run:
+
+```
+winget --version
+```
+
+- **Prints a version number** (e.g. `v1.7.10582`) → you're set, skip to
+  ffmpeg below.
+- **"winget is not recognized"** → open the **Microsoft Store** app,
+  search for **"App Installer"**, and click **Get** (or **Update**, if it's
+  already listed) — winget ships inside that package. Close and reopen
+  Command Prompt afterward and try `winget --version` again.
+- **Still not recognized** (older Windows 10, or the Store is disabled on
+  this PC) → download the latest `.msixbundle` from
+  https://github.com/microsoft/winget-cli/releases/latest, double-click it
+  to install, then try again in a new Command Prompt window.
+
+If none of that gets winget working, that's fine — every winget command
+below has a manual fallback step right after it, so you can skip winget
+entirely and install ffmpeg/Deno by hand instead.
+
+One more thing worth having: an account with **administrator rights** on
+this PC (most personal Windows accounts already are). If any install
+command below fails with a permissions error, right-click Command Prompt
+in the Start menu and choose **"Run as administrator"**, then retry it.
+
+Once winget is sorted (or you've decided to skip it), install the other
+three. After each one, **open a brand-new Command Prompt window** before
+checking it worked — PATH changes don't apply to a window that was already
+open.
 
 ### Python 3.11 or newer
 
 Download from **https://www.python.org/downloads/** and run the installer.
 On the very first screen, tick **"Add python.exe to PATH"** before clicking
-Install — this is the most common thing people miss.
+Install — this is the most common thing people miss. (Alternatively, if
+winget is working: `winget install --id=Python.Python.3.12 -e`.)
+
+Open a new Command Prompt and run `python --version` to confirm it works.
 
 ### FFmpeg (does the actual audio decoding)
 
