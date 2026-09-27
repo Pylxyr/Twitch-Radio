@@ -21,6 +21,34 @@ _CHUNK_BYTES = int(AUDIO_RATE * AUDIO_CHANNELS * 2 * _CHUNK_DURATION)
 _SILENCE_CHUNK = b"\x00" * _CHUNK_BYTES
 _STREAM_CHUNK_BYTES = 8192
 _SUBSCRIBER_QUEUE_SIZE = 50  # ~5-10s of Opus at typical bitrates; a stalled listener gets dropped, not buffered forever
+# Sanity ceiling on captured Ogg header bytes (see _pump_encoder_output).
+_MAX_OGG_HEADER_BYTES = 65536
+
+
+def _iter_ogg_pages(buf: bytes) -> tuple[list[bytes], bytes]:
+    """Split complete Ogg pages off the front of `buf`; return them plus
+    whatever incomplete tail is left."""
+    pages: list[bytes] = []
+    pos = 0
+    n = len(buf)
+    while True:
+        if n - pos < 27 or buf[pos:pos + 4] != b"OggS":
+            break
+        segment_count = buf[pos + 26]
+        header_len = 27 + segment_count
+        if n - pos < header_len:
+            break
+        body_len = sum(buf[pos + 27:pos + header_len])
+        page_len = header_len + body_len
+        if n - pos < page_len:
+            break
+        pages.append(buf[pos:pos + page_len])
+        pos += page_len
+    return pages, buf[pos:]
+
+
+def _ogg_page_granule(page: bytes) -> int:
+    return int.from_bytes(page[6:14], "little", signed=True)
 
 _MIN_BACKOFF = 5.0
 _MAX_BACKOFF = 300.0
@@ -192,6 +220,10 @@ class RadioPlayer:
         self._notify_failure: Callable[[str], Awaitable[None]] | None = None
         self._duration_limit_getter: Callable[[], Awaitable[int]] | None = None
         self._subscribers: set[asyncio.Queue[bytes]] = set()
+        # Ogg ID/comment header pages for the current encoder session —
+        # replayed to new subscribers in handle_stream(). See ogg_header_snapshot().
+        self._ogg_header_bytes: bytes = b""
+        self._ogg_header_ready: bool = False
         # Cleared every time a new request becomes active (see _play_one),
         # so votes never carry over from one song to the next.
         self._skip_votes: set[int] = set()
@@ -329,6 +361,10 @@ class RadioPlayer:
 
     def unsubscribe(self, q: asyncio.Queue[bytes]) -> None:
         self._subscribers.discard(q)
+
+    def ogg_header_snapshot(self) -> bytes:
+        """Current session's Ogg header pages, or empty if not captured yet."""
+        return self._ogg_header_bytes if self._ogg_header_ready else b""
 
     def subscribe_state(self) -> asyncio.Queue[None]:
         """A queue that receives a wakeup (no payload) every time now-
@@ -572,6 +608,10 @@ class RadioPlayer:
     async def _pump_encoder_output(self) -> None:
         assert self._encoder is not None and self._encoder.stdout is not None
         stdout = self._encoder.stdout
+        # Reset per session — a restarted ffmpeg is a new logical bitstream.
+        self._ogg_header_bytes = b""
+        self._ogg_header_ready = False
+        header_parse_buf = b""
         while True:
             chunk = await stdout.read(_STREAM_CHUNK_BYTES)
             if not chunk:
@@ -582,6 +622,19 @@ class RadioPlayer:
                 # encoder failure, with a log line explaining why.
                 returncode = self._encoder.returncode if self._encoder is not None else None
                 raise RuntimeError(f"Encoder stdout closed unexpectedly (exit code {returncode})")
+            if not self._ogg_header_ready:
+                header_parse_buf += chunk
+                pages, header_parse_buf = _iter_ogg_pages(header_parse_buf)
+                for page in pages:
+                    if _ogg_page_granule(page) == 0:
+                        self._ogg_header_bytes += page
+                    else:
+                        self._ogg_header_ready = True
+                        break
+                if len(self._ogg_header_bytes) > _MAX_OGG_HEADER_BYTES:
+                    self._ogg_header_ready = True
+                if self._ogg_header_ready:
+                    header_parse_buf = b""
             for q in list(self._subscribers):
                 try:
                     q.put_nowait(chunk)
@@ -1020,10 +1073,8 @@ class RadioPlayer:
             self._now_playing = None
 
     async def _announce_now_playing(self, request: QueuedRequest, track: Track) -> None:
-        title_and_artist = f"{track.title} - {track.uploader}" if track.uploader else track.title
         if request.requester_id == 0:
-            # Radio-mix autoplay — see radio.py's RadioSuggester.
-            message = f"Now Playing: {title_and_artist}"
+            message = f"Now Playing: {track.title}"
         else:
-            message = f"{request.requester_name}'s song request is Now Playing: {title_and_artist}"
+            message = f"{request.requester_name}'s song request is Now Playing: {track.title}"
         await self._notify(message)
