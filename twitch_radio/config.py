@@ -130,13 +130,13 @@ class Settings:
     # Audio
     audio_bitrate_kbps: int
     # If True, don't start a new track while nobody's subscribed to
-    # /stream.mp3 — holds at the current boundary and resumes once someone
+    # /stream.opus — holds at the current boundary and resumes once someone
     # (re)connects. A track already playing finishes normally either way.
     # Off by default (the queue has always run on a real-time clock
     # regardless of listeners); opt in via PAUSE_QUEUE_WHEN_NO_LISTENERS=true.
     pause_when_no_listeners: bool
 
-    # Local HTTP surface — serves /stream.mp3, /overlay, /nowplaying.json, /settings
+    # Local HTTP surface — serves /stream.opus, /overlay, /nowplaying.json, /settings
     nowplaying_host: str
     nowplaying_port: int
     settings_password: str | None
@@ -256,7 +256,7 @@ def load_settings() -> Settings:
         owner_id=owner_id,
         # Not read from the environment — this bot only ever answers to "!".
         prefix="!",
-        audio_bitrate_kbps=_clamped_int_env("AUDIO_BITRATE_KBPS", 128, 64, 320),
+        audio_bitrate_kbps=_clamped_int_env("AUDIO_BITRATE_KBPS", 160, 64, 256),
         pause_when_no_listeners=_bool_env("PAUSE_QUEUE_WHEN_NO_LISTENERS", False),
         nowplaying_host=nowplaying_host,
         nowplaying_port=_clamped_int_env("TWITCH_NOWPLAYING_PORT", 8098, 1024, 65535),
