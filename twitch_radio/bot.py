@@ -128,9 +128,26 @@ async def _async_run(settings: Settings) -> None:
                 _bg_tasks.add(task)
                 task.add_done_callback(_bg_tasks.discard)
 
-            for sig in (signal.SIGTERM, signal.SIGINT):
-                with contextlib.suppress(NotImplementedError):
+            # SIGBREAK (Ctrl+Break in a console) only exists on Windows.
+            shutdown_signals = [signal.SIGTERM, signal.SIGINT]
+            if hasattr(signal, "SIGBREAK"):
+                shutdown_signals.append(signal.SIGBREAK)
+            for sig in shutdown_signals:
+                try:
+                    # add_signal_handler is the clean asyncio-native path,
+                    # but only the Unix event loop implements it — Windows'
+                    # ProactorEventLoop always raises NotImplementedError.
                     loop.add_signal_handler(sig, _handle_shutdown_signal, sig)
+                except NotImplementedError:
+                    # Windows fallback: plain `signal` still delivers
+                    # SIGINT/SIGTERM/SIGBREAK, just outside the loop's own
+                    # callback machinery — hand off via call_soon_threadsafe
+                    # so the handler still runs as a normal loop callback
+                    # instead of inside the raw signal frame.
+                    with contextlib.suppress(ValueError):
+                        signal.signal(
+                            sig, lambda signum, frame: loop.call_soon_threadsafe(_handle_shutdown_signal, signum)
+                        )
 
             async with bot:
                 await bot.start()
@@ -216,6 +233,17 @@ def _check_config() -> int:
     if shutil.which("ffmpeg") is None:
         print("Config check FAILED: ffmpeg not found on PATH.")
         return 1
+
+    # Non-fatal: quickjs (bundled with yt-dlp) covers the fast path, but
+    # the fallback resolve still needs a real JS runtime on PATH — deno by
+    # default, or whatever YTDLP_JS_RUNTIME_NAME/PATH points at instead.
+    js_runtime = settings.ytdlp_js_runtime_path or settings.ytdlp_js_runtime_name
+    if shutil.which(js_runtime) is None:
+        print(
+            f"WARNING: {js_runtime!r} not found on PATH — yt-dlp needs it to resolve "
+            "YouTube links once quickjs's fast path can't. Install it, or point "
+            "YTDLP_JS_RUNTIME_PATH at it in .env."
+        )
 
     # Deliberately never prints client_secret or settings_password.
     print("Config OK:")

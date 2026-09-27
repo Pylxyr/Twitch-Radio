@@ -7,8 +7,8 @@ from typing import Any
 log = logging.getLogger(__name__)
 
 # Single source of truth for each tunable's valid range — shared by the
-# /settings form (admin/render/settings_page.py), the chat !setlimit command (chatbot.py),
-# and from_dict()'s own clamp below, so all three enforce identical limits.
+# /settings form (admin/render/settings_page.py) and from_dict()'s own
+# clamp below, so both enforce identical limits.
 TUNABLE_BOUNDS: dict[str, tuple[int, int]] = {
     "max_pending_per_chatter": (1, 10),
     "request_cooldown_seconds": (0, 3600),

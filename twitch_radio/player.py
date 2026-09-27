@@ -5,10 +5,10 @@ import contextlib
 import logging
 import shutil
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Protocol
+from typing import Any, Protocol
 
 from twitch_radio.models import Track
 
@@ -33,13 +33,40 @@ _DECODER_START_TIMEOUT = 20.0
 # chunks normally arrive every _CHUNK_DURATION via ffmpeg's -re pacing, so
 # a real gap that long means the source is actually stuck.
 _STALL_TIMEOUT_SECONDS = 20.0
-# How long before a track ends to pre-resolve what's next (see
-# _prefetch_next_when_close) — comfortably above the ~8-18s a warm resolve
-# takes, so it lands inside Resolver's TTL cache before it's needed for
-# real. Without this, a queue backlog outliving YTDLP_CACHE_TTL_SECONDS
-# turns every transition into a full cold resolve — audible silence
-# mid-stream, not just at startup.
+# How long before a track ends to resolve the next one (network-only —
+# no decoder yet, see _DECODER_PREP_LEAD_SECONDS below) so the actual
+# resolve latency (~8-18s) is paid ahead of time rather than as part of
+# the transition.
 _PREFETCH_LEAD_SECONDS = 20.0
+# How long before a track ends to spawn the next decoder and read its
+# first chunk — deliberately much shorter than _PREFETCH_LEAD_SECONDS.
+# ffmpeg's -re paces its *own* clock from the moment it's spawned, not
+# from whenever we first read its output: a decoder spawned a full 20s
+# early would sit idle that whole time yet still believe, by -re's own
+# clock, that up to 20s of the track had already gone by — on a 3-4
+# minute track that's a small, unnoticeable trim off the very end; on a
+# short one it's the difference between "plays" and "skips itself
+# entirely" (caught by hand: a synthetic 3s test track was reduced to
+# under half a second of actual audio). Small enough that the same drift
+# here is negligible, comfortably above the sub-second ffmpeg spawn +
+# first-chunk time it needs to cover.
+_DECODER_PREP_LEAD_SECONDS = 3.0
+
+
+def _decoder_cmd(stream_url: str) -> list[str]:
+    return [
+        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        # Reconnect flags recover from a dropped/hiccuping CDN connection
+        # instead of corrupting the stream — including one that's gone
+        # idle while a prepared-ahead decoder sat waiting for its turn to
+        # play. -probesize/-analyzeduration skip ffmpeg's default
+        # multi-second format probe, cutting startup latency.
+        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+        "-reconnect_on_network_error", "1", "-reconnect_on_http_error", "429,500,502,503,504",
+        "-probesize", "128k", "-analyzeduration", "0",
+        "-re", "-i", stream_url,
+        "-f", "s16le", "-ar", str(AUDIO_RATE), "-ac", str(AUDIO_CHANNELS), "-",
+    ]
 
 
 class TrackResolver(Protocol):
@@ -61,13 +88,18 @@ class QueuedRequest:
     requester_id: int
     requester_name: str
     title: str = ""
-    # Uploader/channel as reported by the resolve. Carried here so !block
-    # <uploader> can purge already-queued entries like !block <url> does,
-    # without re-resolving every pending request just to find out who
-    # uploaded it. Empty string when unknown.
+    # Uploader/channel as reported by the resolve — shown in chat
+    # announcements and available for matching already-queued entries by
+    # uploader without a re-resolve (e.g. a future block-list). Empty
+    # string when unknown.
     uploader: str = ""
     cancelled: bool = False
     on_start: Callable[[], None] | None = field(default=None, repr=False)
+    # Only ever True on the resumed-track entry pause() builds — lets
+    # _feed_loop start it immediately even if _pause_when_no_listeners
+    # would otherwise defer, so an explicit !resume unambiguously resumes
+    # rather than silently staying paused because nobody's connected yet.
+    bypass_listener_pause: bool = False
 
 
 class PlayerState(str, Enum):
@@ -92,6 +124,20 @@ class NowPlaying:
     webpage_url: str
     started_at: float
     duration: int
+
+
+@dataclass(slots=True)
+class _PreparedNext:
+    """A track resolved, decoded, and already producing audio ahead of
+    time — built by _prepare_ahead() while the current track is still
+    playing, so the transition to it can hand off with no silence gap.
+    Discarded (decoder killed) if it turns out not to be what plays next
+    — see _feed_loop's use of it."""
+
+    request: QueuedRequest
+    track: Track
+    decoder: asyncio.subprocess.Process
+    first_chunk: bytes
 
 
 class RadioPlayer:
@@ -119,7 +165,13 @@ class RadioPlayer:
         self._prefetch_enabled = prefetch_enabled
         self._prefetch_task: asyncio.Task[None] | None = None
 
-        self._queue: asyncio.Queue[QueuedRequest] = asyncio.Queue()
+        # The one structure representing the queue's play order — also
+        # what !queue, !position and the overlay read directly. (Used to
+        # be split across this list plus a separate asyncio.Queue kept in
+        # sync by convention; collapsing them removes a real class of bugs
+        # from the two staying out of sync, and lets enqueue() reorder a
+        # real request ahead of trailing radio-mix filler, which a FIFO
+        # asyncio.Queue can't do.)
         self._pending: list[QueuedRequest] = []
         self._task: asyncio.Task[None] | None = None
         self._encoder: asyncio.subprocess.Process | None = None
@@ -153,7 +205,12 @@ class RadioPlayer:
         self._radio_enabled_getter: Callable[[], Awaitable[bool]] | None = None
         self._last_played_webpage_url: str | None = None
         self._radio_fill_task: asyncio.Task[None] | None = None
-        self._radio_fill_failed_at: float = 0.0
+        # -inf, not 0.0: "no failure yet" must never look like "failed
+        # right at boot" — time.monotonic() is seconds-since-boot on
+        # Linux, so a literal 0.0 here would wrongly block the very first
+        # radio-mix attempt on any system still under
+        # _RADIO_RETRY_BACKOFF_SECONDS of uptime when the bot starts.
+        self._radio_fill_failed_at: float = float("-inf")
 
         # Wall-clock deadline for the next silence chunk — see
         # _write_paced_silence(). Zero means "not pacing yet"; the first
@@ -164,11 +221,17 @@ class RadioPlayer:
         # _pause_when_no_listeners above, which is automatic and driven by
         # subscriber count. Only ever set by an explicit chat command.
         self._paused = False
-        # Holds the track pause() interrupted, so resume() replays it first
-        # instead of skipping to _pending's next item. No seek support
-        # anywhere in this pipeline (ffmpeg runs with -re, no -ss), so
-        # "resume" always means from 0:00, never from the cut-off point.
-        self._priority_request: QueuedRequest | None = None
+
+        # A track resolved, decoded and already producing audio ahead of
+        # the current one ending, set by _prepare_ahead() — see
+        # _PreparedNext. None means nothing's ready; _feed_loop falls back
+        # to resolving fresh (a normal, silence-covered transition) in
+        # that case, same as before this existed.
+        self._prepared: _PreparedNext | None = None
+        # Short-lived fire-and-forget tasks (currently just the now-playing
+        # chat announcement) — held here only so asyncio can't garbage-
+        # collect one mid-flight; see _fire_and_forget().
+        self._background_tasks: set[asyncio.Task[None]] = set()
 
     # -- public interface used by the chat bot / admin server ------------
 
@@ -197,14 +260,8 @@ class RadioPlayer:
         return None
 
     def queue_size(self) -> int:
-        """Requests still waiting to play. Deliberately len(self._pending),
-        not self._queue.qsize(): purge_pending()/cancel_pending_for() only
-        mark an entry cancelled and drop it from _pending — the
-        asyncio.Queue keeps the tombstone until _feed_loop next dequeues
-        it, which never happens while paused for no listeners, so qsize()
-        could stay at its pre-!clearqueue value indefinitely. _pending is
-        the authoritative list and what !queue/the overlay already render,
-        so this keeps all three in agreement."""
+        """Requests still waiting to play — what !queue, !position and the
+        overlay already read directly from the same list."""
         return len(self._pending)
 
     def queued_items(self) -> list[QueuedRequest]:
@@ -217,11 +274,24 @@ class RadioPlayer:
         return [i + 1 for i, r in enumerate(self._pending) if r.requester_id == requester_id]
 
     def enqueue(self, request: QueuedRequest) -> None:
-        self._queue.put_nowait(request)
-        self._pending.append(request)
+        # A real request is inserted ahead of any trailing radio-mix
+        # filler (requester_id == 0 — see radio.py's RadioSuggester,
+        # never a real Twitch user ID) already queued, but still after
+        # every other real request — a listener's own pick shouldn't have
+        # to wait behind autoplay filler nobody actually asked for, but
+        # two listeners' requests still play in the order they arrived.
+        if request.requester_id != 0:
+            index = next((i for i, r in enumerate(self._pending) if r.requester_id == 0), len(self._pending))
+            self._pending.insert(index, request)
+        else:
+            self._pending.append(request)
         self._notify_state_changed()
 
     def set_track_failure_notifier(self, notifier: Callable[[str], Awaitable[None]] | None) -> None:
+        # Also used for the "Now Playing: ..." announcement on a
+        # successful track start, not just failures — see _notify() and
+        # _announce_now_playing(). One "post this plain string to chat,
+        # best-effort" callback either way.
         self._notify_failure = notifier
 
     def set_duration_limit_getter(self, getter: Callable[[], Awaitable[int]] | None) -> None:
@@ -283,6 +353,8 @@ class RadioPlayer:
                 request.cancelled = True
                 with contextlib.suppress(ValueError):
                     self._pending.remove(request)
+                if self._prepared is not None and self._prepared.request is request:
+                    self._discard_prepared()
                 if request.on_start is not None:
                     with contextlib.suppress(Exception):
                         request.on_start()
@@ -292,10 +364,10 @@ class RadioPlayer:
         return None
 
     def purge_pending(self, predicate: Callable[[QueuedRequest], bool]) -> list[QueuedRequest]:
-        """Removes every not-yet-playing request matching predicate — used
-        for mod tooling (!clearqueue, and !block pulling out an already-
-        queued copy of what it just blocked). Doesn't touch whatever's
-        currently playing/resolving."""
+        """Removes every not-yet-playing request matching predicate.
+        Doesn't touch whatever's currently playing/resolving. Not called
+        anywhere yet — general-purpose bulk removal for a future command
+        (e.g. clear-queue or a block-list) to use."""
         removed = []
         for request in list(self._pending):
             if not predicate(request):
@@ -303,6 +375,8 @@ class RadioPlayer:
             request.cancelled = True
             with contextlib.suppress(ValueError):
                 self._pending.remove(request)
+            if self._prepared is not None and self._prepared.request is request:
+                self._discard_prepared()
             if request.on_start is not None:
                 with contextlib.suppress(Exception):
                     request.on_start()
@@ -329,8 +403,11 @@ class RadioPlayer:
         wait for a track boundary like _pause_when_no_listeners does, since
         a mod reaching for !pause usually means "stop it right now", not
         "in four minutes when this song ends". The interrupted request (if
-        any) is preserved and replayed from the top on resume() — see
-        _priority_request's docstring for why "from the top"."""
+        any) is preserved and replayed from the top on resume(): inserted
+        straight into _pending[0], the same place any other "play this
+        next" request lives, rather than a separate field — see
+        _feed_loop. No seek support anywhere in this pipeline (ffmpeg runs
+        with -re, no -ss), so "resume" always means from 0:00."""
         if self._paused:
             return False
         self._paused = True
@@ -342,10 +419,14 @@ class RadioPlayer:
                 requester_name=active.requester_name,
                 title=self._now_playing.title if self._now_playing else active.title,
                 uploader=self._now_playing.uploader if self._now_playing else active.uploader,
+                bypass_listener_pause=True,
             )
-            self._priority_request = resumed
             self._pending.insert(0, resumed)
         self.skip_current()
+        # Whatever was being prepared for after the interrupted track is no
+        # longer next — the interrupted track is. Free its decoder now
+        # rather than letting it idle for however long the pause lasts.
+        self._discard_prepared()
         self._notify_state_changed()
         return True
 
@@ -380,6 +461,20 @@ class RadioPlayer:
         with contextlib.suppress(Exception):
             await self._notify_failure(message)
 
+    def _discard_prepared(self) -> None:
+        """Kills and drops whatever's in self._prepared, if anything —
+        called whenever it turns out not to be what plays next (preempted
+        by a real request, cancelled, or we're pausing/stopping)."""
+        prepared, self._prepared = self._prepared, None
+        if prepared is not None:
+            with contextlib.suppress(ProcessLookupError):
+                prepared.decoder.kill()
+
+    def _fire_and_forget(self, coro: Coroutine[Any, Any, None], name: str) -> None:
+        task = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
     def start(self) -> None:
         if shutil.which("ffmpeg") is None:
             raise RuntimeError("ffmpeg not found on PATH — required to run the radio player.")
@@ -398,6 +493,12 @@ class RadioPlayer:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._radio_fill_task
             self._radio_fill_task = None
+        for task in list(self._background_tasks):
+            task.cancel()
+        if self._background_tasks:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._discard_prepared()
         await self._kill_encoder()
 
     # -- internals ---------------------------------------------------------
@@ -508,31 +609,24 @@ class RadioPlayer:
                 # in while a mod has explicitly paused things.
                 await self._write_paced_silence(encoder_stdin)
                 continue
-            try:
-                if self._priority_request is not None:
-                    # Set by pause() — takes priority over the normal queue
-                    # exactly once, so resume() picks up the same track
-                    # again rather than whatever's now at _pending's front.
-                    request = self._priority_request
-                    self._priority_request = None
-                elif self._pause_when_no_listeners and not self._subscribers:
-                    # Track-boundary pause only (not mid-track) — checked
-                    # fresh every loop tick, so playback resumes on its own
-                    # the instant a subscriber (re)connects.
-                    await self._write_paced_silence(encoder_stdin)
-                    continue
-                else:
-                    request = self._queue.get_nowait()
-            except asyncio.QueueEmpty:
-                # Catches what the prefetch-timer hook doesn't: a skip or
-                # early end that empties the queue first. Guarded/deduped
-                # inside the method, so calling it every idle tick is cheap.
-                self._maybe_start_radio_fill()
+            about_to_resume = bool(self._pending) and self._pending[0].bypass_listener_pause
+            if self._pending and not (self._pause_when_no_listeners and not self._subscribers and not about_to_resume):
+                request = self._pending.pop(0)
+            else:
+                if not self._pending:
+                    # Catches what the prefetch-timer hook doesn't: a skip
+                    # or early end that empties the queue first. Guarded/
+                    # deduped inside the method, so calling it every idle
+                    # tick is cheap.
+                    self._maybe_start_radio_fill()
+                # Else: track-boundary pause only (not mid-track) — checked
+                # fresh every loop tick, so playback resumes on its own the
+                # instant a subscriber (re)connects.
                 await self._write_paced_silence(encoder_stdin)
                 continue
-            with contextlib.suppress(ValueError):
-                self._pending.remove(request)
             if request.cancelled:
+                if self._prepared is not None and self._prepared.request is request:
+                    self._discard_prepared()
                 continue
             if request.on_start is not None:
                 with contextlib.suppress(Exception):
@@ -597,40 +691,132 @@ class RadioPlayer:
                     await task
             self._notify_state_changed()
 
-    async def _prefetch_next_when_close(self, current_duration: int) -> None:
-        """Best-effort: once playback is close to ending, resolves what's
-        now at the front of the queue so it's cache-warm by the time
-        _play_one_inner re-resolves it for real (see _PREFETCH_LEAD_SECONDS).
-        Never raises; a failure just means that transition pays the normal
-        resolve cost. Re-checks the queue at fire time, not what was next
-        when scheduled, since a request ahead of it could get skipped,
-        blocked, or cleared while this was sleeping.
+    async def _prepare_ahead(self, current_duration: int) -> None:
+        """Best-effort: once playback is close to ending, gets whatever
+        should play next fully ready — resolved, decoded, and already
+        producing audio — so _feed_loop's handoff to it has no silence
+        gap. Includes asking for a radio-mix pick if the queue is empty,
+        so "gapless" applies to autoplay too, not just a queued request.
+
+        Two separate waits, not one: the resolve (network-bound, wants a
+        big lead — _PREFETCH_LEAD_SECONDS) and the decoder spawn (wants a
+        small one — _DECODER_PREP_LEAD_SECONDS, see its comment for why).
+
+        Stashed in self._prepared; only used if it's still what's
+        actually next once this track ends (see _play_one_inner) — a real
+        request can preempt a radio-mix pick at any point up to that
+        moment (see enqueue()), and this notices rather than playing the
+        stale one. Never raises; on any failure, or if nothing's ready in
+        time, that transition just falls back to resolving fresh, exactly
+        as if this didn't run at all.
         """
-        delay = max(0.0, current_duration - _PREFETCH_LEAD_SECONDS)
-        await asyncio.sleep(delay)  # cancelled cleanly by _play_one's finally when the track ends first
-        # Try radio auto-fill before checking what's next, so a freshly
-        # queued pick gets the same pre-warming resolve below instead of a
-        # cold one right when it's needed.
-        self._maybe_start_radio_fill()
-        upcoming = self._pending[0] if self._pending else None
-        if upcoming is None or upcoming.cancelled:
+        started_at = time.monotonic()
+        resolve_delay = max(0.0, current_duration - _PREFETCH_LEAD_SECONDS)
+        await asyncio.sleep(resolve_delay)  # cancelled cleanly by _play_one's finally when the track ends first
+        if not self._pending:
+            # Ask for a radio-mix pick ourselves — awaited, not the fire-
+            # and-forget _maybe_start_radio_fill(), so there's actually
+            # something here to prepare rather than hoping one turns up
+            # in time. Same backoff so a broken radio source isn't retried
+            # on every single track transition.
+            if time.monotonic() - self._radio_fill_failed_at >= _RADIO_RETRY_BACKOFF_SECONDS:
+                picked = await self._get_radio_pick()
+                if picked is not None:
+                    self.enqueue(picked)
+                    log.info("Radio autoplay queued: %s", picked.title)
+            if not self._pending:
+                return
+        candidate = self._pending[0]
+        if candidate.cancelled:
             return
+        track = await self._resolve_ahead(candidate)
+        if track is None:
+            return
+
+        decoder_at = started_at + max(0.0, current_duration - _DECODER_PREP_LEAD_SECONDS)
+        remaining = decoder_at - time.monotonic()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        # Re-check before spawning: a real request can jump ahead of
+        # radio-mix filler (enqueue()) at any point while the above was
+        # sleeping/awaiting, and !remove can cancel `candidate` outright.
+        if not self._pending or self._pending[0] is not candidate or candidate.cancelled:
+            return
+        prepared = await self._spawn_ahead(candidate, track)
+        if prepared is None:
+            return
+        # One more re-check: the spawn itself just awaited too.
+        if self._pending and self._pending[0] is candidate and not candidate.cancelled:
+            self._prepared = prepared
+        else:
+            with contextlib.suppress(ProcessLookupError):
+                prepared.decoder.kill()
+
+    async def _resolve_ahead(self, request: QueuedRequest) -> Track | None:
+        """The resolve+validate half of what _play_one_inner always ran
+        inline, extracted so _prepare_ahead can run it early — network-
+        only, no decoder yet (see _DECODER_PREP_LEAD_SECONDS for why
+        that's spawned separately, later). Silent on failure (just a
+        debug log) and touches none of the active-track state
+        (_resolving, _current_decoder, _skip_pending) — this request
+        isn't active yet, so a failure here isn't a user-facing event;
+        _play_one_inner will notice nothing was prepared and resolve it
+        fresh, with its usual chat notification if that fails too."""
         try:
-            await self._resolver(upcoming.webpage_url, upcoming.requester_id)
+            track = await self._resolver(request.webpage_url, request.requester_id)
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            log.debug("Prefetch failed for %s (non-fatal).", upcoming.webpage_url, exc_info=True)
+            log.debug("Prepare-ahead resolve failed for %s (non-fatal).", request.webpage_url, exc_info=True)
+            return None
+        if track is None or track.is_live or request.cancelled:
+            return None
+        duration_limit = await self._current_duration_limit()
+        if 0 < duration_limit < track.duration:
+            return None
+        return track
+
+    async def _spawn_ahead(self, request: QueuedRequest, track: Track) -> _PreparedNext | None:
+        """The decoder-spawn+first-chunk half — see _resolve_ahead."""
+        decoder: asyncio.subprocess.Process | None = None
+        try:
+            try:
+                decoder = await asyncio.create_subprocess_exec(
+                    *_decoder_cmd(track.stream_url), stdout=asyncio.subprocess.PIPE
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("Prepare-ahead decoder spawn failed for %s (non-fatal).", request.webpage_url, exc_info=True)
+                return None
+            assert decoder.stdout is not None
+            try:
+                first_chunk = await asyncio.wait_for(decoder.stdout.read(_CHUNK_BYTES), timeout=_DECODER_START_TIMEOUT)
+            except TimeoutError:
+                return None
+            if not first_chunk or request.cancelled:
+                return None
+            result = _PreparedNext(request=request, track=track, decoder=decoder, first_chunk=first_chunk)
+            decoder = None  # ownership transferred to `result` — the finally below shouldn't kill it
+            return result
+        finally:
+            if decoder is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    decoder.kill()
+                with contextlib.suppress(Exception):
+                    await decoder.wait()
 
     def _maybe_start_radio_fill(self) -> None:
         """Kicks off a background radio-suggestion lookup when the queue is
-        empty and nothing's already in flight. Called from both the
-        prefetch timer (pre-warms the normal "track ends naturally" case)
-        and _feed_loop's idle branch (catches a skip/early-end that beat
-        the timer) — both funnel through this one guarded entry point so
-        they can't double-queue a pick.
+        empty and nothing's already in flight — _feed_loop's idle-branch
+        backstop for whenever _prepare_ahead's own attempt (above) didn't
+        run or didn't catch it in time (e.g. a track too short for
+        _PREFETCH_LEAD_SECONDS to matter, or radio toggled on mid-track).
+        Guarded so the two can't double-queue a pick.
 
-        _feed_loop can never reach this while paused, but the prefetch
-        timer is a background task scheduled minutes earlier and could
-        still fire mid-pause, so the guard is repeated here too."""
+        _feed_loop can never reach this while paused, but _prepare_ahead
+        is a background task scheduled minutes earlier and could still
+        fire mid-pause, so the guard is repeated here too."""
         if self._paused or self._radio_fill_task is not None or self._pending:
             return
         if self._radio_suggest is None or self._last_played_webpage_url is None:
@@ -641,32 +827,38 @@ class RadioPlayer:
 
     async def _run_radio_fill(self) -> None:
         try:
-            if self._radio_enabled_getter is not None:
-                with contextlib.suppress(Exception):
-                    if not await self._radio_enabled_getter():
-                        # Arm the same backoff a failed suggestion uses.
-                        # Without this, the common "radio autoplay is off"
-                        # state meant _feed_loop's idle branch spawned a
-                        # fresh task every ~100ms forever — cheap per-call,
-                        # but ten pointless tasks a second isn't free on a
-                        # small VPS.
-                        self._radio_fill_failed_at = time.monotonic()
-                        return
-            seed = self._last_played_webpage_url
-            if seed is None or self._radio_suggest is None:
-                return
-            try:
-                picked = await self._radio_suggest(seed)
-            except Exception:
-                log.debug("Radio autoplay suggestion failed for %s (non-fatal).", seed, exc_info=True)
-                picked = None
-            if picked is None:
-                self._radio_fill_failed_at = time.monotonic()
-                return
-            self.enqueue(picked)
-            log.info("Radio autoplay queued: %s", picked.title)
+            picked = await self._get_radio_pick()
+            if picked is not None:
+                self.enqueue(picked)
+                log.info("Radio autoplay queued: %s", picked.title)
         finally:
             self._radio_fill_task = None
+
+    async def _get_radio_pick(self) -> QueuedRequest | None:
+        """The actual "ask for one radio-autoplay suggestion" step, shared
+        by _run_radio_fill's fire-and-forget backstop and _prepare_ahead's
+        own direct attempt at a gapless autoplay transition. None (and the
+        retry backoff armed) covers everything from "radio's off" to a
+        failed lookup."""
+        if self._radio_enabled_getter is not None:
+            with contextlib.suppress(Exception):
+                if not await self._radio_enabled_getter():
+                    # Arm the backoff here too — otherwise the common
+                    # "radio autoplay is off" state means both callers
+                    # above retry every time they fire, for nothing.
+                    self._radio_fill_failed_at = time.monotonic()
+                    return None
+        seed = self._last_played_webpage_url
+        if seed is None or self._radio_suggest is None:
+            return None
+        try:
+            picked = await self._radio_suggest(seed)
+        except Exception:
+            log.debug("Radio autoplay suggestion failed for %s (non-fatal).", seed, exc_info=True)
+            picked = None
+        if picked is None:
+            self._radio_fill_failed_at = time.monotonic()
+        return picked
 
     async def _current_duration_limit(self) -> int:
         if self._duration_limit_getter is None:
@@ -676,11 +868,27 @@ class RadioPlayer:
         return 0
 
     async def _play_one_inner(self, request: QueuedRequest, encoder_stdin: asyncio.StreamWriter) -> None:
+        prepared, self._prepared = self._prepared, None
+        if prepared is not None and (prepared.request is not request or request.cancelled):
+            # Belonged to a different track than the one actually about to
+            # play — a real request preempted it, or it was cancelled
+            # while sitting ready. Not usable; free it and fall through to
+            # resolving `request` fresh below, same as if nothing had
+            # been prepared at all.
+            with contextlib.suppress(ProcessLookupError):
+                prepared.decoder.kill()
+            prepared = None
+
+        if prepared is not None:
+            await self._start_and_stream(prepared.track, prepared.decoder, prepared.first_chunk, request, encoder_stdin)
+            return
+
         self._skip_pending = False
         silence_task = asyncio.create_task(
             self._trickle_silence_until_cancelled(encoder_stdin), name="radio-player-prefeed-silence"
         )
         decoder: asyncio.subprocess.Process | None = None
+        track: Track | None = None
         first_chunk = b""
         self._resolving = True
         try:
@@ -708,39 +916,8 @@ class RadioPlayer:
                 log.info("Skipped %s before it started playing (mid-resolve skip).", track.title)
                 return
 
-            self._now_playing = NowPlaying(
-                title=track.title,
-                uploader=track.uploader,
-                thumbnail_url=track.thumbnail_url,
-                requester_name=request.requester_name,
-                requester_id=request.requester_id,
-                webpage_url=track.webpage_url,
-                started_at=time.monotonic(),
-                duration=track.duration,
-            )
-            # Seed for the next radio-autoplay pick — set only once
-            # playback is actually going ahead, so a track that fails to
-            # resolve/decode never becomes a seed.
-            self._last_played_webpage_url = track.webpage_url
-            self._notify_state_changed()
-            log.info("Now playing: %s (requested by %s)", track.title, request.requester_name)
-            if self._prefetch_enabled:
-                self._prefetch_task = asyncio.create_task(
-                    self._prefetch_next_when_close(track.duration), name="radio-player-prefetch-next"
-                )
-
             decoder = await asyncio.create_subprocess_exec(
-                "ffmpeg", "-hide_banner", "-loglevel", "error",
-                # Reconnect flags recover from a dropped/hiccuping CDN
-                # connection instead of corrupting the stream. -probesize/
-                # -analyzeduration skip ffmpeg's default multi-second format
-                # probe, cutting startup latency.
-                "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-                "-reconnect_on_network_error", "1", "-reconnect_on_http_error", "429,500,502,503,504",
-                "-probesize", "128k", "-analyzeduration", "0",
-                "-re", "-i", track.stream_url,
-                "-f", "s16le", "-ar", str(AUDIO_RATE), "-ac", str(AUDIO_CHANNELS), "-",
-                stdout=asyncio.subprocess.PIPE,
+                *_decoder_cmd(track.stream_url), stdout=asyncio.subprocess.PIPE
             )
             self._current_decoder = decoder
             if self._skip_pending:
@@ -750,13 +927,11 @@ class RadioPlayer:
                     decoder.kill()
                 await decoder.wait()
                 self._current_decoder = None
-                self._now_playing = None
                 decoder = None
                 return
             assert decoder.stdout is not None
-            stdout = decoder.stdout
             try:
-                first_chunk = await asyncio.wait_for(stdout.read(_CHUNK_BYTES), timeout=_DECODER_START_TIMEOUT)
+                first_chunk = await asyncio.wait_for(decoder.stdout.read(_CHUNK_BYTES), timeout=_DECODER_START_TIMEOUT)
             except TimeoutError:
                 log.warning("Timed out waiting for decoder output for %s — skipping.", request.webpage_url)
                 await self._notify(f"Skipped {request.requester_name}'s song — it took too long to start.")
@@ -764,7 +939,6 @@ class RadioPlayer:
                     decoder.kill()
                 await decoder.wait()
                 self._current_decoder = None
-                self._now_playing = None
                 decoder = None
                 return
         finally:
@@ -773,8 +947,49 @@ class RadioPlayer:
             with contextlib.suppress(asyncio.CancelledError):
                 await silence_task
 
-        if decoder is None:
+        if decoder is None or track is None:
             return
+        await self._start_and_stream(track, decoder, first_chunk, request, encoder_stdin)
+
+    async def _start_and_stream(
+        self,
+        track: Track,
+        decoder: asyncio.subprocess.Process,
+        first_chunk: bytes,
+        request: QueuedRequest,
+        encoder_stdin: asyncio.StreamWriter,
+    ) -> None:
+        """Common tail for both playback paths — a freshly resolved-and-
+        spawned track (the slow path above) and one handed off from
+        self._prepared (the gapless path) arrive here identically: a
+        track, a live decoder, and its first chunk already in hand."""
+        assert decoder.stdout is not None
+        stdout = decoder.stdout
+        self._current_decoder = decoder
+        self._now_playing = NowPlaying(
+            title=track.title,
+            uploader=track.uploader,
+            thumbnail_url=track.thumbnail_url,
+            requester_name=request.requester_name,
+            requester_id=request.requester_id,
+            webpage_url=track.webpage_url,
+            started_at=time.monotonic(),
+            duration=track.duration,
+        )
+        # Seed for the next radio-autoplay pick — set only once playback
+        # is actually going ahead, so a track that fails to resolve/decode
+        # never becomes a seed.
+        self._last_played_webpage_url = track.webpage_url
+        self._notify_state_changed()
+        log.info("Now playing: %s (requested by %s)", track.title, request.requester_name)
+        self._fire_and_forget(
+            self._announce_now_playing(request, track), name="radio-player-announce-now-playing"
+        )
+        if self._prefetch_enabled:
+            self._prefetch_task = asyncio.create_task(
+                self._prepare_ahead(track.duration), name="radio-player-prepare-ahead"
+            )
+
         try:
             chunk = first_chunk
             while chunk:
@@ -799,3 +1014,12 @@ class RadioPlayer:
             await decoder.wait()
             self._current_decoder = None
             self._now_playing = None
+
+    async def _announce_now_playing(self, request: QueuedRequest, track: Track) -> None:
+        title_and_artist = f"{track.title} - {track.uploader}" if track.uploader else track.title
+        if request.requester_id == 0:
+            # Radio-mix autoplay — see radio.py's RadioSuggester.
+            message = f"Now Playing: {title_and_artist}"
+        else:
+            message = f"{request.requester_name}'s song request is Now Playing: {title_and_artist}"
+        await self._notify(message)
