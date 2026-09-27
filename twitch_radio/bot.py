@@ -77,7 +77,7 @@ async def _async_run(settings: Settings) -> None:
             toggles_store=toggles_store,
             settings_password=settings.settings_password,
             broadcast_info={
-                "Audio stream": "/stream.mp3",
+                "Audio stream": "/stream.opus",
                 "Overlay": "/overlay",
                 "Audio bitrate": f"{settings.audio_bitrate_kbps} kbps",
                 "Chat command prefix": settings.prefix,
