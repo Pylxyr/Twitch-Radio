@@ -12,6 +12,7 @@ from twitch_radio.extraction import UnsupportedSourceError
 from twitch_radio.player import QueuedRequest
 from twitch_radio.toggles import FeatureToggles
 from twitch_radio.tunables import TwitchTunables
+from twitch_radio.youtube import youtube_video_id
 
 if TYPE_CHECKING:
     from twitch_radio.chatbot import TwitchChatBot
@@ -21,7 +22,10 @@ log = logging.getLogger(__name__)
 # Keyed by canonical command name (ctx.command.name resolves aliases to
 # this), for event_command_error's MissingRequiredArgument handler in
 # chatbot.py.
-USAGE = {"sr": "Usage: !sr <song name or URL>"}
+USAGE = {
+    "sr": "Usage: !sr <song name or URL>",
+    "unblock": "Usage: !unblock <song name or URL>",
+}
 
 # How much of a chatter's query the "Looking up ..." acknowledgement repeats.
 _MAX_ECHO_CHARS = 80
@@ -131,6 +135,10 @@ class SongRequestComponent(commands.Component):
 
             if track.is_live:
                 await self.bot.safe_reply(ctx, "Can't queue a livestream — sorry!")
+                return
+
+            if await self.bot.blocklist.is_blocked(track.webpage_url):
+                await self.bot.safe_reply(ctx, f"{track.title} has been blocked by a mod.")
                 return
 
             # Re-read rather than reuse whatever song_request() read before
@@ -353,3 +361,60 @@ class SongRequestComponent(commands.Component):
 
         await self.bot.toggles_store.update(_mutate)
         await self.bot.safe_reply(ctx, f"Radio autoplay is now {arg}.")
+
+    @commands.command(name="block")
+    @commands.is_moderator()
+    async def block(self, ctx: commands.Context) -> None:
+        """Blocks whatever's currently playing so it can never be requested
+        or radio-suggested again, strips any already-queued copies of it,
+        and skips it right now — one action, like Cloudbot's !blacklist."""
+        np = self.bot.player.now_playing
+        if np is None:
+            await self.bot.safe_reply(ctx, "Nothing's playing right now.")
+            return
+        blocked_by = ctx.chatter.display_name or ctx.chatter.name or "a mod"
+        ok = await self.bot.blocklist.block(np.webpage_url, title=np.title, uploader=np.uploader, blocked_by=blocked_by)
+        if not ok:
+            await self.bot.safe_reply(ctx, "Couldn't identify that as a YouTube video to block.")
+            return
+        video_id = youtube_video_id(np.webpage_url)
+        self.bot.player.purge_pending(lambda r: youtube_video_id(r.webpage_url) == video_id)
+        self.bot.player.skip_current()
+        await self.bot.safe_reply(ctx, f"Blocked and skipped: {np.title}")
+
+    @commands.command(name="unblock")
+    @commands.is_moderator()
+    async def unblock(self, ctx: commands.Context, *, query: str) -> None:
+        """Looks query up the same way !sr does, then removes the match
+        from the blocklist — doesn't queue it, just lifts the block."""
+        query = query.strip()
+        if not query:
+            await self.bot.safe_reply(ctx, USAGE["unblock"])
+            return
+        try:
+            track = await self.bot.resolver(query, 0)
+        except UnsupportedSourceError as exc:
+            await self.bot.safe_reply(ctx, str(exc))
+            return
+        except Exception:
+            log.exception("Failed to resolve Twitch !unblock query: %s", query)
+            await self.bot.safe_reply(ctx, "Couldn't look that up — try a different search or link.")
+            return
+        if track is None:
+            await self.bot.safe_reply(ctx, "No results for that.")
+            return
+        removed = await self.bot.blocklist.unblock(track.webpage_url)
+        if removed:
+            await self.bot.safe_reply(ctx, f"Unblocked: {track.title}")
+        else:
+            await self.bot.safe_reply(ctx, f"{track.title} wasn't blocked.")
+
+    @commands.command(name="blocklist", aliases=["banlist"])
+    async def blocklist_cmd(self, ctx: commands.Context) -> None:
+        entries = await self.bot.blocklist.list_blocked()
+        if not entries:
+            await self.bot.safe_reply(ctx, "Nothing's blocked right now.")
+            return
+        shown = ", ".join(e.title or e.video_id for e in entries[:5])
+        more = f" (+{len(entries) - 5} more)" if len(entries) > 5 else ""
+        await self.bot.safe_reply(ctx, f"{len(entries)} blocked: {shown}{more}")
