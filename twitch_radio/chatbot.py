@@ -48,6 +48,7 @@ from twitchio import eventsub
 from twitchio.exceptions import TwitchioException
 from twitchio.ext import commands
 
+from twitch_radio.blocklist import BlockList
 from twitch_radio.components.song_requests import SongRequestComponent
 from twitch_radio.components.song_requests import USAGE as _USAGE
 from twitch_radio.player import RadioPlayer
@@ -89,6 +90,7 @@ class TwitchChatBot(commands.Bot):
         player: RadioPlayer,
         tunables_store: JsonStore,
         toggles_store: JsonStore,
+        blocklist: BlockList,
         token_storage_path: Path,
     ) -> None:
         super().__init__(
@@ -102,6 +104,7 @@ class TwitchChatBot(commands.Bot):
         self.player = player
         self.tunables_store = tunables_store
         self.toggles_store = toggles_store
+        self.blocklist = blocklist
         self.prefix = prefix
         self._owner_id = owner_id
         self._bot_id = bot_id
