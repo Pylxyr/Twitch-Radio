@@ -7,6 +7,7 @@ import signal
 
 from twitch_radio.admin.app import run_admin_server
 from twitch_radio.admin.passwords import is_password_hash
+from twitch_radio.blocklist import BlockList
 from twitch_radio.player import RadioPlayer
 from twitch_radio.chatbot import TwitchChatBot
 from twitch_radio.config import Settings, load_settings
@@ -43,6 +44,7 @@ async def _async_run(settings: Settings) -> None:
     resolver = Resolver(settings)
     tunables_store = JsonStore(settings.tunables_path)
     toggles_store = JsonStore(settings.toggles_path)
+    blocklist = BlockList(JsonStore(settings.blocklist_path))
 
     # Fire-and-forget: warms up yt-dlp's worker threads (and, once cached,
     # persists across restarts too) before the first real !sr arrives. Never
@@ -58,14 +60,19 @@ async def _async_run(settings: Settings) -> None:
         pause_when_no_listeners=settings.pause_when_no_listeners,
         prefetch_enabled=settings.ytdlp_cache_ttl_seconds > 0,
     )
-    radio_suggester = RadioSuggester(resolver)
+    radio_suggester = RadioSuggester(resolver, blocklist)
     player.set_radio_suggester(radio_suggester.suggest)
+    player.set_radio_played_notifier(radio_suggester.note_played)
 
     async def _radio_enabled() -> bool:
         toggles = FeatureToggles.from_dict(await toggles_store.read())
         return toggles.radio_autoplay_enabled
 
     player.set_radio_enabled_getter(_radio_enabled)
+    player.set_queue_store(JsonStore(settings.queue_state_path))
+    restored = await player.restore_queue()
+    if restored:
+        log.info("Restored %d queued request(s) from the last run.", restored)
     # Nested try/finally per resource (not one big try around just the chat
     # bot) so a failure acquiring a *later* resource still tears down
     # everything already acquired.
@@ -100,6 +107,7 @@ async def _async_run(settings: Settings) -> None:
                 player=player,
                 tunables_store=tunables_store,
                 toggles_store=toggles_store,
+                blocklist=blocklist,
                 token_storage_path=settings.token_path,
             )
             player.set_track_failure_notifier(bot.announce)
