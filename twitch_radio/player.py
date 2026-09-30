@@ -11,6 +11,7 @@ from enum import Enum
 from typing import Any, Protocol
 
 from twitch_radio.models import Track
+from twitch_radio.store import JsonStore
 
 log = logging.getLogger(__name__)
 
@@ -21,6 +22,10 @@ _CHUNK_BYTES = int(AUDIO_RATE * AUDIO_CHANNELS * 2 * _CHUNK_DURATION)
 _SILENCE_CHUNK = b"\x00" * _CHUNK_BYTES
 _STREAM_CHUNK_BYTES = 8192
 _SUBSCRIBER_QUEUE_SIZE = 50  # ~5-10s of Opus at typical bitrates; a stalled listener gets dropped, not buffered forever
+# How far behind real time a listener typically hears /stream.opus (client
+# buffering) — the overlay's title change is held back by this much so it
+# doesn't jump ahead of what's actually audible. Tune to taste.
+_OVERLAY_SYNC_DELAY_SECONDS = 4.0
 # Sanity ceiling on captured Ogg header bytes (see _pump_encoder_output).
 _MAX_OGG_HEADER_BYTES = 65536
 
@@ -83,7 +88,10 @@ _DECODER_PREP_LEAD_SECONDS = 3.0
 
 def _decoder_cmd(stream_url: str) -> list[str]:
     return [
-        "ffmpeg", "-hide_banner", "-loglevel", "error",
+        # fatal, not error: a mid-pull TLS reset is exactly what -reconnect
+        # below recovers from on its own — logging it at "error" was just
+        # noise on every transient CDN hiccup.
+        "ffmpeg", "-hide_banner", "-loglevel", "fatal",
         # Reconnect flags recover from a dropped/hiccuping CDN connection
         # instead of corrupting the stream — including one that's gone
         # idle while a prepared-ahead decoder sat waiting for its turn to
@@ -93,8 +101,18 @@ def _decoder_cmd(stream_url: str) -> list[str]:
         "-reconnect_on_network_error", "1", "-reconnect_on_http_error", "429,500,502,503,504",
         "-probesize", "128k", "-analyzeduration", "0",
         "-re", "-i", stream_url,
+        # Single-pass (dynamic) EBU R128 loudness normalization — every
+        # track lands around the same perceived volume regardless of how
+        # loud the original upload was, instead of a jump on every track
+        # change. -16 LUFS sits between Spotify/YouTube's ~-14 and
+        # broadcast's -23; -1.5 dBTP true-peak ceiling leaves headroom so
+        # this never clips. Two-pass would sound marginally better but
+        # needs the whole file decoded first — not compatible with
+        # starting playback immediately.
+        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
         "-f", "s16le", "-ar", str(AUDIO_RATE), "-ac", str(AUDIO_CHANNELS), "-",
     ]
+
 
 
 class TrackResolver(Protocol):
@@ -201,6 +219,7 @@ class RadioPlayer:
         # real request ahead of trailing radio-mix filler, which a FIFO
         # asyncio.Queue can't do.)
         self._pending: list[QueuedRequest] = []
+        self._queue_store: JsonStore | None = None
         self._task: asyncio.Task[None] | None = None
         self._encoder: asyncio.subprocess.Process | None = None
         self._encoder_spawned_at: float = 0.0
@@ -235,6 +254,7 @@ class RadioPlayer:
         # Radio autoplay — see set_radio_suggester()/_maybe_start_radio_fill().
         self._radio_suggest: RadioSuggestFn | None = None
         self._radio_enabled_getter: Callable[[], Awaitable[bool]] | None = None
+        self._radio_played_notifier: Callable[[str], None] | None = None
         self._last_played_webpage_url: str | None = None
         self._radio_fill_task: asyncio.Task[None] | None = None
         # -inf, not 0.0: "no failure yet" must never look like "failed
@@ -305,6 +325,64 @@ class RadioPlayer:
         waiting (check active_requester_id for the "up now" case)."""
         return [i + 1 for i, r in enumerate(self._pending) if r.requester_id == requester_id]
 
+    def set_queue_store(self, store: JsonStore | None) -> None:
+        """Persists the real (non-radio-filler) queue to disk on every
+        change, restored by restore_queue() at startup — so a restart for
+        an update doesn't wipe out everyone's queued requests. Radio-mix
+        filler (requester_id == 0) is never persisted; it's regenerated
+        on demand, not a real request worth keeping."""
+        self._queue_store = store
+
+    async def _persist_queue(self) -> None:
+        if self._queue_store is None:
+            return
+        items = [
+            {
+                "webpage_url": r.webpage_url,
+                "requester_id": r.requester_id,
+                "requester_name": r.requester_name,
+                "title": r.title,
+                "uploader": r.uploader,
+            }
+            for r in self._pending
+            if r.requester_id != 0
+        ]
+        await self._queue_store.write({"items": items})
+
+    async def restore_queue(self) -> int:
+        """Reloads whatever set_queue_store() last persisted — call once at
+        startup, before start(), so the queue's already populated by the
+        time the feed loop takes its first tick. Returns how many were
+        restored. stream_url is never persisted (see QueuedRequest) since
+        it's re-resolved fresh from webpage_url at play time regardless —
+        a restored entry is exactly as good as one just requested."""
+        if self._queue_store is None:
+            return 0
+        data = await self._queue_store.read()
+        raw_items = data.get("items")
+        if not isinstance(raw_items, list):
+            return 0
+        restored = 0
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                webpage_url = str(item["webpage_url"])
+                requester_id = int(item["requester_id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            self.enqueue(
+                QueuedRequest(
+                    webpage_url=webpage_url,
+                    requester_id=requester_id,
+                    requester_name=str(item.get("requester_name") or "a viewer"),
+                    title=str(item.get("title") or ""),
+                    uploader=str(item.get("uploader") or ""),
+                )
+            )
+            restored += 1
+        return restored
+
     def enqueue(self, request: QueuedRequest) -> None:
         # A real request is inserted ahead of any trailing radio-mix
         # filler (requester_id == 0 — see radio.py's RadioSuggester,
@@ -318,6 +396,7 @@ class RadioPlayer:
         else:
             self._pending.append(request)
         self._notify_state_changed()
+        self._fire_and_forget(self._persist_queue(), name="persist-queue")
 
     def set_track_failure_notifier(self, notifier: Callable[[str], Awaitable[None]] | None) -> None:
         # Also used for the "Now Playing: ..." announcement on a
@@ -331,6 +410,9 @@ class RadioPlayer:
 
     def set_radio_suggester(self, suggester: RadioSuggestFn | None) -> None:
         self._radio_suggest = suggester
+
+    def set_radio_played_notifier(self, notifier: Callable[[str], None] | None) -> None:
+        self._radio_played_notifier = notifier
 
     def set_radio_enabled_getter(self, getter: Callable[[], Awaitable[bool]] | None) -> None:
         self._radio_enabled_getter = getter
@@ -383,6 +465,10 @@ class RadioPlayer:
             with contextlib.suppress(asyncio.QueueFull):
                 q.put_nowait(None)
 
+    async def _notify_state_changed_delayed(self, delay: float) -> None:
+        await asyncio.sleep(delay)
+        self._notify_state_changed()
+
     def cancel_pending_for(self, requester_id: int) -> QueuedRequest | None:
         for request in reversed(self._pending):
             if request.requester_id == requester_id and not request.cancelled:
@@ -396,14 +482,15 @@ class RadioPlayer:
                         request.on_start()
                     request.on_start = None
                 self._notify_state_changed()
+                self._fire_and_forget(self._persist_queue(), name="persist-queue")
                 return request
         return None
 
     def purge_pending(self, predicate: Callable[[QueuedRequest], bool]) -> list[QueuedRequest]:
         """Removes every not-yet-playing request matching predicate.
-        Doesn't touch whatever's currently playing/resolving. Not called
-        anywhere yet — general-purpose bulk removal for a future command
-        (e.g. clear-queue or a block-list) to use."""
+        Doesn't touch whatever's currently playing/resolving. Used by
+        !block (see components/song_requests.py) to strip a newly-blocked
+        video out of the queue immediately."""
         removed = []
         for request in list(self._pending):
             if not predicate(request):
@@ -420,6 +507,7 @@ class RadioPlayer:
             removed.append(request)
         if removed:
             self._notify_state_changed()
+            self._fire_and_forget(self._persist_queue(), name="persist-queue")
         return removed
 
     def skip_current(self) -> bool:
@@ -458,6 +546,7 @@ class RadioPlayer:
                 bypass_listener_pause=True,
             )
             self._pending.insert(0, resumed)
+            self._fire_and_forget(self._persist_queue(), name="persist-queue")
         self.skip_current()
         # Whatever was being prepared for after the interrupted track is no
         # longer next — the interrupted track is. Free its decoder now
@@ -669,6 +758,7 @@ class RadioPlayer:
             about_to_resume = bool(self._pending) and self._pending[0].bypass_listener_pause
             if self._pending and not (self._pause_when_no_listeners and not self._subscribers and not about_to_resume):
                 request = self._pending.pop(0)
+                self._fire_and_forget(self._persist_queue(), name="persist-queue")
             else:
                 if not self._pending:
                     # Catches what the prefetch-timer hook doesn't: a skip
@@ -1037,7 +1127,11 @@ class RadioPlayer:
         # is actually going ahead, so a track that fails to resolve/decode
         # never becomes a seed.
         self._last_played_webpage_url = track.webpage_url
-        self._notify_state_changed()
+        if self._radio_played_notifier is not None:
+            self._radio_played_notifier(track.webpage_url)
+        self._fire_and_forget(
+            self._notify_state_changed_delayed(_OVERLAY_SYNC_DELAY_SECONDS), name="radio-player-overlay-sync"
+        )
         log.info("Now playing: %s (requested by %s)", track.title, request.requester_name)
         self._fire_and_forget(
             self._announce_now_playing(request, track), name="radio-player-announce-now-playing"
