@@ -150,6 +150,8 @@ class Settings:
     token_path: Path
     tunables_path: Path
     toggles_path: Path
+    blocklist_path: Path
+    queue_state_path: Path
 
     # yt-dlp
     ytdlp_cookies_file: Path | None
@@ -268,16 +270,25 @@ def load_settings() -> Settings:
         token_path=DATA_DIR / os.getenv("TWITCH_TOKEN_FILE", "twitch_tokens.json").strip(),
         tunables_path=DATA_DIR / os.getenv("TWITCH_TUNABLES_FILE", "tunables.json").strip(),
         toggles_path=DATA_DIR / os.getenv("TWITCH_TOGGLES_FILE", "toggles.json").strip(),
+        blocklist_path=DATA_DIR / os.getenv("TWITCH_BLOCKLIST_FILE", "blocklist.json").strip(),
+        queue_state_path=DATA_DIR / os.getenv("TWITCH_QUEUE_STATE_FILE", "queue_state.json").strip(),
         ytdlp_cookies_file=cookies_path,
         ytdlp_js_runtime_path=os.getenv("YTDLP_JS_RUNTIME_PATH", "").strip() or None,
         ytdlp_js_runtime_name=os.getenv("YTDLP_JS_RUNTIME_NAME", "deno").strip() or "deno",
-        ytdlp_concurrency=_clamped_int_env("YTDLP_CONCURRENCY", 2, 1, 4),
+        # Each worker is its own process (ProcessBackend) specifically so
+        # extraction parallelizes across cores instead of competing with
+        # the real-time feed loop for one — default/ceiling raised for an
+        # 8c/16t 5700X; each idle worker costs one Python process, cheap
+        # against 32GB, so this is a CPU headroom call, not a RAM one.
+        ytdlp_concurrency=_clamped_int_env("YTDLP_CONCURRENCY", 6, 1, 8),
         ytdlp_extract_timeout_seconds=_clamped_int_env("YTDLP_EXTRACT_TIMEOUT_SECONDS", 45, 10, 120),
         ytdlp_player_client=ytdlp_player_client,
         # Skips the player's second extraction (chat resolves once to queue,
         # then re-resolves right before playing) for anything near the front
-        # of the queue. 0 disables caching.
-        ytdlp_cache_ttl_seconds=_clamped_int_env("YTDLP_CACHE_TTL_SECONDS", 300, 0, 3600),
+        # of the queue. 0 disables caching. Raised from 300: a cached Track
+        # is a few KB, so a bigger window costs nothing on 32GB while
+        # cutting repeat-request resolve work.
+        ytdlp_cache_ttl_seconds=_clamped_int_env("YTDLP_CACHE_TTL_SECONDS", 900, 0, 3600),
         # Points yt-dlp's PO-token plugin at a bgutil-ytdlp-pot-provider
         # instance, if one's set up. None is a no-op.
         ytdlp_pot_provider_url=os.getenv("YTDLP_POT_PROVIDER_URL", "").strip() or None,
