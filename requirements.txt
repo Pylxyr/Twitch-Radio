@@ -15,6 +15,6 @@ certifi==2026.7.22
 mutagen==1.48.1
 pycryptodomex==3.23.0
 requests==2.34.2
-urllib3==2.7.0
-websockets==17.0.1
-curl-cffi==0.16.0
+urllib3==2.8.0
+websockets==17.1
+curl-cffi==0.16.3
