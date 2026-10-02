@@ -137,3 +137,25 @@ jobs:
       - name: Real YouTube resolve + JS solver download (needs the network; may fail on a PR)
         continue-on-error: true
         run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore.exe --bin packaging/bin --resolve-only
+
+  linux-build-smoke:
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-build.txt
+      - name: Fetch ffmpeg and Deno (pinned, checksum-verified)
+        run: ./packaging/fetch-tools.sh
+      - name: Build the core with PyInstaller
+        run: pyinstaller packaging/core.spec --noconfirm --distpath dist/core --workpath build/pyinstaller
+      - name: Smoke test the frozen core
+        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore --bin packaging/bin
+      - name: Real YouTube resolve + JS solver download (needs the network; may fail on a PR)
+        continue-on-error: true
+        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore --bin packaging/bin --resolve-only
