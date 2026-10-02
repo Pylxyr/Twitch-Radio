@@ -141,7 +141,12 @@ version: it builds everything and uploads the files as a workflow artifact witho
   resolve is best effort here because YouTube often blocks GitHub's runners, so a failure is a
   warning in the run, not a stopped release), writes `SHA256SUMS.txt`, and publishes a GitHub
   release with the installer, `SHA256SUMS.txt` and `THIRD_PARTY_NOTICES.txt`. Release notes are the
-  commit subjects since the previous tag under a fixed install / SmartScreen note.
+  a changelog built by `scripts/release_notes.py` from the commits since the previous release
+  (grouped into Added / Fixed / Changed / Removed / Dependencies, with release-bump, `ruff format` and
+  merge commits left out, plus a compare link), under the fixed install note from
+  `.github/release-notes-header.md`. Start commit messages with Add, Fix, Remove or Update (or
+  `feat:` / `fix:`) and they land in the right group. A stable release is compared with the previous
+  stable release, not with a release candidate.
 * Third-party actions are pinned to full commit SHAs with the version in a comment.
   `.github/dependabot.yml` opens weekly pull requests for GitHub Actions, pip and npm, which is how
   they stay fresh. Review those PRs (Dependabot updates the SHA and the comment together).
