@@ -29,8 +29,7 @@ jobs:
           cache-dependency-path: requirements*.txt
       - run: pip install -r requirements-dev.txt -r requirements.txt
       - run: ruff check .
-      # `ruff format --check .` is left out on purpose: the repo isn't formatted yet.
-      # Run `ruff format .` once in its own commit, then add the check here.
+      - run: ruff format --check .
       - run: mypy twitch_radio bot.py
       - run: pytest -q
 

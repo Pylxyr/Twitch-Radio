@@ -93,8 +93,7 @@ python scripts\smoke_core.py --exe dist\core\TwitchRadioCore\TwitchRadioCore.exe
 
 The second command resolves a real YouTube video and needs YouTube and GitHub reachable.
 
-`ruff format` is not enforced yet: the code base predates it. Run `ruff format .` in a
-commit of its own, then add `ruff format --check .` to `ci.yml`.
+`ruff format --check .` runs in CI; fix a failure with `ruff format .`.
 
 ## Cutting a release
 

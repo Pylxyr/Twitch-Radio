@@ -236,6 +236,7 @@ any Media/Browser Source. Song requests support YouTube only.
 ```
 pip install -r requirements-dev.txt -r requirements.txt
 ruff check .
+ruff format --check .
 mypy twitch_radio bot.py
 pytest -q
 

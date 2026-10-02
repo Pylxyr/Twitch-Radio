@@ -5,6 +5,7 @@
 ```
 pip install -r requirements-dev.txt -r requirements.txt
 ruff check .
+ruff format --check .
 mypy twitch_radio bot.py          # disallow_untyped_defs is on
 pytest -q
 
