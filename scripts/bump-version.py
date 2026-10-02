@@ -4,6 +4,8 @@
 python scripts/bump-version.py 1.1.0          set gui/package.json, gui/package-lock.json
                                               and twitch_radio/version.py, print next steps
 python scripts/bump-version.py --check v1.1.0 fail unless all three equal the tag (used by CI)
+python scripts/bump-version.py --next patch   print the next version (patch, minor or major) without
+                                              changing anything (used by the Cut release workflow)
 """
 
 from __future__ import annotations
@@ -49,6 +51,35 @@ def check(tag: str) -> int:
     return 0
 
 
+def next_version(current: str, kind: str) -> str:
+    """The version after `current` for a patch, minor or major release.
+
+    A pre-release suffix on `current` is dropped first, so 1.2.0-rc1 + patch is 1.2.1;
+    to promote a release candidate to 1.2.0, give the exact version instead.
+    """
+    match = SEMVER.match(current)
+    if not match:
+        raise ValueError(f"'{current}' is not MAJOR.MINOR.PATCH[-suffix].")
+    major, minor, patch = (int(part) for part in current.split("-", 1)[0].split("."))
+    if kind == "major":
+        return f"{major + 1}.0.0"
+    if kind == "minor":
+        return f"{major}.{minor + 1}.0"
+    if kind == "patch":
+        return f"{major}.{minor}.{patch + 1}"
+    raise ValueError(f"Unknown bump kind '{kind}' (use patch, minor or major).")
+
+
+def print_next(kind: str) -> int:
+    current = read_versions()["gui/package.json"]
+    try:
+        print(next_version(current or "", kind))
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 1
+    return 0
+
+
 def write_json_version(path: Path, version: str) -> None:
     data = json.loads(path.read_text(encoding="utf-8"))
     data["version"] = version
@@ -85,6 +116,8 @@ def bump(version: str) -> int:
 def main(argv: list[str]) -> int:
     if len(argv) == 3 and argv[1] == "--check":
         return check(argv[2])
+    if len(argv) == 3 and argv[1] == "--next":
+        return print_next(argv[2])
     if len(argv) == 2 and not argv[1].startswith("-"):
         return bump(argv[1].removeprefix("v"))
     print(__doc__)

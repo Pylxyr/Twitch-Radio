@@ -1,10 +1,11 @@
-Drag everything in this folder (except README.txt / changes.patch) onto the
-root of your Twitch-Radio repo and accept "replace".
+Drag everything here (except this README) onto the root of your Twitch-Radio repo, replace when asked.
+On github.com you can also upload them: Add file > Upload files (keep the folder structure).
 
-  .github/workflows/ci.yml   new `autoformat` job: runs ruff format and commits the result
-  twitch_radio/...           the 16 files ruff wanted reformatted
+  .github/workflows/cut-release.yml   NEW  the one-click release button
+  .github/workflows/release.yml       now also callable by cut-release.yml (tag pushes + dry run unchanged)
+  scripts/bump-version.py             new `--next patch|minor|major`
+  tests/test_bump_version.py          NEW  tests for it
+  BUILD.md                            release instructions updated
 
-Optional: add a repo secret named AUTOFORMAT_TOKEN (a PAT or GitHub App token with
-contents:write) so the bot's format commit also triggers its own CI run.
-If main is branch-protected against direct pushes, allow github-actions[bot] to push
-or the autoformat job's push will be rejected on main (it works fine on PR branches).
+To release: Actions > Cut release > Run workflow > choose patch/minor/major > Run workflow.
+First release: leave it on "patch"; with no tags yet it releases 1.0.0 as it is.

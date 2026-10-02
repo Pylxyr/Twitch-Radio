@@ -97,6 +97,22 @@ The second command resolves a real YouTube video and needs YouTube and GitHub re
 
 ## Cutting a release
 
+On GitHub: **Actions > Cut release > Run workflow**, pick `patch`, `minor` or `major`, and run it.
+(To set an exact version, such as `1.2.0` or `1.2.0-rc1`, type it into the version box instead.)
+The workflow then, with no further steps from you:
+
+1. works out the next version from the current one (the very first release uses the version already
+   in the files, so a repo at 1.0.0 with no tags releases 1.0.0),
+2. commits the bump to `main` and tags it (`bump-version.py` sets `gui/package.json`,
+   `gui/package-lock.json` and `twitch_radio/version.py`),
+3. builds the installer and publishes the GitHub release by calling **release.yml**.
+
+A version with a `-` suffix (`1.2.0-rc1`) is published as a pre-release. If the build fails after the
+tag was created, fix the problem and run **Cut release** again: the failed version number is simply
+skipped. If the failure was a flaky network step, open the failed run and choose **Re-run failed jobs**.
+
+Prefer a terminal? The manual route still works and gives the same result:
+
 ```
 python scripts\bump-version.py 1.1.0
 git add -A
@@ -105,8 +121,6 @@ git tag v1.1.0
 git push origin main v1.1.0
 ```
 
-`bump-version.py` sets the version in `gui/package.json`, `gui/package-lock.json` and
-`twitch_radio/version.py`. A tag with a `-` suffix (`v1.1.0-rc1`) is published as a pre-release.
 For a dry run, start the **Release** workflow by hand (Actions > Release > Run workflow) with the
 version: it builds everything and uploads the files as a workflow artifact without publishing.
 
@@ -118,7 +132,10 @@ version: it builds everything and uploads the files as a workflow artifact witho
   * `windows-build-smoke`: only on pull requests that touch `twitch_radio/`, `packaging/`, `gui/` or
     `requirements*.txt`. Builds the core with PyInstaller and runs `scripts/smoke_core.py`. The last
     step (real YouTube resolve, needs the network) may fail without failing the PR.
-* **release.yml** runs on `v*.*.*` tags. It first checks that the tag equals the version in
+* **cut-release.yml** is the one-click release button (see "Cutting a release"). It bumps, commits
+  and tags on `main`, then calls release.yml, because a tag pushed with the built-in token does not
+  start other workflows by itself.
+* **release.yml** runs on `v*.*.*` tags, and when called by cut-release.yml. It first checks that the tag equals the version in
   `gui/package.json`, `gui/package-lock.json` and `twitch_radio/version.py`, then builds on
   Windows (pinned tools, PyInstaller core, smoke tests including the real YouTube resolve, which
   is required here, then the NSIS installer), writes `SHA256SUMS.txt`, and publishes a GitHub
