@@ -178,9 +178,16 @@ jobs:
           subject-path: release/Twitch.Radio.Setup.*.exe
       - name: Write release notes
         run: |
-          prev=$(git describe --tags --abbrev=0 --match 'v*.*.*' "${TAG}^" 2>/dev/null || true)
           {
             cat .github/release-notes-header.md
+            echo
+            # What changed since the previous release (grouped, with release/format commits left out).
+            python3 scripts/release_notes.py --tag "$TAG" --repo "$GITHUB_REPOSITORY" || {
+              echo "::warning::Could not build the changelog; publishing without it." >&2
+              echo "See the commit history for what changed."
+            }
+            echo
+            echo "## About this installer"
             echo
             if [ "$SIGNED" = "true" ]; then
               echo "This installer is code-signed."
@@ -190,11 +197,9 @@ jobs:
             if [ "${{ steps.attest.outcome }}" = "success" ]; then
               echo "Build provenance: verify with \`gh attestation verify <file> --repo ${GITHUB_REPOSITORY}\`."
             fi
-            echo
-            echo "## Changes${prev:+ since $prev}"
-            git log --no-merges --pretty='- %s (%h)' ${prev:+$prev..}"$TAG"
           } > notes.md
           cat notes.md
+          cat notes.md >> "$GITHUB_STEP_SUMMARY"
       - name: Create the GitHub release
         run: |
           flags=()
