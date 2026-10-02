@@ -137,8 +137,9 @@ version: it builds everything and uploads the files as a workflow artifact witho
   start other workflows by itself.
 * **release.yml** runs on `v*.*.*` tags, and when called by cut-release.yml. It first checks that the tag equals the version in
   `gui/package.json`, `gui/package-lock.json` and `twitch_radio/version.py`, then builds on
-  Windows (pinned tools, PyInstaller core, smoke tests including the real YouTube resolve, which
-  is required here, then the NSIS installer), writes `SHA256SUMS.txt`, and publishes a GitHub
+  Windows (pinned tools, PyInstaller core, smoke tests, then the NSIS installer; the real YouTube
+  resolve is best effort here because YouTube often blocks GitHub's runners, so a failure is a
+  warning in the run, not a stopped release), writes `SHA256SUMS.txt`, and publishes a GitHub
   release with the installer, `SHA256SUMS.txt` and `THIRD_PARTY_NOTICES.txt`. Release notes are the
   commit subjects since the previous tag under a fixed install / SmartScreen note.
 * Third-party actions are pinned to full commit SHAs with the version in a comment.
