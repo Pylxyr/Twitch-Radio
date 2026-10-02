@@ -240,12 +240,17 @@ jobs:
             release/Twitch.Radio.Setup.*.exe
             release/Twitch-Radio-*-linux-x64.*
       - name: Write release notes
+        env:
+          # Optional. With this secret set, Claude reads the code changes and writes the notes;
+          # without it the notes come from commit messages and a static read of the code.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           {
             cat .github/release-notes-header.md
             echo
-            # What changed since the previous release (grouped, with release/format commits left out).
-            python3 scripts/release_notes.py --tag "$TAG" --repo "$GITHUB_REPOSITORY" || {
+            # What changed since the previous release: an AI summary if a key is set, otherwise grouped
+            # commit messages plus what the code shows for vague messages like "Add files via upload".
+            python3 scripts/release_notes.py --ai --tag "$TAG" --repo "$GITHUB_REPOSITORY" || {
               echo "::warning::Could not build the changelog; publishing without it." >&2
               echo "See the commit history for what changed."
             }
