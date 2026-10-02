@@ -162,7 +162,7 @@ jobs:
           cache-dependency-path: gui/package-lock.json
       - run: pip install -r requirements-build.txt
       - name: Fetch ffmpeg and Deno (pinned, checksum-verified)
-        run: ./packaging/fetch-tools.sh
+        run: bash packaging/fetch-tools.sh
       - name: Build the core with PyInstaller
         run: pyinstaller packaging/core.spec --noconfirm --distpath dist/core --workpath build/pyinstaller
       - name: Smoke test the frozen core
