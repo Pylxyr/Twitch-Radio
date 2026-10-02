@@ -1,0 +1,70 @@
+Twitch Radio - third-party notices
+==================================
+
+Twitch Radio itself is released under the Unlicense (see LICENSE in the source
+repository). The software below is under its own licences.
+
+Twitch Radio bundles or downloads the software below. Each project is under its
+own licence; the summary here is for orientation, and the project's own licence
+text is authoritative. Where a licence requires its text to accompany the
+software, it is included in the installed app folder or at the link given.
+
+Bundled programs
+----------------
+
+ffmpeg - GNU GPL (v3 or later)
+    The "essentials" Windows build from gyan.dev, configured with --enable-gpl
+    and --enable-version3. It runs as a separate program (ffmpeg.exe) that the
+    bot starts to decode audio and encode Opus. Licence text: FFMPEG-LICENSE.txt
+    in the bin folder next to it. Source code and details: https://ffmpeg.org/
+    and https://www.gyan.dev/ffmpeg/builds/ - the exact source for a build is
+    available from those sites on request. https://ffmpeg.org/legal.html
+
+Deno - MIT
+    JavaScript runtime that yt-dlp uses to run YouTube's player scripts.
+    https://github.com/denoland/deno
+
+Python application core (frozen with PyInstaller)
+-------------------------------------------------
+
+Python - PSF License                       https://docs.python.org/3/license.html
+PyInstaller - GPL-2.0 with a bootloader exception that allows distributing the
+    frozen program under any licence      https://pyinstaller.org/
+yt-dlp - Unlicense                         https://github.com/yt-dlp/yt-dlp
+twitchio - MIT                             https://github.com/PythonistaGuild/TwitchIO
+aiohttp - Apache-2.0                       https://github.com/aio-libs/aiohttp
+python-dotenv - BSD-3-Clause               https://github.com/theskumar/python-dotenv
+psutil - BSD-3-Clause                      https://github.com/giampaolo/psutil
+curl_cffi - MIT                            https://github.com/lexiforest/curl_cffi
+Brotli - MIT                               https://github.com/google/brotli
+certifi - MPL-2.0                          https://github.com/certifi/python-certifi
+mutagen - GPL-2.0-or-later                 https://github.com/quodlibet/mutagen
+pycryptodomex - BSD-2-Clause / public domain   https://github.com/Legrandin/pycryptodome
+requests - Apache-2.0                      https://github.com/psf/requests
+urllib3 - MIT                              https://github.com/urllib3/urllib3
+websockets - BSD-3-Clause                  https://github.com/python-websockets/websockets
+Their own dependencies (for example aiohttp's and curl_cffi's) are installed
+with them and carry their own licences.
+
+Desktop shell
+-------------
+
+Electron - MIT                             https://github.com/electron/electron
+Chromium and Node.js, included in Electron - see LICENSES.chromium.html in the
+    installed app folder, and https://nodejs.org/
+electron-builder (build tool, not shipped) - MIT
+
+Downloaded at runtime, not shipped
+----------------------------------
+
+yt-dlp JS challenge solver scripts - Unlicense
+    https://github.com/yt-dlp/ejs
+    These are NOT part of the installer. yt-dlp downloads the scripts that match
+    its own version over HTTPS the first time it needs them and keeps them in
+    the Twitch Radio data folder (%APPDATA%\TwitchRadio\data\yt-dlp-cache). They
+    run inside Deno.
+
+yt-dlp updates - Unlicense
+    If you press "Update" in Settings > App, a newer yt-dlp release is downloaded
+    from https://github.com/yt-dlp/yt-dlp (checksum verified) into
+    %APPDATA%\TwitchRadio\yt-dlp.

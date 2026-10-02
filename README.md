@@ -1,6 +1,11 @@
-# Twitch Radio Bot — Windows Setup
+# Twitch Radio — Windows Setup
 
-A song-request bot for your Twitch stream. Viewers type `!sr <song>` in
+> **Desktop app available.** This project can also be built into a double-click Windows app with a
+> dashboard, live log viewer, Start/Stop buttons and a Settings screen, with ffmpeg and Deno bundled
+> (no terminal, no manual installs for end users). See [BUILD.md](BUILD.md). The steps below still
+> work if you prefer running from source.
+
+Twitch Radio is a song-request radio for your Twitch stream. Viewers type `!sr <song>` in
 chat, it queues the song, and it feeds audio + an on-screen overlay into
 OBS. Everything runs on your own PC.
 
@@ -225,3 +230,21 @@ for — safe to leave alone unless you have a specific reason to change it.
 
 It doesn't stream to Twitch by itself — it only feeds OBS locally, like
 any Media/Browser Source. Song requests support YouTube only.
+
+## Development
+
+```
+pip install -r requirements-dev.txt -r requirements.txt
+ruff check .
+mypy twitch_radio bot.py
+pytest -q
+
+cd gui && npm ci && npm run lint && npm run check && npm test && npm run check:build
+```
+
+See `BUILD.md` for building the installer, the CI workflows, cutting a release and how the yt-dlp
+and app update checks work, and `CONTRIBUTING.md` for the ground rules.
+
+## License
+
+Public domain under the [Unlicense](LICENSE). Bundled third-party software keeps its own licences; see `THIRD_PARTY_NOTICES.txt`.
