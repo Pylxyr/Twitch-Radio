@@ -180,13 +180,15 @@ version: it builds everything and uploads the files as a workflow artifact witho
   Windows (pinned tools, PyInstaller core, smoke tests, then the NSIS installer; the real YouTube
   resolve is best effort here because YouTube often blocks GitHub's runners, so a failure is a
   warning in the run, not a stopped release), writes `SHA256SUMS.txt`, and publishes a GitHub
-  release with the installer, `SHA256SUMS.txt` and `THIRD_PARTY_NOTICES.txt`. Release notes are the
-  a changelog built by `scripts/release_notes.py` from the commits since the previous release
-  (grouped into Added / Fixed / Changed / Removed / Dependencies, with release-bump, `ruff format` and
-  merge commits left out, plus a compare link), under the fixed install note from
-  `.github/release-notes-header.md`. Start commit messages with Add, Fix, Remove or Update (or
-  `feat:` / `fix:`) and they land in the right group. A stable release is compared with the previous
-  stable release, not with a release candidate.
+  release with the installer, `SHA256SUMS.txt` and `THIRD_PARTY_NOTICES.txt`.
+  Release notes are a changelog built by `scripts/release_notes.py` from the changes since the previous release: commit messages grouped into Added / Fixed / Changed /
+  Removed / Dependencies (release-bump, `ruff format` and merge commits are left out). For vague
+  messages such as "Add files via upload" or "Update bot.py" it reads the code instead and lists new
+  or removed chat commands, settings and functions plus the files changed per area. With the optional
+  `ANTHROPIC_API_KEY` repository secret, Claude reads the diff and writes the notes in plain language
+  (any error falls back to the above). A compare link is added, under the fixed install note from
+  `.github/release-notes-header.md`. A stable release is compared with the previous stable release,
+  not with a release candidate.
 * Third-party actions are pinned to full commit SHAs with the version in a comment.
   `.github/dependabot.yml` opens weekly pull requests for GitHub Actions, pip and npm, which is how
   they stay fresh. Review those PRs (Dependabot updates the SHA and the comment together).
