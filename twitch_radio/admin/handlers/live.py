@@ -124,4 +124,6 @@ async def handle_logo(request: web.Request) -> web.Response:
     body = ctx.logo_small if request.query.get("s") == "32" else ctx.logo
     if body is None:
         return web.Response(status=404, text="No logo asset installed")
-    return web.Response(body=body, content_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+    return web.Response(
+        body=body, content_type="image/png", headers={"Cache-Control": "public, max-age=86400"}
+    )

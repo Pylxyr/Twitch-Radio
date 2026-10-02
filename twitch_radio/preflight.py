@@ -81,12 +81,20 @@ def build_report() -> dict[str, Any]:
         report["config_ok"] = error is None
         report["config_error"] = error
 
-        js_name = (settings.ytdlp_js_runtime_name if settings else os.getenv("YTDLP_JS_RUNTIME_NAME", "deno")) or "deno"
-        js_path = settings.ytdlp_js_runtime_path if settings else (os.getenv("YTDLP_JS_RUNTIME_PATH") or "").strip()
+        js_name = (
+            settings.ytdlp_js_runtime_name if settings else os.getenv("YTDLP_JS_RUNTIME_NAME", "deno")
+        ) or "deno"
+        js_path = (
+            settings.ytdlp_js_runtime_path if settings else (os.getenv("YTDLP_JS_RUNTIME_PATH") or "").strip()
+        )
         ffmpeg = shutil.which("ffmpeg")
         js = shutil.which(js_path) if js_path else shutil.which(js_name)
         report["ffmpeg"] = {"path": ffmpeg, "version": _first_line([ffmpeg, "-version"]) if ffmpeg else None}
-        report["js_runtime"] = {"name": js_name, "path": js, "version": _first_line([js, "--version"]) if js else None}
+        report["js_runtime"] = {
+            "name": js_name,
+            "path": js,
+            "version": _first_line([js, "--version"]) if js else None,
+        }
 
         bot_id = settings.bot_id if settings else os.getenv("TWITCH_BOT_ID", "").strip() or None
         owner_id = settings.owner_id if settings else os.getenv("TWITCH_OWNER_ID", "").strip() or None
@@ -100,6 +108,7 @@ def build_report() -> dict[str, Any]:
                 "port": settings.nowplaying_port,
                 "password_set": settings.settings_password is not None,
             }
+
         def _data_file(env_name: str, default: str) -> str:
             return str(config.DATA_DIR / (os.getenv(env_name, default).strip() or default))
 

@@ -23,7 +23,8 @@ _CHUNK_DURATION = 0.1
 _CHUNK_BYTES = int(AUDIO_RATE * AUDIO_CHANNELS * 2 * _CHUNK_DURATION)
 _SILENCE_CHUNK = b"\x00" * _CHUNK_BYTES
 _STREAM_CHUNK_BYTES = 8192
-_SUBSCRIBER_QUEUE_SIZE = 50  # ~5-10s of Opus at typical bitrates; a stalled listener gets dropped, not buffered forever
+# ~5-10s of Opus at typical bitrates; a stalled listener gets dropped, not buffered forever.
+_SUBSCRIBER_QUEUE_SIZE = 50
 # How far behind real time a listener typically hears /stream.opus (client
 # buffering) — the overlay's title change is held back by this much so it
 # doesn't jump ahead of what's actually audible. Tune to taste.
@@ -39,23 +40,24 @@ def _iter_ogg_pages(buf: bytes) -> tuple[list[bytes], bytes]:
     pos = 0
     n = len(buf)
     while True:
-        if n - pos < 27 or buf[pos:pos + 4] != b"OggS":
+        if n - pos < 27 or buf[pos : pos + 4] != b"OggS":
             break
         segment_count = buf[pos + 26]
         header_len = 27 + segment_count
         if n - pos < header_len:
             break
-        body_len = sum(buf[pos + 27:pos + header_len])
+        body_len = sum(buf[pos + 27 : pos + header_len])
         page_len = header_len + body_len
         if n - pos < page_len:
             break
-        pages.append(buf[pos:pos + page_len])
+        pages.append(buf[pos : pos + page_len])
         pos += page_len
     return pages, buf[pos:]
 
 
 def _ogg_page_granule(page: bytes) -> int:
     return int.from_bytes(page[6:14], "little", signed=True)
+
 
 _MIN_BACKOFF = 5.0
 _MAX_BACKOFF = 300.0
@@ -106,16 +108,32 @@ def _decoder_cmd(stream_url: str) -> list[str]:
         # fatal, not error: a mid-pull TLS reset is exactly what -reconnect
         # below recovers from on its own — logging it at "error" was just
         # noise on every transient CDN hiccup.
-        _ffmpeg(), "-hide_banner", "-loglevel", "fatal",
+        _ffmpeg(),
+        "-hide_banner",
+        "-loglevel",
+        "fatal",
         # Reconnect flags recover from a dropped/hiccuping CDN connection
         # instead of corrupting the stream — including one that's gone
         # idle while a prepared-ahead decoder sat waiting for its turn to
         # play. -probesize/-analyzeduration skip ffmpeg's default
         # multi-second format probe, cutting startup latency.
-        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
-        "-reconnect_on_network_error", "1", "-reconnect_on_http_error", "429,500,502,503,504",
-        "-probesize", "128k", "-analyzeduration", "0",
-        "-re", "-i", stream_url,
+        "-reconnect",
+        "1",
+        "-reconnect_streamed",
+        "1",
+        "-reconnect_delay_max",
+        "5",
+        "-reconnect_on_network_error",
+        "1",
+        "-reconnect_on_http_error",
+        "429,500,502,503,504",
+        "-probesize",
+        "128k",
+        "-analyzeduration",
+        "0",
+        "-re",
+        "-i",
+        stream_url,
         # Single-pass (dynamic) EBU R128 loudness normalization — every
         # track lands around the same perceived volume regardless of how
         # loud the original upload was, instead of a jump on every track
@@ -124,10 +142,16 @@ def _decoder_cmd(stream_url: str) -> list[str]:
         # this never clips. Two-pass would sound marginally better but
         # needs the whole file decoded first — not compatible with
         # starting playback immediately.
-        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-        "-f", "s16le", "-ar", str(AUDIO_RATE), "-ac", str(AUDIO_CHANNELS), "-",
+        "-af",
+        "loudnorm=I=-16:TP=-1.5:LRA=11",
+        "-f",
+        "s16le",
+        "-ar",
+        str(AUDIO_RATE),
+        "-ac",
+        str(AUDIO_CHANNELS),
+        "-",
     ]
-
 
 
 class TrackResolver(Protocol):
@@ -748,19 +772,34 @@ class RadioPlayer:
 
     async def _spawn_encoder(self) -> None:
         cmd = [
-            _ffmpeg(), "-hide_banner", "-loglevel", "error",
-            "-f", "s16le", "-ar", str(AUDIO_RATE), "-ac", str(AUDIO_CHANNELS), "-i", "-",
+            _ffmpeg(),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "s16le",
+            "-ar",
+            str(AUDIO_RATE),
+            "-ac",
+            str(AUDIO_CHANNELS),
+            "-i",
+            "-",
             # Opus over Ogg: Opus beats MP3 at the same bitrate (transparent
             # well under half MP3's bitrate — see AUDIO_BITRATE_KBPS in
             # .env), and Ogg is natively built for exactly this — an
             # unbounded live stream muxed page-by-page — where MP3 only
             # ever worked by omitting the tags/duration header it expects.
-            "-c:a", "libopus", "-b:a", f"{self._audio_bitrate_kbps}k", "-vbr", "on",
-            "-f", "ogg", "-",
+            "-c:a",
+            "libopus",
+            "-b:a",
+            f"{self._audio_bitrate_kbps}k",
+            "-vbr",
+            "on",
+            "-f",
+            "ogg",
+            "-",
         ]
-        self._encoder = await _spawn(
-            *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE
-        )
+        self._encoder = await _spawn(*cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
         self._encoder_starts += 1
         log.info("Audio encoder started (%dkbps Opus).", self._audio_bitrate_kbps)
 
@@ -815,7 +854,10 @@ class RadioPlayer:
         while not self._stopping:
             if self._encoder.returncode is not None:
                 raise RuntimeError(f"Encoder exited with code {self._encoder.returncode}")
-            if not self._backoff_reset_done and time.monotonic() - self._encoder_spawned_at >= _STABLE_UPTIME_SECONDS:
+            if (
+                not self._backoff_reset_done
+                and time.monotonic() - self._encoder_spawned_at >= _STABLE_UPTIME_SECONDS
+            ):
                 self._backoff = _MIN_BACKOFF
                 self._backoff_reset_done = True
             if self._paused:
@@ -826,7 +868,9 @@ class RadioPlayer:
                 await self._write_paced_silence(encoder_stdin)
                 continue
             about_to_resume = bool(self._pending) and self._pending[0].bypass_listener_pause
-            if self._pending and not (self._pause_when_no_listeners and not self._subscribers and not about_to_resume):
+            if self._pending and not (
+                self._pause_when_no_listeners and not self._subscribers and not about_to_resume
+            ):
                 request = self._pending.pop(0)
                 self._fire_and_forget(self._persist_queue(), name="persist-queue")
             else:
@@ -929,7 +973,8 @@ class RadioPlayer:
         """
         started_at = time.monotonic()
         resolve_delay = max(0.0, current_duration - _PREFETCH_LEAD_SECONDS)
-        await asyncio.sleep(resolve_delay)  # cancelled cleanly by _play_one's finally when the track ends first
+        # Cancelled cleanly by _play_one's finally when the track ends first.
+        await asyncio.sleep(resolve_delay)
         if not self._pending:
             # Ask for a radio-mix pick ourselves — awaited, not the fire-
             # and-forget _maybe_start_radio_fill(), so there's actually
@@ -998,17 +1043,21 @@ class RadioPlayer:
         decoder: asyncio.subprocess.Process | None = None
         try:
             try:
-                decoder = await _spawn(
-                    *_decoder_cmd(track.stream_url), stdout=asyncio.subprocess.PIPE
-                )
+                decoder = await _spawn(*_decoder_cmd(track.stream_url), stdout=asyncio.subprocess.PIPE)
             except asyncio.CancelledError:
                 raise
             except Exception:
-                log.debug("Prepare-ahead decoder spawn failed for %s (non-fatal).", request.webpage_url, exc_info=True)
+                log.debug(
+                    "Prepare-ahead decoder spawn failed for %s (non-fatal).",
+                    request.webpage_url,
+                    exc_info=True,
+                )
                 return None
             assert decoder.stdout is not None
             try:
-                first_chunk = await asyncio.wait_for(decoder.stdout.read(_CHUNK_BYTES), timeout=_DECODER_START_TIMEOUT)
+                first_chunk = await asyncio.wait_for(
+                    decoder.stdout.read(_CHUNK_BYTES), timeout=_DECODER_START_TIMEOUT
+                )
             except TimeoutError:
                 return None
             if not first_chunk or request.cancelled:
@@ -1097,7 +1146,9 @@ class RadioPlayer:
             prepared = None
 
         if prepared is not None:
-            await self._start_and_stream(prepared.track, prepared.decoder, prepared.first_chunk, request, encoder_stdin)
+            await self._start_and_stream(
+                prepared.track, prepared.decoder, prepared.first_chunk, request, encoder_stdin
+            )
             return
 
         self._skip_pending = False
@@ -1125,17 +1176,19 @@ class RadioPlayer:
                 return
             duration_limit = await self._current_duration_limit()
             if 0 < duration_limit < track.duration:
-                log.warning("Re-resolve found %s now exceeds the duration cap — skipping", request.webpage_url)
-                await self._notify_failed(f"Skipped {request.requester_name}'s song — it's too long to play now.")
+                log.warning(
+                    "Re-resolve found %s now exceeds the duration cap — skipping", request.webpage_url
+                )
+                await self._notify_failed(
+                    f"Skipped {request.requester_name}'s song — it's too long to play now."
+                )
                 return
             if self._skip_pending:
                 self._skip_pending = False
                 log.info("Skipped %s before it started playing (mid-resolve skip).", track.title)
                 return
 
-            decoder = await _spawn(
-                *_decoder_cmd(track.stream_url), stdout=asyncio.subprocess.PIPE
-            )
+            decoder = await _spawn(*_decoder_cmd(track.stream_url), stdout=asyncio.subprocess.PIPE)
             self._current_decoder = decoder
             if self._skip_pending:
                 self._skip_pending = False
@@ -1148,10 +1201,14 @@ class RadioPlayer:
                 return
             assert decoder.stdout is not None
             try:
-                first_chunk = await asyncio.wait_for(decoder.stdout.read(_CHUNK_BYTES), timeout=_DECODER_START_TIMEOUT)
+                first_chunk = await asyncio.wait_for(
+                    decoder.stdout.read(_CHUNK_BYTES), timeout=_DECODER_START_TIMEOUT
+                )
             except TimeoutError:
                 log.warning("Timed out waiting for decoder output for %s — skipping.", request.webpage_url)
-                await self._notify_failed(f"Skipped {request.requester_name}'s song — it took too long to start.")
+                await self._notify_failed(
+                    f"Skipped {request.requester_name}'s song — it took too long to start."
+                )
                 with contextlib.suppress(ProcessLookupError):
                     decoder.kill()
                 await decoder.wait()
@@ -1221,7 +1278,8 @@ class RadioPlayer:
                 except TimeoutError:
                     log.warning(
                         "No audio from decoder for %.0fs (stalled source?) — skipping %s.",
-                        _STALL_TIMEOUT_SECONDS, request.webpage_url,
+                        _STALL_TIMEOUT_SECONDS,
+                        request.webpage_url,
                     )
                     await self._notify_failed(f"Skipped {request.requester_name}'s song — playback stalled.")
                     break

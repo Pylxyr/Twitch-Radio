@@ -152,9 +152,19 @@ def _check_cookies_path_writable(raw: str, path: Path) -> None:
 # private API; re-verify against the pinned yt-dlp version if this needs
 # updating.
 _VALID_PLAYER_CLIENTS = {
-    "web": True, "web_safari": True, "web_embedded": True, "web_music": True,
-    "web_creator": True, "android": False, "android_vr": False, "ios": False,
-    "visionos": False, "mweb": True, "tv": True, "tv_downgraded": True, "tv_simply": False,
+    "web": True,
+    "web_safari": True,
+    "web_embedded": True,
+    "web_music": True,
+    "web_creator": True,
+    "android": False,
+    "android_vr": False,
+    "ios": False,
+    "visionos": False,
+    "mweb": True,
+    "tv": True,
+    "tv_downgraded": True,
+    "tv_simply": False,
 }
 
 
@@ -372,7 +382,9 @@ def load_settings() -> Settings:
     )
 
 
-def token_status(bot_id: str | None, owner_id: str | None, token_path: Path | None = None) -> dict[str, object]:
+def token_status(
+    bot_id: str | None, owner_id: str | None, token_path: Path | None = None
+) -> dict[str, object]:
     """Which of the two OAuth authorizations exist on disk.
 
     twitchio's token file is a JSON object keyed by Twitch user ID (verified

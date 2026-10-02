@@ -37,7 +37,11 @@ _URL_RE = re.compile(r"^https?://", re.IGNORECASE)
 # twice: the host check below, plus `allowed_extractors` in
 # _build_options() in case a redirect resolves through something else.
 _ALLOWED_URL_HOSTS = {
-    "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be",
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+    "youtu.be",
 }
 # re.fullmatch against yt-dlp's lowercased IE_NAME; covers every youtube:*
 # variant while excluding "generic", the scrape-any-webpage fallback this
@@ -149,7 +153,12 @@ class ThreadBackend(ExtractionBackend):
         self._concurrency = concurrency
 
     def status(self) -> dict[str, Any]:
-        return {"mode": "thread", "size": self._concurrency, "alive": self._concurrency, "idle": self._concurrency}
+        return {
+            "mode": "thread",
+            "size": self._concurrency,
+            "alive": self._concurrency,
+            "idle": self._concurrency,
+        }
 
     def _extract_sync(self, query: str, options: dict[str, Any]) -> dict[str, Any]:
         # Keyed by the options themselves (not a fast/slow flag) so the
@@ -171,7 +180,9 @@ class ThreadBackend(ExtractionBackend):
         async with self._semaphore:
             try:
                 return await asyncio.wait_for(
-                    loop.run_in_executor(self._executor, functools.partial(self._extract_sync, query, options)),
+                    loop.run_in_executor(
+                        self._executor, functools.partial(self._extract_sync, query, options)
+                    ),
                     timeout=timeout,
                 )
             except TimeoutError as exc:
@@ -621,7 +632,9 @@ class Resolver:
         }
         extractor_args: dict[str, dict[str, list[str]]] = {}
         player_client = (
-            player_client_override if player_client_override is not None else self._settings.ytdlp_player_client
+            player_client_override
+            if player_client_override is not None
+            else self._settings.ytdlp_player_client
         )
         if player_client:
             extractor_args["youtube"] = {"player_client": list(player_client)}
@@ -672,12 +685,16 @@ class Resolver:
             start = time.monotonic()
             try:
                 info = await self._extract_info_via(
-                    query, fast=True, timeout=min(self._settings.ytdlp_extract_timeout_seconds, _FAST_EXTRACT_TIMEOUT_SECONDS)
+                    query,
+                    fast=True,
+                    timeout=min(self._settings.ytdlp_extract_timeout_seconds, _FAST_EXTRACT_TIMEOUT_SECONDS),
                 )
             except DownloadError as exc:
                 log.info(
                     "Fast resolve failed for %r after %.1fs (%s) — falling back.",
-                    query, time.monotonic() - start, exc,
+                    query,
+                    time.monotonic() - start,
+                    exc,
                 )
             else:
                 if self._has_playable_url(info):
@@ -685,11 +702,14 @@ class Resolver:
                     return info
                 log.info(
                     "Fast resolve returned no playable format for %r after %.1fs — falling back.",
-                    query, time.monotonic() - start,
+                    query,
+                    time.monotonic() - start,
                 )
 
         start = time.monotonic()
-        info = await self._extract_info_via(query, fast=False, timeout=self._settings.ytdlp_extract_timeout_seconds)
+        info = await self._extract_info_via(
+            query, fast=False, timeout=self._settings.ytdlp_extract_timeout_seconds
+        )
         log.debug("Resolve for %r took %.1fs.", query, time.monotonic() - start)
         return info
 

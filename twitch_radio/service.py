@@ -500,7 +500,9 @@ class BotRuntime:
             self._tokens = await asyncio.to_thread(token_status, s.bot_id, s.owner_id, s.token_path)
         if self._toggles_store is not None:
             with contextlib.suppress(Exception):
-                self._radio_autoplay = FeatureToggles.from_dict(await self._toggles_store.read()).radio_autoplay_enabled
+                self._radio_autoplay = FeatureToggles.from_dict(
+                    await self._toggles_store.read()
+                ).radio_autoplay_enabled
 
     def _emit_snapshot(self, lag_ms: float) -> None:
         if self._emit is not None:

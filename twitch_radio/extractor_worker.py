@@ -135,7 +135,13 @@ class _Worker:
 
         from twitch_radio import ytdlp_loader
 
-        self._respond({"ready": True, "yt_dlp": yt_dlp.version.__version__, "source": ytdlp_loader.import_with_fallback()["source"]})
+        self._respond(
+            {
+                "ready": True,
+                "yt_dlp": yt_dlp.version.__version__,
+                "source": ytdlp_loader.import_with_fallback()["source"],
+            }
+        )
         for line in sys.stdin:
             line = line.strip()
             if not line:

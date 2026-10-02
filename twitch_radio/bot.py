@@ -78,16 +78,54 @@ def run() -> None:
         action="store_true",
         help="Prompt for a /settings password and print the hash to put in TWITCH_SETTINGS_PASSWORD.",
     )
-    parser.add_argument("--hash-password-stdin", action="store_true", help="(desktop app) read a password from stdin, print its hash.")
-    parser.add_argument("--env-json", action="store_true", help="(desktop app) print the .env values as JSON and exit.")
-    parser.add_argument("--env-update-stdin", action="store_true", help="(desktop app) apply a JSON object from stdin to .env.")
-    parser.add_argument("--preflight", action="store_true", help="(desktop app) print a JSON health report and exit.")
-    parser.add_argument("--headless", action="store_true", help="(desktop app) run with the JSON control channel on stdin/stdout.")
-    parser.add_argument("--ytdlp-check", action="store_true", help="(desktop app) look for a newer yt-dlp release, print JSON.")
-    parser.add_argument("--ytdlp-install", action="store_true", help="(desktop app) install the latest yt-dlp release, print JSON.")
-    parser.add_argument("--ytdlp-rollback", action="store_true", help="(desktop app) go back to the previous yt-dlp copy, print JSON.")
-    parser.add_argument("--ytdlp-selftest", nargs="?", const="", metavar="DIR", help="import yt_dlp (from DIR first, if given) and print JSON.")
-    parser.add_argument("--resolve-test", metavar="URL", help="resolve one YouTube URL end to end and print JSON (CI smoke test).")
+    parser.add_argument(
+        "--hash-password-stdin",
+        action="store_true",
+        help="(desktop app) read a password from stdin, print its hash.",
+    )
+    parser.add_argument(
+        "--env-json", action="store_true", help="(desktop app) print the .env values as JSON and exit."
+    )
+    parser.add_argument(
+        "--env-update-stdin",
+        action="store_true",
+        help="(desktop app) apply a JSON object from stdin to .env.",
+    )
+    parser.add_argument(
+        "--preflight", action="store_true", help="(desktop app) print a JSON health report and exit."
+    )
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="(desktop app) run with the JSON control channel on stdin/stdout.",
+    )
+    parser.add_argument(
+        "--ytdlp-check",
+        action="store_true",
+        help="(desktop app) look for a newer yt-dlp release, print JSON.",
+    )
+    parser.add_argument(
+        "--ytdlp-install",
+        action="store_true",
+        help="(desktop app) install the latest yt-dlp release, print JSON.",
+    )
+    parser.add_argument(
+        "--ytdlp-rollback",
+        action="store_true",
+        help="(desktop app) go back to the previous yt-dlp copy, print JSON.",
+    )
+    parser.add_argument(
+        "--ytdlp-selftest",
+        nargs="?",
+        const="",
+        metavar="DIR",
+        help="import yt_dlp (from DIR first, if given) and print JSON.",
+    )
+    parser.add_argument(
+        "--resolve-test",
+        metavar="URL",
+        help="resolve one YouTube URL end to end and print JSON (CI smoke test).",
+    )
     args = parser.parse_args()
 
     prepend_bundled_bins_to_path()
@@ -212,7 +250,10 @@ def _ytdlp_selftest(directory: str) -> int:
         except ImportError:
             ejs_importable = False
         report.update(
-            ok=True, version=yt_dlp.version.__version__, file=str(yt_dlp.__file__), yt_dlp_ejs_importable=ejs_importable
+            ok=True,
+            version=yt_dlp.version.__version__,
+            file=str(yt_dlp.__file__),
+            yt_dlp_ejs_importable=ejs_importable,
         )
     except Exception as exc:  # noqa: BLE001 - the whole point is to report any import failure
         report["error"] = f"{type(exc).__name__}: {exc}"
@@ -238,7 +279,11 @@ def _resolve_test(url: str) -> int:
         report: dict[str, object] = {"ok": False}
         try:
             track = await resolver.resolve(url, 0)
-            report.update(ok=track is not None, title=track.title if track else None, duration=track.duration if track else None)
+            report.update(
+                ok=track is not None,
+                title=track.title if track else None,
+                duration=track.duration if track else None,
+            )
         except Exception as exc:  # noqa: BLE001
             report["error"] = f"{type(exc).__name__}: {exc}"
         finally:
@@ -306,7 +351,9 @@ def _check_config() -> int:
     # Deliberately never prints client_secret or settings_password.
     print("Config OK:")
     print(f"  Twitch: bot_id={settings.bot_id} owner_id={settings.owner_id} prefix={settings.prefix!r}")
-    print(f"  Audio: {settings.audio_bitrate_kbps} kbps, pause_when_no_listeners={settings.pause_when_no_listeners}")
+    print(
+        f"  Audio: {settings.audio_bitrate_kbps} kbps, pause_when_no_listeners={settings.pause_when_no_listeners}"
+    )
     if settings.settings_password is None:
         login = "no password - /settings is reachable only from this machine, never through a proxy"
     else:
@@ -314,7 +361,11 @@ def _check_config() -> int:
     print(f"  HTTP: http://{settings.nowplaying_host}:{settings.nowplaying_port} ({login})")
     print(
         f"  Sessions: {settings.session_hours}h"
-        + (f", or {settings.session_remember_days}d with 'keep me signed in'" if settings.session_remember_days else "")
+        + (
+            f", or {settings.session_remember_days}d with 'keep me signed in'"
+            if settings.session_remember_days
+            else ""
+        )
     )
     print(f"  Trusted proxies: {', '.join(str(net) for net in settings.trusted_proxies) or 'none'}")
     token_status = "found" if settings.token_path.exists() else "missing - run OAuth setup before starting"
@@ -326,4 +377,3 @@ def _check_config() -> int:
         f"cookies={'configured' if settings.ytdlp_cookies_file else 'none'}"
     )
     return 0
-

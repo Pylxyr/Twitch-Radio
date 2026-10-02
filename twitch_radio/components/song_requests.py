@@ -68,7 +68,9 @@ class SongRequestComponent(commands.Component):
 
         pending = self.bot.pending_by_chatter.get(chatter_key, 0)
         if pending >= tunables.max_pending_per_chatter:
-            await self.bot.safe_reply(ctx, f"You already have {pending} request(s) queued — wait for one to play first.")
+            await self.bot.safe_reply(
+                ctx, f"You already have {pending} request(s) queued — wait for one to play first."
+            )
             return
 
         if self.bot.player.queue_size() >= tunables.queue_cap:
@@ -185,7 +187,9 @@ class SongRequestComponent(commands.Component):
             )
             reserved = False  # ownership of the reservation now belongs to on_start's eventual decrement
             counters.record("requests_queued")
-            await self.bot.safe_reply(ctx, f"Queued: {track.title} (#{self.bot.player.queue_size()} in queue)")
+            await self.bot.safe_reply(
+                ctx, f"Queued: {track.title} (#{self.bot.player.queue_size()} in queue)"
+            )
         except Exception:
             # Catch-all so a bug here can't silently eat the chatter's
             # pending-count reservation forever, or fail with no reply at
@@ -276,10 +280,14 @@ class SongRequestComponent(commands.Component):
         if skipped:
             await self.bot.safe_reply(ctx, "Vote-skipped!")
         elif not is_new:
-            await self.bot.safe_reply(ctx, f"You've already voted to skip this one ({count}/{tunables.vote_skip_threshold}).")
+            await self.bot.safe_reply(
+                ctx, f"You've already voted to skip this one ({count}/{tunables.vote_skip_threshold})."
+            )
         else:
             needed = tunables.vote_skip_threshold - count
-            await self.bot.safe_reply(ctx, f"Skip vote registered ({count}/{tunables.vote_skip_threshold}) — {needed} more needed.")
+            await self.bot.safe_reply(
+                ctx, f"Skip vote registered ({count}/{tunables.vote_skip_threshold}) — {needed} more needed."
+            )
 
     @commands.command(name="remove", aliases=["cancel", "unqueue"])
     async def remove(self, ctx: commands.Context) -> None:
@@ -335,7 +343,9 @@ class SongRequestComponent(commands.Component):
             await self.bot.safe_reply(ctx, "Nothing's playing right now.")
             return
         elapsed = max(0, int(time.monotonic() - np.started_at))
-        await self.bot.safe_reply(ctx, f"Now playing: {np.title} — requested by {np.requester_name} ({elapsed}s in)")
+        await self.bot.safe_reply(
+            ctx, f"Now playing: {np.title} — requested by {np.requester_name} ({elapsed}s in)"
+        )
 
     @commands.command(name="radio")
     async def radio_toggle(self, ctx: commands.Context, *, arg: str = "") -> None:
@@ -350,7 +360,9 @@ class SongRequestComponent(commands.Component):
             return
         chatter = ctx.chatter
         if not (isinstance(chatter, Chatter) and chatter.moderator):
-            await self.bot.safe_reply(ctx, "Only mods can change that — try !radio with no argument to check status.")
+            await self.bot.safe_reply(
+                ctx, "Only mods can change that — try !radio with no argument to check status."
+            )
             return
         if arg not in ("on", "off"):
             await self.bot.safe_reply(ctx, "Usage: !radio [on|off]")
@@ -375,7 +387,9 @@ class SongRequestComponent(commands.Component):
             await self.bot.safe_reply(ctx, "Nothing's playing right now.")
             return
         blocked_by = ctx.chatter.display_name or ctx.chatter.name or "a mod"
-        ok = await self.bot.blocklist.block(np.webpage_url, title=np.title, uploader=np.uploader, blocked_by=blocked_by)
+        ok = await self.bot.blocklist.block(
+            np.webpage_url, title=np.title, uploader=np.uploader, blocked_by=blocked_by
+        )
         if not ok:
             await self.bot.safe_reply(ctx, "Couldn't identify that as a YouTube video to block.")
             return

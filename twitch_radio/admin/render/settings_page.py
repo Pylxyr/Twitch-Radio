@@ -24,7 +24,9 @@ FORM_MARKER = "_settings_form"
 
 
 # Only offered when a password is set (otherwise there is no session to end).
-_SIGNOUT_FORM = '<form class="signout" method="post" action="/logout"><button type="submit">Sign out</button></form>'
+_SIGNOUT_FORM = (
+    '<form class="signout" method="post" action="/logout"><button type="submit">Sign out</button></form>'
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,7 +51,7 @@ def _tunable_rows(tunables: TwitchTunables) -> str:
             f'<input id="f-{escape(name)}" type="number" name="{escape(name)}" '
             f'value="{value}" min="{lo}" max="{hi}" step="1" inputmode="numeric">'
             f'<p class="help">{escape(help_text)} <span class="range">{lo}\u2013{hi}</span></p>'
-            f'</div>'
+            f"</div>"
         )
     return "".join(rows)
 
@@ -64,7 +66,7 @@ def _toggle_rows(toggles: FeatureToggles) -> str:
             f'<span class="switch" aria-hidden="true"></span>'
             f'<span class="switch-text"><code>{escape(key)}</code>'
             f'<span class="help">{escape(desc)}</span></span>'
-            f'</label>'
+            f"</label>"
         )
     return "".join(rows)
 

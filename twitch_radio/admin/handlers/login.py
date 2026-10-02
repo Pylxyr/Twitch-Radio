@@ -123,4 +123,3 @@ async def handle_logout(request: web.Request) -> web.Response:
     response = redirect("/login?signed_out=1")
     clear_session_cookie(response)
     return response
-

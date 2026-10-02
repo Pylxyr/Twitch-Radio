@@ -40,7 +40,9 @@ def render_login_page(
         if remember_days > 0
         else ""
     )
-    logo = '<img class="mark" src="/logo.png" alt="" onerror="this.remove()">' if has_logo else "<span></span>"
+    logo = (
+        '<img class="mark" src="/logo.png" alt="" onerror="this.remove()">' if has_logo else "<span></span>"
+    )
     return template("login.html").substitute(
         css=static_text("login.css"),
         js=static_text("login.js"),

@@ -37,13 +37,21 @@ class LogBus(logging.Handler):
             elif record.exc_text:
                 trace = record.exc_text
             entries: list[LogEntry] = []
-            first, *rest = (message.splitlines() or [""])
-            entries.append({"ts": record.created, "level": record.levelname, "logger": record.name, "msg": first})
+            first, *rest = message.splitlines() or [""]
+            entries.append(
+                {"ts": record.created, "level": record.levelname, "logger": record.name, "msg": first}
+            )
             # One entry per line so the viewer can keep fixed-height rows;
             # `cont` marks a continuation of the entry above it.
             for extra in [*rest, *trace.splitlines()]:
                 entries.append(
-                    {"ts": record.created, "level": record.levelname, "logger": record.name, "msg": extra, "cont": True}
+                    {
+                        "ts": record.created,
+                        "level": record.levelname,
+                        "logger": record.name,
+                        "msg": extra,
+                        "cont": True,
+                    }
                 )
             with self._sink_lock:
                 sinks = list(self._sinks)

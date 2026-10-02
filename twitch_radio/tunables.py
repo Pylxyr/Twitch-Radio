@@ -78,16 +78,18 @@ class TwitchTunables:
                     clamped = max(lo, min(hi, value))
                     log.warning(
                         "tunables.json: %r=%r is outside the allowed range %d-%d — clamping to %d.",
-                        name, value, lo, hi, clamped,
+                        name,
+                        value,
+                        lo,
+                        hi,
+                        clamped,
                     )
                     return clamped
             return value
 
         return cls(
             max_pending_per_chatter=_field("max_pending_per_chatter", defaults.max_pending_per_chatter),
-            request_cooldown_seconds=_field(
-                "request_cooldown_seconds", defaults.request_cooldown_seconds
-            ),
+            request_cooldown_seconds=_field("request_cooldown_seconds", defaults.request_cooldown_seconds),
             queue_cap=_field("queue_cap", defaults.queue_cap),
             max_request_duration_seconds=_field(
                 "max_request_duration_seconds", defaults.max_request_duration_seconds

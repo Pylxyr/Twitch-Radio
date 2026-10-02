@@ -78,9 +78,7 @@ class JsonStore:
             self._cache = dict(data)
             self._cache_key = self._stat_key()
 
-    async def update(
-        self, mutator: Callable[[dict[str, Any]], dict[str, Any] | None]
-    ) -> dict[str, Any]:
+    async def update(self, mutator: Callable[[dict[str, Any]], dict[str, Any] | None]) -> dict[str, Any]:
         """Read-modify-write while holding the lock across all three steps,
         so two concurrent callers (e.g. two /settings submissions) can't
         silently clobber each other. `mutator` returns the dict to persist,
@@ -119,9 +117,7 @@ class JsonStore:
 
     def _write_sync(self, data: dict[str, Any]) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(
-            dir=self._path.parent, prefix=f".{self._path.name}.", suffix=".tmp"
-        )
+        fd, tmp_path = tempfile.mkstemp(dir=self._path.parent, prefix=f".{self._path.name}.", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)

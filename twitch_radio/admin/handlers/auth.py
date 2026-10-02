@@ -79,9 +79,7 @@ def _login_required(request: web.Request) -> web.Response:
     if "text/html" in request.headers.get("Accept", ""):
         target = request.path_qs if request.method in ("GET", "HEAD") else request.path
         return redirect(f"/login?next={quote(safe_next_path(target), safe='')}")
-    return protect(
-        web.json_response({"error": "authentication required", "login": "/login"}, status=401)
-    )
+    return protect(web.json_response({"error": "authentication required", "login": "/login"}, status=401))
 
 
 def authorize(ctx: AdminContext, request: web.Request) -> web.Response | None:
