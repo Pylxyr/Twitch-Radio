@@ -1,0 +1,91 @@
+name: Cut release
+
+# One-click release from the GitHub website:
+#   Actions > Cut release > Run workflow > pick patch / minor / major > Run.
+# It bumps the version, commits and tags it on main, then builds and publishes the
+# installer by calling release.yml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Which part of the version to increase (1.2.3 = major.minor.patch)"
+        type: choice
+        options: [patch, minor, major]
+        default: patch
+      version:
+        description: "Optional exact version instead, e.g. 1.2.0 or 1.2.0-rc1 (a '-' makes it a pre-release). Overrides the choice above."
+        type: string
+        required: false
+        default: ""
+
+concurrency:
+  group: cut-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    # Releases are always cut from main, whatever branch the button was pressed on.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.next.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+      - id: next
+        env:
+          BUMP: ${{ inputs.bump }}
+          EXACT: ${{ inputs.version }}
+        run: |
+          EXACT="${EXACT#v}"
+          if [ -n "$EXACT" ]; then
+            VERSION="$EXACT"
+          elif [ -z "$(git tag --list 'v*.*.*')" ]; then
+            # Nothing has been released yet, so the version already in the files is the first release.
+            VERSION="$(python3 -c "import json; print(json.load(open('gui/package.json'))['version'])")"
+            echo "::notice::No release tag exists yet, so releasing the current version ($VERSION) as is."
+          else
+            VERSION="$(python3 scripts/bump-version.py --next "$BUMP")"
+          fi
+          if git rev-parse -q --verify "refs/tags/v$VERSION" >/dev/null; then
+            echo "::error::Tag v$VERSION already exists. Pick a different version."
+            exit 1
+          fi
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Releasing $VERSION"
+      - name: Bump, commit and tag
+        env:
+          VERSION: ${{ steps.next.outputs.version }}
+          TAG: ${{ steps.next.outputs.tag }}
+        run: |
+          python3 scripts/bump-version.py "$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # The files may already carry this version (the very first release).
+          if ! git diff --quiet; then
+            git commit -am "Release $VERSION"
+          fi
+          git tag "$TAG"
+          # One atomic push: if main moved since this run started, nothing is pushed.
+          git push --atomic origin HEAD:refs/heads/main "refs/tags/$TAG"
+
+  release:
+    needs: prepare
+    # A called workflow can only use permissions the calling job grants it.
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.prepare.outputs.tag }}
+    secrets: inherit

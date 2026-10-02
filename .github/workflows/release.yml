@@ -8,6 +8,14 @@ on:
       version:
         description: "Dry run: version to build, as in package.json (e.g. 1.1.0 or 1.1.0-rc1). Builds and uploads artifacts; publishes nothing."
         required: true
+  # Called by cut-release.yml (the one-click release). A tag pushed with the default
+  # GITHUB_TOKEN does not start workflows, so that workflow calls this one directly.
+  workflow_call:
+    inputs:
+      tag:
+        description: "Existing tag to build and publish, e.g. v1.1.0"
+        required: true
+        type: string
 
 concurrency:
   group: release-${{ github.ref }}
@@ -23,14 +31,20 @@ jobs:
       tag: ${{ steps.v.outputs.tag }}
       version: ${{ steps.v.outputs.version }}
     steps:
+      # Empty (the triggering ref) for a tag push or a dry run; the new tag when called.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
       - id: v
         env:
           EVENT: ${{ github.event_name }}
+          CALLED_TAG: ${{ inputs.tag }}
           INPUT_VERSION: ${{ inputs.version }}
           REF_NAME: ${{ github.ref_name }}
         run: |
-          if [ "$EVENT" = "workflow_dispatch" ]; then TAG="v${INPUT_VERSION#v}"; else TAG="$REF_NAME"; fi
+          if [ -n "$CALLED_TAG" ]; then TAG="$CALLED_TAG"
+          elif [ "$EVENT" = "workflow_dispatch" ]; then TAG="v${INPUT_VERSION#v}"
+          else TAG="$REF_NAME"; fi
           python3 scripts/bump-version.py --check "$TAG"
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
@@ -44,6 +58,8 @@ jobs:
       VERSION: ${{ needs.version-guard.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
@@ -118,7 +134,8 @@ jobs:
 
   publish:
     needs: [version-guard, build]
-    if: github.event_name == 'push'
+    # A tag push, or a call from cut-release.yml. A manual dry run has neither.
+    if: github.event_name == 'push' || inputs.tag != ''
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -132,6 +149,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.tag }}
           fetch-depth: 0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
