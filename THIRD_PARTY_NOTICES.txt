@@ -19,6 +19,11 @@ ffmpeg - GNU GPL (v3 or later)
     in the bin folder next to it. Source code and details: https://ffmpeg.org/
     and https://www.gyan.dev/ffmpeg/builds/ - the exact source for a build is
     available from those sites on request. https://ffmpeg.org/legal.html
+    The Linux builds bundle a static GPL v3 ffmpeg (version 7.0.2) from
+    johnvansickle.com/ffmpeg, redistributed through
+    https://github.com/eugeneware/ffmpeg-static (tag b6.1.1), also with
+    --enable-gpl and --enable-version3; its licence is FFMPEG-LICENSE.txt next
+    to it.
 
 Deno - MIT
     JavaScript runtime that yt-dlp uses to run YouTube's player scripts.

@@ -1,7 +1,8 @@
-# Building the Twitch Radio desktop app (Windows)
+# Building the Twitch Radio desktop app (Windows and Linux)
 
 The installer is made in four automatic steps: Python environment, ffmpeg + Deno download,
 the bot core (PyInstaller), and the desktop app (Electron + electron-builder).
+This page is written for Windows; [Linux](#linux-arch--cachyos) has its own section below.
 
 ## Prerequisites (build machine only)
 
@@ -95,6 +96,44 @@ The second command resolves a real YouTube video and needs YouTube and GitHub re
 
 `ruff format --check .` runs in CI; fix a failure with `ruff format .`.
 
+## Linux (Arch / CachyOS)
+
+Releases include `Twitch-Radio-x.y.z-linux-x64.AppImage` and a `.tar.gz` of the unpacked app
+(x86-64). ffmpeg (a static build) and Deno are bundled.
+
+**Run a release build**
+
+```
+chmod +x Twitch-Radio-*-linux-x64.AppImage
+./Twitch-Radio-*-linux-x64.AppImage
+```
+
+The AppImage needs FUSE 2: `sudo pacman -S fuse2`. Without it, unpack the `.tar.gz` and run
+`./twitch-radio` inside, or run the AppImage with `--appimage-extract-and-run`. Settings, tokens and
+data live in `~/.config/TwitchRadio` (the Windows `%APPDATA%\TwitchRadio` equivalent). Electron's
+sandbox needs unprivileged user namespaces, which Arch and CachyOS enable by default.
+
+**Build it yourself**
+
+```
+sudo pacman -S python nodejs npm curl
+scripts/build-linux.sh
+```
+
+This runs the same four steps as `build-windows.bat` and leaves the AppImage and tarball in
+`dist/app/`. `packaging/fetch-tools.sh` always downloads the pinned static ffmpeg and Deno from the
+`linux` section of `packaging/tools.lock.json` and verifies their SHA-256 (a system ffmpeg is
+dynamically linked and would not run on other distributions). Bump them the same way as the Windows
+pins.
+
+**Not supported on Linux:** "Open Twitch Radio when I sign in" (Electron cannot set login items
+there; the toggle is hidden). Use your desktop's autostart instead. Install and update from the app
+only shows a link to the AppImage; nothing is installed for you. Only x86-64 is built.
+
+**Source install on Linux** (no packaging): `sudo pacman -S python nodejs npm ffmpeg deno`, then
+`python -m venv .venv && .venv/bin/pip install -r requirements.txt` and, for the desktop shell,
+`cd gui && npm ci && npm start`. The bot uses `ffmpeg` and `deno` from PATH.
+
 ## Cutting a release
 
 On GitHub: **Actions > Cut release > Run workflow**, pick `patch`, `minor` or `major`, and run it.
@@ -105,7 +144,8 @@ The workflow then, with no further steps from you:
    in the files, so a repo at 1.0.0 with no tags releases 1.0.0),
 2. commits the bump to `main` and tags it (`bump-version.py` sets `gui/package.json`,
    `gui/package-lock.json` and `twitch_radio/version.py`),
-3. builds the installer and publishes the GitHub release by calling **release.yml**.
+3. builds the Windows installer and the Linux AppImage and tarball, and publishes the GitHub release
+   by calling **release.yml**.
 
 A version with a `-` suffix (`1.2.0-rc1`) is published as a pre-release. If the build fails after the
 tag was created, fix the problem and run **Cut release** again: the failed version number is simply

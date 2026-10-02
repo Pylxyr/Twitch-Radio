@@ -51,17 +51,22 @@ function shouldAutoCheck(prefs, now = Date.now()) {
   return last > now || now - last >= DAY_MS;
 }
 
-function pickLinks(release, repo) {
+// GitHub turns spaces in asset names into dots, so both spellings are accepted.
+const INSTALLER_ASSET = {
+  win32: /^Twitch[ .]Radio[ .]Setup[ .].*\.exe$/,
+  linux: /^Twitch[ .-]Radio[ .-].*linux-x64\.AppImage$/,
+};
+
+function pickLinks(release, repo, platform) {
   const prefix = `https://github.com/${repo}/`;
   const page = typeof release.html_url === 'string' && release.html_url.startsWith(prefix) ? release.html_url : `${prefix}releases/latest`;
   const assets = Array.isArray(release.assets) ? release.assets : [];
-  const installer = assets.find(
-    (asset) => /^Twitch[ .]Radio[ .]Setup[ .].*\.exe$/.test(String(asset.name)) && String(asset.browser_download_url).startsWith(prefix),
-  );
+  const wanted = INSTALLER_ASSET[platform];
+  const installer = wanted && assets.find((asset) => wanted.test(String(asset.name)) && String(asset.browser_download_url).startsWith(prefix));
   return { releaseUrl: page, installerUrl: installer ? installer.browser_download_url : null };
 }
 
-async function checkForAppUpdate({ current, fetchImpl = fetch, repo = UPDATE_REPO, timeoutMs = 15000 }) {
+async function checkForAppUpdate({ current, fetchImpl = fetch, repo = UPDATE_REPO, timeoutMs = 15000, platform = process.platform }) {
   const result = { ok: false, current, latest: null, updateAvailable: false, releaseUrl: null, installerUrl: null, error: null };
   try {
     const response = await fetchImpl(`https://api.github.com/repos/${repo}/releases/latest`, {
@@ -74,7 +79,7 @@ async function checkForAppUpdate({ current, fetchImpl = fetch, repo = UPDATE_REP
     const tag = String(release.tag_name || '');
     const order = compareVersions(tag, current);
     if (order === null) throw new Error(`Couldn't read the version "${tag}".`);
-    Object.assign(result, { ok: true, latest: tag.replace(/^v/, ''), updateAvailable: order > 0 }, pickLinks(release, repo));
+    Object.assign(result, { ok: true, latest: tag.replace(/^v/, ''), updateAvailable: order > 0 }, pickLinks(release, repo, platform));
   } catch (error) {
     result.error = error && error.message ? error.message : String(error);
   }

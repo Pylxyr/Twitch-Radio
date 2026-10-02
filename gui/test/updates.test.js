@@ -33,16 +33,36 @@ test('checkForAppUpdate reports a newer release with links on the repo only', as
       { name: 'Twitch.Radio.Setup.1.2.0.exe', browser_download_url: 'https://github.com/Pylxyr/Twitch-Radio/releases/download/v1.2.0/Twitch.Radio.Setup.1.2.0.exe' },
     ],
   };
-  const result = await checkForAppUpdate({ current: '1.0.0', fetchImpl: reply(200, body) });
+  const result = await checkForAppUpdate({ current: '1.0.0', fetchImpl: reply(200, body), platform: 'win32' });
   assert.equal(result.ok, true);
   assert.equal(result.updateAvailable, true);
   assert.equal(result.latest, '1.2.0');
   assert.match(result.installerUrl, /Setup/);
 });
 
+test('checkForAppUpdate links the AppImage on Linux and the installer on Windows', async () => {
+  const base = 'https://github.com/Pylxyr/Twitch-Radio/releases/download/v1.2.0/';
+  const body = {
+    tag_name: 'v1.2.0',
+    html_url: 'https://github.com/Pylxyr/Twitch-Radio/releases/tag/v1.2.0',
+    assets: [
+      { name: 'Twitch.Radio.Setup.1.2.0.exe', browser_download_url: `${base}Twitch.Radio.Setup.1.2.0.exe` },
+      { name: 'Twitch-Radio-1.2.0-linux-x64.tar.gz', browser_download_url: `${base}Twitch-Radio-1.2.0-linux-x64.tar.gz` },
+      { name: 'Twitch-Radio-1.2.0-linux-x64.AppImage', browser_download_url: `${base}Twitch-Radio-1.2.0-linux-x64.AppImage` },
+    ],
+  };
+  const linux = await checkForAppUpdate({ current: '1.0.0', fetchImpl: reply(200, body), platform: 'linux' });
+  assert.match(linux.installerUrl, /linux-x64\.AppImage$/);
+  const win = await checkForAppUpdate({ current: '1.0.0', fetchImpl: reply(200, body), platform: 'win32' });
+  assert.match(win.installerUrl, /Setup\.1\.2\.0\.exe$/);
+  const mac = await checkForAppUpdate({ current: '1.0.0', fetchImpl: reply(200, body), platform: 'darwin' });
+  assert.equal(mac.installerUrl, null);
+  assert.match(mac.releaseUrl, /releases\/tag/);
+});
+
 test('checkForAppUpdate ignores foreign URLs and handles errors', async () => {
   const evil = { tag_name: 'v9.0.0', html_url: 'https://evil.example/x', assets: [{ name: 'Twitch Radio Setup 9.0.0.exe', browser_download_url: 'https://evil.example/a.exe' }] };
-  const result = await checkForAppUpdate({ current: '1.0.0', fetchImpl: reply(200, evil) });
+  const result = await checkForAppUpdate({ current: '1.0.0', fetchImpl: reply(200, evil), platform: 'win32' });
   assert.equal(result.installerUrl, null);
   assert.match(result.releaseUrl, /^https:\/\/github\.com\/Pylxyr\/Twitch-Radio\//);
   const upToDate = await checkForAppUpdate({ current: '1.2.0', fetchImpl: reply(200, { tag_name: 'v1.2.0' }) });

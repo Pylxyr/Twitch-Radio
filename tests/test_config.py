@@ -113,3 +113,30 @@ def test_packaged_app_defaults_to_the_bundled_deno(
     assert options["js_runtimes"]["deno"]["path"] == str(deno)
     monkeypatch.setenv("YTDLP_JS_RUNTIME_NAME", "node")  # another runtime: don't force the bundled Deno on it
     assert config.load_settings().ytdlp_js_runtime_path is None
+
+
+def test_solver_hint_only_for_matching_failures_and_only_once(
+    settings: config.Settings, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from twitch_radio import extraction
+
+    monkeypatch.setattr(extraction.ytdlp_loader, "solver_status", lambda _dir: {"ready": False})
+    resolver = Resolver(settings)
+    with caplog.at_level("INFO", logger=extraction.log.name):
+        resolver._hint_if_solver_missing(Exception("Video unavailable"))
+        assert not caplog.records
+        resolver._hint_if_solver_missing(Exception("Requested format is not available"))
+        resolver._hint_if_solver_missing(Exception("n challenge solving failed"))
+    hints = [r for r in caplog.records if "JS solver" in r.getMessage()]
+    assert len(hints) == 1 and hints[0].levelname == "WARNING"
+
+
+def test_solver_hint_is_silent_when_the_solver_is_ready(
+    settings: config.Settings, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from twitch_radio import extraction
+
+    monkeypatch.setattr(extraction.ytdlp_loader, "solver_status", lambda _dir: {"ready": True})
+    with caplog.at_level("INFO", logger=extraction.log.name):
+        Resolver(settings)._hint_if_solver_missing(Exception("Requested format is not available"))
+    assert not caplog.records

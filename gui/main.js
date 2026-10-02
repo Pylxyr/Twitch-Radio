@@ -727,7 +727,7 @@ function registerIpc() {
       if (patch && key in patch && typeof patch[key] === typeof DEFAULT_PREFS[key]) prefs[key] = patch[key];
     }
     savePrefs();
-    if (app.isPackaged) app.setLoginItemSettings({ openAtLogin: !!prefs.launchAtLogin, args: ['--hidden'] });
+    if (app.isPackaged && (IS_WIN || process.platform === 'darwin')) app.setLoginItemSettings({ openAtLogin: !!prefs.launchAtLogin, args: ['--hidden'] });
     return prefs;
   });
 

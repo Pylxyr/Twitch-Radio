@@ -185,8 +185,7 @@
       const js = pre.js_runtime || {};
       add(js.name ? `JS runtime (${js.name})` : 'JS runtime', js.path ? 'ok' : 'warn', js.path ? 'Found' : 'Not found');
     }
-    if (!pre) add('YouTube JS solver', 'idle', 'Checking…');
-    else add('YouTube JS solver', solverReady() ? 'ok' : 'warn', solverReady() ? 'Ready' : 'Not downloaded yet');
+    if (pre) add('YouTube JS solver', solverReady() ? 'ok' : 'idle', solverReady() ? 'Ready' : 'Not needed so far');
     if (live && s) {
       const lag = s.proc.loop_lag_ms || 0;
       add('Event-loop delay', lag < 60 ? 'ok' : lag < 250 ? 'warn' : 'err', `${Math.round(lag)} ms`);
@@ -224,14 +223,6 @@
         desc: 'Do this in a private window, or after signing out of the bot account on twitch.tv.',
         actions: authBtns(OAUTH_OWNER),
       },
-      {
-        done: solverReady(),
-        title: 'Download the YouTube JS solver',
-        desc: live
-          ? 'yt-dlp downloads it from github.com on first use. If this stays unfinished, check your internet connection and that your firewall or antivirus allows github.com, then restart the bot. The Logs tab shows the details.'
-          : 'Downloaded automatically the first time the bot starts (needs access to github.com).',
-        actions: [h('button', { class: 'btn ghost sm', onclick: () => switchTab('logs'), text: 'View logs' })],
-      },
     ];
   }
 
@@ -241,7 +232,7 @@
       card.hidden = true;
       return;
     }
-    const steps = setupSteps().filter((step) => step.title !== 'Download the YouTube JS solver' || pre.js_solver);
+    const steps = setupSteps();
     const done = steps.filter((s) => s.done).length;
     card.hidden = done === steps.length;
     if (card.hidden) return;
@@ -757,7 +748,7 @@
       ['autoRestart', 'Restart automatically if the bot crashes', 'Up to 5 times in 10 minutes. Not for settings errors.'],
       ['startBotOnLaunch', 'Start the bot when this app opens', ''],
       ['launchAtLogin', 'Open Twitch Radio when I sign in to Windows', 'Starts minimized to the tray.'],
-    ];
+    ].filter(([key]) => key !== 'launchAtLogin' || appInfo.platform !== 'linux'); // Electron can't set login items on Linux
     const card = h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', { text: 'This app' })));
     toggles.forEach(([key, label, hint]) => {
       const box = h('input', { type: 'checkbox', id: `p-${key}` });
@@ -813,8 +804,8 @@
       updateRow('yt-dlp', h('span', { class: 'muted', text: ytStatus }), ytButtons, 'YouTube changes often; updating yt-dlp does not need a new installer. Updating restarts the bot if it is running.'),
       y.overrideError ? h('div', { class: 'hint err-text', text: `The downloaded yt-dlp failed to load, so the bundled one is in use (${y.overrideError}).` }) : null,
       prefToggle('checkYtdlpOnStartup', 'Check for yt-dlp updates on startup'),
-      updateRow('JS solver', h('span', { class: solver && solver.ready ? 'tag purple' : 'tag warn', text: !solver ? 'unknown' : solver.ready ? 'ready' : 'not downloaded yet' }), [],
-        solver && solver.ready ? 'Downloaded by yt-dlp from github.com/yt-dlp/ejs and kept in the data folder.' : 'yt-dlp downloads it from github.com the first time the bot resolves a YouTube link. If it stays missing, allow github.com through your firewall or antivirus, then restart the bot.'),
+      updateRow('JS solver', h('span', { class: solver && solver.ready ? 'tag purple' : 'tag', text: !solver ? 'unknown' : solver.ready ? 'ready' : 'not downloaded yet (optional)' }), [],
+        solver && solver.ready ? 'Downloaded by yt-dlp from github.com/yt-dlp/ejs and kept in the data folder.' : 'Only needed if YouTube starts requiring it, for example on a datacenter IP. yt-dlp then downloads it from github.com on its own; if that is blocked, allow github.com through your firewall or antivirus.'),
     );
   }
   function refreshUpdates() {
@@ -1023,8 +1014,7 @@
       if (result) upd.app = result;
     });
     setInterval(() => {
-      // While running, keep looking until the JS solver has been downloaded.
-      if (!running() || (pre && pre.js_solver && !pre.js_solver.ready)) refreshPreflight();
+      if (!running()) refreshPreflight();
     }, 30000);
   }
   init().catch((error) => toast(`Startup problem: ${error.message}`, 'err'));

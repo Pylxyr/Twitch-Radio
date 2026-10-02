@@ -534,6 +534,7 @@ class Resolver:
         # YTDLP_JS_RUNTIME_NAME/PATH explicitly (config.py) rather than
         # relying on this fast-path logic.
         self._fast_path_enabled = self._fast_client_enabled
+        self._solver_hint_shown = False
 
         self._ytdl_options: dict[str, Any] | None = None
         self._fast_ytdl_options: dict[str, Any] | None = None
@@ -590,11 +591,9 @@ class Resolver:
             log.debug("Resolver warm-up failed (non-fatal).", exc_info=True)
         log.info("Resolver warm-up finished in %.1fs.", time.monotonic() - start)
         if not ytdlp_loader.solver_status(DATA_DIR / ytdlp_loader.CACHE_DIRNAME)["ready"]:
-            log.error(
-                "The YouTube JS solver scripts are not downloaded. yt-dlp fetches them from "
-                "github.com/yt-dlp/ejs the first time it needs them; without them most !sr requests "
-                "will fail. Check that this PC is online and that your firewall or antivirus allows "
-                "github.com, then press Restart (Settings > App shows the status)."
+            log.info(
+                "YouTube JS solver scripts: not downloaded, and not needed so far. yt-dlp fetches "
+                "them from github.com/yt-dlp/ejs on demand if YouTube starts requiring them."
             )
 
     def _build_options(
@@ -707,11 +706,31 @@ class Resolver:
                 )
 
         start = time.monotonic()
-        info = await self._extract_info_via(
-            query, fast=False, timeout=self._settings.ytdlp_extract_timeout_seconds
-        )
+        try:
+            info = await self._extract_info_via(
+                query, fast=False, timeout=self._settings.ytdlp_extract_timeout_seconds
+            )
+        except DownloadError as exc:
+            self._hint_if_solver_missing(exc)
+            raise
         log.debug("Resolve for %r took %.1fs.", query, time.monotonic() - start)
         return info
+
+    def _hint_if_solver_missing(self, exc: Exception) -> None:
+        """A failed resolve is the only time a missing JS solver matters; say so once."""
+        if self._solver_hint_shown:
+            return
+        text = str(exc).lower()
+        if not any(word in text for word in ("challenge", "signature", "js runtime", "requested format")):
+            return
+        if ytdlp_loader.solver_status(DATA_DIR / ytdlp_loader.CACHE_DIRNAME)["ready"]:
+            return
+        self._solver_hint_shown = True
+        log.warning(
+            "A YouTube link failed in a way the JS solver can fix, and the solver scripts aren't "
+            "downloaded. yt-dlp fetches them from github.com/yt-dlp/ejs: check that this PC is online "
+            "and that your firewall or antivirus allows github.com, then try again."
+        )
 
     async def resolve_radio_mix(self, mix_url: str) -> list[dict[str, Any]]:
         """Flat-extracts a YouTube 'watch?v=X&list=RDX' Mix — YouTube's own
