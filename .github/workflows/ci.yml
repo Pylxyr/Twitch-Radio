@@ -14,7 +14,47 @@ permissions:
   contents: read
 
 jobs:
+  # Formats the code with the ruff version pinned in requirements-dev.txt and
+  # commits the result back to the branch, so a formatting slip never fails CI.
+  # Skipped for fork PRs (no write access); the `python` job's
+  # `ruff format --check` below still enforces formatting there.
+  #
+  # Commits pushed with the default GITHUB_TOKEN do not start a new workflow
+  # run. That is fine here, because the `python` job below checks out the
+  # formatted branch tip and tests it in this same run. If you require status
+  # checks on PRs, add a PAT or GitHub App token as the AUTOFORMAT_TOKEN
+  # secret and the bot commit will get its own CI run too.
+  autoformat:
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          token: ${{ secrets.AUTOFORMAT_TOKEN || github.token }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Install the pinned ruff
+        run: pip install "$(grep -E '^ruff==' requirements-dev.txt)"
+      - run: ruff format .
+      - name: Commit formatting changes
+        run: |
+          if git diff --quiet; then
+            echo "Already formatted."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "style: ruff format"
+          git push
+
   python:
+    needs: autoformat
+    # Run when autoformat succeeded or was skipped (fork PRs), never when it failed.
+    if: ${{ !cancelled() && (needs.autoformat.result == 'success' || needs.autoformat.result == 'skipped') }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -22,6 +62,9 @@ jobs:
         python-version: ["3.11", "3.12"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Pick up the commit autoformat may have just pushed.
+          ref: ${{ needs.autoformat.result == 'success' && (github.head_ref || github.ref_name) || github.sha }}
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
