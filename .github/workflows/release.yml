@@ -1,0 +1,177 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Dry run: version to build, as in package.json (e.g. 1.1.0 or 1.1.0-rc1). Builds and uploads artifacts; publishes nothing."
+        required: true
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  version-guard:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - id: v
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          if [ "$EVENT" = "workflow_dispatch" ]; then TAG="v${INPUT_VERSION#v}"; else TAG="$REF_NAME"; fi
+          python3 scripts/bump-version.py --check "$TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: version-guard
+    runs-on: windows-latest
+    outputs:
+      signed: ${{ steps.sign.outputs.signed }}
+    env:
+      VERSION: ${{ needs.version-guard.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
+      - run: pip install -r requirements-build.txt
+      - name: Fetch ffmpeg and Deno (pinned, checksum-verified)
+        shell: pwsh
+        run: ./packaging/fetch-tools.ps1
+      - name: Build the core with PyInstaller
+        run: pyinstaller packaging/core.spec --noconfirm --distpath dist/core --workpath build/pyinstaller
+      - name: Smoke test the frozen core
+        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore.exe --bin packaging/bin
+      # Required here: this is the one place a broken solver download or a YouTube change is caught before users see it.
+      - name: Real YouTube resolve + JS solver download
+        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore.exe --bin packaging/bin --resolve-only
+      - name: Install GUI dependencies
+        working-directory: gui
+        run: npm ci
+      - name: Check the electron-builder config and build inputs
+        working-directory: gui
+        run: npm run check:build -- --require-built
+      - name: Detect code-signing secrets
+        id: sign
+        shell: bash
+        env:
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: |
+          if [ -n "$WIN_CSC_LINK" ] && [ -n "$WIN_CSC_KEY_PASSWORD" ]; then
+            echo "signed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::WIN_CSC_LINK / WIN_CSC_KEY_PASSWORD not set: building an unsigned installer."
+          fi
+      - name: Build the installer (signed)
+        if: steps.sign.outputs.signed == 'true'
+        working-directory: gui
+        env:
+          CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: npm run dist
+      - name: Build the installer (unsigned)
+        if: steps.sign.outputs.signed != 'true'
+        working-directory: gui
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npm run dist
+      - name: Collect release files and checksums
+        shell: pwsh
+        run: |
+          $built = "dist/app/Twitch Radio Setup $env:VERSION.exe"
+          if (-not (Test-Path $built)) { throw "Installer not found: $built" }
+          New-Item -ItemType Directory -Force -Path release | Out-Null
+          # GitHub turns spaces in asset names into dots; name the file as users will receive it.
+          $asset = "Twitch.Radio.Setup.$env:VERSION.exe"
+          Copy-Item $built "release/$asset"
+          Copy-Item THIRD_PARTY_NOTICES.txt release/THIRD_PARTY_NOTICES.txt
+          $hash = (Get-FileHash -Algorithm SHA256 "release/$asset").Hash.ToLowerInvariant()
+          "$hash  $asset" | Set-Content -Encoding ascii release/SHA256SUMS.txt
+          Get-Content release/SHA256SUMS.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-files
+          path: release/*
+          if-no-files-found: error
+
+  publish:
+    needs: [version-guard, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.version-guard.outputs.tag }}
+      VERSION: ${{ needs.version-guard.outputs.version }}
+      SIGNED: ${{ needs.build.outputs.signed }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-files
+          path: release
+      # Needs a public repo, or GitHub Enterprise Cloud for a private one. Never blocks the release.
+      - name: Attest build provenance
+        id: attest
+        continue-on-error: true
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/Twitch.Radio.Setup.*.exe
+      - name: Write release notes
+        run: |
+          prev=$(git describe --tags --abbrev=0 --match 'v*.*.*' "${TAG}^" 2>/dev/null || true)
+          {
+            cat .github/release-notes-header.md
+            echo
+            if [ "$SIGNED" = "true" ]; then
+              echo "This installer is code-signed."
+            else
+              echo "This installer is **not code-signed**, so SmartScreen will warn about it."
+            fi
+            if [ "${{ steps.attest.outcome }}" = "success" ]; then
+              echo "Build provenance: verify with \`gh attestation verify <file> --repo ${GITHUB_REPOSITORY}\`."
+            fi
+            echo
+            echo "## Changes${prev:+ since $prev}"
+            git log --no-merges --pretty='- %s (%h)' ${prev:+$prev..}"$TAG"
+          } > notes.md
+          cat notes.md
+      - name: Create the GitHub release
+        run: |
+          flags=()
+          case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+          gh release create "$TAG" \
+            "release/Twitch.Radio.Setup.${VERSION}.exe#Twitch Radio Setup ${VERSION}.exe" \
+            release/SHA256SUMS.txt \
+            release/THIRD_PARTY_NOTICES.txt \
+            --title "Twitch Radio ${VERSION}" \
+            --notes-file notes.md \
+            --verify-tag \
+            "${flags[@]}"

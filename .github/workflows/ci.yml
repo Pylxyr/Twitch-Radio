@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-dev.txt -r requirements.txt
+      - run: ruff check .
+      # `ruff format --check .` is left out on purpose: the repo isn't formatted yet.
+      # Run `ruff format .` once in its own commit, then add the check here.
+      - run: mypy twitch_radio bot.py
+      - run: pytest -q
+
+  electron:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: gui
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1" # lint and config checks never start Electron
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run check
+      - run: npm test
+      - run: npm run check:build
+
+  changes:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.diff.outputs.build }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - id: diff
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if git diff --name-only "origin/${BASE_REF}...HEAD" | grep -Eq '^(twitch_radio/|packaging/|gui/|requirements[^/]*\.txt$|scripts/smoke_core\.py$|\.github/workflows/ci\.yml$)'; then
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  windows-build-smoke:
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.build == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - run: pip install -r requirements-build.txt
+      - name: Fetch ffmpeg and Deno (pinned, checksum-verified)
+        shell: pwsh
+        run: ./packaging/fetch-tools.ps1
+      - name: Build the core with PyInstaller
+        run: pyinstaller packaging/core.spec --noconfirm --distpath dist/core --workpath build/pyinstaller
+      - name: Smoke test the frozen core
+        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore.exe --bin packaging/bin
+      - name: Real YouTube resolve + JS solver download (needs the network; may fail on a PR)
+        continue-on-error: true
+        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore.exe --bin packaging/bin --resolve-only
