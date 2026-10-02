@@ -10,6 +10,7 @@ from twitchio.ext import commands
 
 from twitch_radio.extraction import UnsupportedSourceError
 from twitch_radio.player import QueuedRequest
+from twitch_radio.telemetry import counters
 from twitch_radio.toggles import FeatureToggles
 from twitch_radio.tunables import TwitchTunables
 from twitch_radio.youtube import youtube_video_id
@@ -183,6 +184,7 @@ class SongRequestComponent(commands.Component):
                 )
             )
             reserved = False  # ownership of the reservation now belongs to on_start's eventual decrement
+            counters.record("requests_queued")
             await self.bot.safe_reply(ctx, f"Queued: {track.title} (#{self.bot.player.queue_size()} in queue)")
         except Exception:
             # Catch-all so a bug here can't silently eat the chatter's

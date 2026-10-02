@@ -41,6 +41,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -112,6 +114,11 @@ class TwitchChatBot(commands.Bot):
         # Set once subscribe_websocket() succeeds — save_tokens() retries the
         # subscription on every call until this is True.
         self._chat_subscribed = False
+        # For the desktop dashboard: set when TwitchIO dispatches "ready"
+        # (logged in, tokens loaded, setup_hook done), and an optional hook
+        # the runtime uses to learn about it.
+        self.ready = False
+        self.on_ready_callback: Callable[[], None] | None = None
         # Per-chatter state — deliberately in-memory only: losing cooldown/
         # pending tracking across a restart is harmless, and persisting it
         # would add complexity for no real benefit.
@@ -144,10 +151,33 @@ class TwitchChatBot(commands.Bot):
         assert self.owner_id is not None
         return self.owner_id
 
+    @property
+    def chat_subscribed(self) -> bool:
+        return self._chat_subscribed
+
     async def load_tokens(self, path: str | None = None, /) -> None:
         # Redirects TwitchIO's default token file into DATA_DIR instead.
         self._token_storage_path.parent.mkdir(parents=True, exist_ok=True)
-        await super().load_tokens(path or str(self._token_storage_path))
+        target = Path(path or self._token_storage_path)
+        # A token file cut off mid-write (power loss, killed process) makes
+        # json.load raise inside twitchio's login and the whole bot refuses
+        # to start with an obscure parse error. Set it aside and carry on
+        # without tokens; the OAuth step is then simply needed again.
+        if target.exists():
+            try:
+                json.loads(target.read_text(encoding="utf-8"))
+            except (ValueError, OSError) as exc:
+                aside = target.with_name(target.name + ".corrupt")
+                with contextlib.suppress(OSError):
+                    os.replace(target, aside)
+                log.error(
+                    "The saved Twitch tokens (%s) couldn't be read (%s). Moved aside to %s - "
+                    "authorize the bot account again to continue.",
+                    target,
+                    exc,
+                    aside.name,
+                )
+        await super().load_tokens(str(target))
 
     async def save_tokens(self, path: str | None = None, /) -> None:
         """Writes tokens to disk, locks the file down, and retries the chat
@@ -157,15 +187,29 @@ class TwitchChatBot(commands.Bot):
         OAuth or a routine refresh takes effect immediately instead of only
         persisting at the next restart."""
         self._token_storage_path.parent.mkdir(parents=True, exist_ok=True)
-        target = path or str(self._token_storage_path)
-        await super().save_tokens(target)
-        # twitchio's save() writes with no explicit mode, so this (live
-        # OAuth tokens) inherits the process umask — often world-readable.
-        # Locked down the same way a typical .env is — a fresh write resets
-        # permissions, so this reapplies every save.
-        with contextlib.suppress(OSError):
-            Path(target).chmod(0o600)
-        await self._try_subscribe_chat()
+        target = Path(path or self._token_storage_path)
+        # twitchio truncates the destination before writing, so a stop that
+        # lands mid-write (or a force-kill) used to leave a half-written
+        # token file. Write beside it and swap in whole instead.
+        staging = target.with_name(target.name + ".tmp")
+        try:
+            await super().save_tokens(str(staging))
+            if staging.exists():
+                # twitchio's save() writes with no explicit mode, so this (live
+                # OAuth tokens) inherits the process umask — often world-readable.
+                # Locked down the same way a typical .env is — a fresh write
+                # resets permissions, so this reapplies every save.
+                with contextlib.suppress(OSError):
+                    staging.chmod(0o600)
+                os.replace(staging, target)
+        finally:
+            with contextlib.suppress(OSError):
+                staging.unlink()
+        # Not while closing: Client.close() saves tokens last, after its
+        # connections are gone, and a subscribe attempt then can only fail
+        # (and log a scary error) on every shutdown.
+        if not getattr(self, "_has_closed", False):
+            await self._try_subscribe_chat()
 
     async def add_token(self, token: str, refresh: str) -> ValidateTokenPayload:
         """twitchio calls this the instant an OAuth authorization completes,
@@ -256,7 +300,10 @@ class TwitchChatBot(commands.Bot):
             )
 
     async def event_ready(self) -> None:
+        self.ready = True
         log.info("Twitch chat bot ready (bot_id=%s).", self._bot_id)
+        if self.on_ready_callback is not None:
+            self.on_ready_callback()
 
     async def announce(self, message: str) -> None:
         """Sends a message to the broadcaster's channel — used by RadioPlayer

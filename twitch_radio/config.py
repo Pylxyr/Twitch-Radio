@@ -1,19 +1,81 @@
 from __future__ import annotations
 
+import json
+import logging
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 from twitch_radio.admin.passwords import validate_stored_password
 from twitch_radio.netutil import DEFAULT_TRUSTED_PROXIES, IPNetwork, is_loopback_host, parse_networks
+from twitch_radio.paths import bundled_tool_path, env_template_path, home_dir, is_frozen
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+# The writable root (.env, data/, logs/). The project folder when run from
+# source, %APPDATA%\TwitchRadio when packaged - see paths.py.
+BASE_DIR = home_dir()
 DATA_DIR = BASE_DIR / "data"
 LOG_DIR = BASE_DIR / "logs"
+ENV_PATH = BASE_DIR / ".env"
 
-load_dotenv(BASE_DIR / ".env")
+# Variables that were already set in the real environment before we ever read
+# .env. They keep winning over the file, exactly like python-dotenv's default
+# (override=False) - a value exported in the shell is a deliberate override.
+_REAL_ENV: dict[str, str | None] = {}
+_FROM_DOTENV: set[str] = set()
+
+
+def reload_env() -> None:
+    """(Re)reads .env into os.environ.
+
+    load_dotenv() at import time only ever adds keys, so a desktop app that
+    edits .env and restarts the bot inside one process would keep serving
+    stale values - and a line deleted from .env would never go away. This
+    undoes what the previous call injected before applying the file again."""
+    for key in list(_FROM_DOTENV):
+        original = _REAL_ENV.get(key)
+        if original is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = original
+    _FROM_DOTENV.clear()
+    try:
+        values = dotenv_values(ENV_PATH, encoding="utf-8", interpolate=False) if ENV_PATH.is_file() else {}
+    except OSError:
+        values = {}
+    for key, value in values.items():
+        if value is None:
+            continue
+        _REAL_ENV.setdefault(key, os.environ.get(key))
+        if _REAL_ENV[key] is None:
+            os.environ[key] = value
+            _FROM_DOTENV.add(key)
+
+
+def _warn(message: str) -> None:
+    """print() before logging exists (the CLI), a real log record after it
+    (the desktop app installs its log handler first, so these reach the Logs
+    tab instead of vanishing)."""
+    if logging.getLogger().handlers:
+        logging.getLogger(__name__).warning(message.removeprefix("WARNING: "))
+    else:
+        print(message)
+
+
+def ensure_home() -> None:
+    """Creates the writable folders and, on first run, a .env from the
+    template - what setup.bat did for the source install."""
+    BASE_DIR.mkdir(parents=True, exist_ok=True)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    template = env_template_path()
+    if not ENV_PATH.exists() and template.is_file():
+        shutil.copyfile(template, ENV_PATH)
+
+
+reload_env()
 
 
 def _int_env(name: str, default: int) -> int:
@@ -24,7 +86,7 @@ def _int_env(name: str, default: int) -> int:
         return int(raw)
     except ValueError:
         # print(), not log — this runs before configure_logging() exists.
-        print(f"WARNING: {name}={raw!r} is not a valid integer — using {default}.")
+        _warn(f"WARNING: {name}={raw!r} is not a valid integer — using {default}.")
         return default
 
 
@@ -40,7 +102,7 @@ def _bool_env(name: str, default: bool) -> bool:
         return True
     if raw in _FALSE_TOKENS:
         return False
-    print(f"WARNING: {name}={raw!r} is not a recognized boolean — using {default}.")
+    _warn(f"WARNING: {name}={raw!r} is not a recognized boolean — using {default}.")
     return default
 
 
@@ -48,7 +110,7 @@ def _clamped_int_env(name: str, default: int, lo: int, hi: int) -> int:
     value = _int_env(name, default)
     clamped = max(lo, min(hi, value))
     if clamped != value:
-        print(f"WARNING: {name}={value} is outside the allowed range {lo}-{hi} — using {clamped}.")
+        _warn(f"WARNING: {name}={value} is outside the allowed range {lo}-{hi} — using {clamped}.")
     return clamped
 
 
@@ -60,7 +122,7 @@ def _log_level_env(name: str, default: str) -> str:
     if not raw:
         return default
     if raw not in _VALID_LOG_LEVELS:
-        print(f"WARNING: {name}={raw!r} is not a valid log level — using {default}.")
+        _warn(f"WARNING: {name}={raw!r} is not a valid log level — using {default}.")
         return default
     return raw
 
@@ -99,7 +161,7 @@ _VALID_PLAYER_CLIENTS = {
 def _check_player_clients(raw_clients: tuple[str, ...], cookies_configured: bool) -> None:
     unknown = [c for c in raw_clients if c not in _VALID_PLAYER_CLIENTS]
     if unknown:
-        print(
+        _warn(
             f"WARNING: YTDLP_PLAYER_CLIENT has unrecognized client name(s) {unknown} — yt-dlp "
             f"will just skip them with a warning. Valid names: {sorted(_VALID_PLAYER_CLIENTS)}"
         )
@@ -174,8 +236,8 @@ class Settings:
 
 
 def load_settings() -> Settings:
-    DATA_DIR.mkdir(exist_ok=True)
-    LOG_DIR.mkdir(exist_ok=True)
+    ensure_home()
+    reload_env()
 
     def _required(name: str) -> str:
         value = os.getenv(name, "").strip()
@@ -201,6 +263,14 @@ def load_settings() -> Settings:
     bot_id = _required_numeric_id("TWITCH_BOT_ID")
     owner_id = _required_numeric_id("TWITCH_OWNER_ID")
 
+    js_runtime_path = os.getenv("YTDLP_JS_RUNTIME_PATH", "").strip() or None
+    js_runtime_name = os.getenv("YTDLP_JS_RUNTIME_NAME", "deno").strip() or "deno"
+    if js_runtime_path is None and is_frozen() and js_runtime_name == "deno":
+        # Packaged app: use the Deno that ships with it, not whatever is on PATH.
+        bundled_deno = bundled_tool_path("deno")
+        if bundled_deno is not None:
+            js_runtime_path = str(bundled_deno)
+
     cookies_raw = os.getenv("YTDLP_COOKIES_FILE", "").strip()
     cookies_path = (BASE_DIR / cookies_raw) if cookies_raw else None
     if cookies_path is not None:
@@ -217,7 +287,7 @@ def load_settings() -> Settings:
 
     worker_mode = os.getenv("YTDLP_WORKER_MODE", "process").strip().lower() or "process"
     if worker_mode not in ("process", "thread"):
-        print(f"WARNING: YTDLP_WORKER_MODE={worker_mode!r} is not 'process' or 'thread' — using 'process'.")
+        _warn(f"WARNING: YTDLP_WORKER_MODE={worker_mode!r} is not 'process' or 'thread' — using 'process'.")
         worker_mode = "process"
 
     nowplaying_host = os.getenv("TWITCH_NOWPLAYING_HOST", "127.0.0.1").strip() or "127.0.0.1"
@@ -229,13 +299,13 @@ def load_settings() -> Settings:
     settings_allow_open = _bool_env("TWITCH_SETTINGS_ALLOW_OPEN", False)
     host_is_exposed = not is_loopback_host(nowplaying_host)
     if settings_password is None and settings_allow_open:
-        print(
+        _warn(
             "WARNING: TWITCH_SETTINGS_PASSWORD is unset with TWITCH_SETTINGS_ALLOW_OPEN on — anyone "
             "who can reach this server (directly, or through a reverse proxy) can change your "
             "queue/cooldown settings via /settings. Set TWITCH_SETTINGS_PASSWORD."
         )
     elif settings_password is None and host_is_exposed:
-        print(
+        _warn(
             f"WARNING: TWITCH_NOWPLAYING_HOST={nowplaying_host!r} is reachable off this machine but "
             f"TWITCH_SETTINGS_PASSWORD is unset — /settings is DISABLED until you set a password. "
             f"(TWITCH_SETTINGS_ALLOW_OPEN=true re-enables it without one; only do that on a "
@@ -246,7 +316,7 @@ def load_settings() -> Settings:
         os.getenv("TWITCH_TRUSTED_PROXIES", "").strip() or DEFAULT_TRUSTED_PROXIES
     )
     if rejected_proxies:
-        print(
+        _warn(
             f"WARNING: TWITCH_TRUSTED_PROXIES has entries that aren't an IP or CIDR range, ignoring "
             f"them: {', '.join(rejected_proxies)}"
         )
@@ -273,14 +343,17 @@ def load_settings() -> Settings:
         blocklist_path=DATA_DIR / os.getenv("TWITCH_BLOCKLIST_FILE", "blocklist.json").strip(),
         queue_state_path=DATA_DIR / os.getenv("TWITCH_QUEUE_STATE_FILE", "queue_state.json").strip(),
         ytdlp_cookies_file=cookies_path,
-        ytdlp_js_runtime_path=os.getenv("YTDLP_JS_RUNTIME_PATH", "").strip() or None,
-        ytdlp_js_runtime_name=os.getenv("YTDLP_JS_RUNTIME_NAME", "deno").strip() or "deno",
+        ytdlp_js_runtime_path=js_runtime_path,
+        ytdlp_js_runtime_name=js_runtime_name,
         # Each worker is its own process (ProcessBackend) specifically so
         # extraction parallelizes across cores instead of competing with
-        # the real-time feed loop for one — default/ceiling raised for an
-        # 8c/16t 5700X; each idle worker costs one Python process, cheap
-        # against 32GB, so this is a CPU headroom call, not a RAM one.
-        ytdlp_concurrency=_clamped_int_env("YTDLP_CONCURRENCY", 6, 1, 8),
+        # the real-time feed loop for one. Default 2, as .env.example has
+        # always documented: it used to be 6 (tuned for one 8-core PC), but
+        # in the packaged app every worker is a full copy of the bundled
+        # interpreter + yt-dlp (~100+ MB each), which is far too much to
+        # assume on someone else's machine. Raise it in Settings if !sr
+        # gets busy.
+        ytdlp_concurrency=_clamped_int_env("YTDLP_CONCURRENCY", 2, 1, 8),
         ytdlp_extract_timeout_seconds=_clamped_int_env("YTDLP_EXTRACT_TIMEOUT_SECONDS", 45, 10, 120),
         ytdlp_player_client=ytdlp_player_client,
         # Skips the player's second extraction (chat resolves once to queue,
@@ -297,3 +370,31 @@ def load_settings() -> Settings:
         log_to_file=_bool_env("LOG_TO_FILE", True),
         log_dir=LOG_DIR,
     )
+
+
+def token_status(bot_id: str | None, owner_id: str | None, token_path: Path | None = None) -> dict[str, object]:
+    """Which of the two OAuth authorizations exist on disk.
+
+    twitchio's token file is a JSON object keyed by Twitch user ID (verified
+    in twitchio/authentication/tokens.py: `_tokens[user_id] = {...}`), so
+    membership of the two configured IDs is exactly "did each account
+    authorize". The tokens themselves are never read out."""
+    path = token_path or (DATA_DIR / os.getenv("TWITCH_TOKEN_FILE", "twitch_tokens.json").strip())
+    saved: set[str] = set()
+    readable = True
+    if path.is_file():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                saved = {str(k) for k in loaded}
+            else:
+                readable = False
+        except (OSError, ValueError):
+            readable = False
+    return {
+        "path": str(path),
+        "file_exists": path.is_file(),
+        "readable": readable,
+        "bot": bool(bot_id) and bot_id in saved,
+        "owner": bool(owner_id) and owner_id in saved,
+    }

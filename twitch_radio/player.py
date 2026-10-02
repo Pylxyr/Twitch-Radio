@@ -11,7 +11,9 @@ from enum import Enum
 from typing import Any, Protocol
 
 from twitch_radio.models import Track
+from twitch_radio.paths import hidden_subprocess_kwargs
 from twitch_radio.store import JsonStore
+from twitch_radio.telemetry import counters
 
 log = logging.getLogger(__name__)
 
@@ -86,12 +88,25 @@ _PREFETCH_LEAD_SECONDS = 20.0
 _DECODER_PREP_LEAD_SECONDS = 3.0
 
 
+def _ffmpeg() -> str:
+    """ffmpeg's full path when it can be found (the packaged app puts its
+    bundled copy on PATH), else the bare name so the error still names it."""
+    return shutil.which("ffmpeg") or "ffmpeg"
+
+
+async def _spawn(*args: str, **kwargs: Any) -> asyncio.subprocess.Process:
+    """create_subprocess_exec, minus the console window Windows would
+    otherwise flash for every ffmpeg launched by a windowless parent."""
+    # mypy can't rule out a `program=` key inside **kwargs; callers only pass subprocess options.
+    return await asyncio.create_subprocess_exec(*args, **hidden_subprocess_kwargs(), **kwargs)  # type: ignore[misc]
+
+
 def _decoder_cmd(stream_url: str) -> list[str]:
     return [
         # fatal, not error: a mid-pull TLS reset is exactly what -reconnect
         # below recovers from on its own — logging it at "error" was just
         # noise on every transient CDN hiccup.
-        "ffmpeg", "-hide_banner", "-loglevel", "fatal",
+        _ffmpeg(), "-hide_banner", "-loglevel", "fatal",
         # Reconnect flags recover from a dropped/hiccuping CDN connection
         # instead of corrupting the stream — including one that's gone
         # idle while a prepared-ahead decoder sat waiting for its turn to
@@ -234,6 +249,7 @@ class RadioPlayer:
         # song before it's technically "playing" yet.
         self._active_request: QueuedRequest | None = None
         self._stopping = False
+        self._encoder_starts = 0
         self._resolving = False
         self._skip_pending = False
         self._notify_failure: Callable[[str], Awaitable[None]] | None = None
@@ -319,6 +335,22 @@ class RadioPlayer:
     def queued_items(self) -> list[QueuedRequest]:
         return list(self._pending)
 
+    @property
+    def listener_count(self) -> int:
+        """Open /stream.opus connections (OBS browser/media sources)."""
+        return len(self._subscribers)
+
+    @property
+    def encoder_running(self) -> bool:
+        encoder = self._encoder
+        return encoder is not None and encoder.returncode is None
+
+    @property
+    def encoder_starts(self) -> int:
+        """How many times ffmpeg's encoder has been launched this run; more
+        than one means it died and was restarted."""
+        return self._encoder_starts
+
     def positions_for(self, requester_id: int) -> list[int]:
         """1-indexed queue positions, in play order, for every one of
         requester_id's requests still waiting — empty if they have none
@@ -333,9 +365,10 @@ class RadioPlayer:
         on demand, not a real request worth keeping."""
         self._queue_store = store
 
-    async def _persist_queue(self) -> None:
+    async def _persist_queue(self, front: QueuedRequest | None = None) -> None:
         if self._queue_store is None:
             return
+        pending = ([front] if front is not None else []) + list(self._pending)
         items = [
             {
                 "webpage_url": r.webpage_url,
@@ -344,7 +377,7 @@ class RadioPlayer:
                 "title": r.title,
                 "uploader": r.uploader,
             }
-            for r in self._pending
+            for r in pending
             if r.requester_id != 0
         ]
         await self._queue_store.write({"items": items})
@@ -514,9 +547,11 @@ class RadioPlayer:
         if self._current_decoder is not None:
             with contextlib.suppress(ProcessLookupError):
                 self._current_decoder.kill()
+            counters.record("skips")
             return True
         if self._resolving:
             self._skip_pending = True
+            counters.record("skips")
             return True
         return False
 
@@ -586,6 +621,10 @@ class RadioPlayer:
         with contextlib.suppress(Exception):
             await self._notify_failure(message)
 
+    async def _notify_failed(self, message: str) -> None:
+        counters.record("tracks_failed")
+        await self._notify(message)
+
     def _discard_prepared(self) -> None:
         """Kills and drops whatever's in self._prepared, if anything —
         called whenever it turns out not to be what plays next (preempted
@@ -606,8 +645,34 @@ class RadioPlayer:
         self._stopping = False
         self._task = asyncio.create_task(self._run_forever(), name="radio-player")
 
+    def close_subscribers(self) -> None:
+        """Ends every open /stream.opus connection by pushing the empty-bytes
+        sentinel handle_stream() already understands. Without it a connected
+        OBS source keeps its handler alive forever and the web server's
+        shutdown waits out its whole grace period for nothing."""
+        for q in list(self._subscribers):
+            self._subscribers.discard(q)
+            while True:
+                try:
+                    q.put_nowait(b"")
+                    break
+                except asyncio.QueueFull:
+                    with contextlib.suppress(asyncio.QueueEmpty):
+                        q.get_nowait()
+
     async def stop(self) -> None:
         self._stopping = True
+        # A song that is playing (or loading) right now is not in _pending, so
+        # a plain restart used to lose it. Put a real viewer request back at
+        # the front of the saved queue unless it was about to end anyway.
+        carry: QueuedRequest | None = self._active_request
+        if carry is not None:
+            np = self._now_playing
+            nearly_done = (
+                np is not None and np.duration > 0 and time.monotonic() - np.started_at >= np.duration - 15
+            )
+            if carry.requester_id == 0 or nearly_done or carry in self._pending:
+                carry = None
         if self._task is not None:
             self._task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -625,6 +690,10 @@ class RadioPlayer:
                 await asyncio.gather(*self._background_tasks, return_exceptions=True)
         self._discard_prepared()
         await self._kill_encoder()
+        self.close_subscribers()
+        if carry is not None:
+            with contextlib.suppress(Exception):
+                await self._persist_queue(front=carry)
 
     # -- internals ---------------------------------------------------------
 
@@ -679,7 +748,7 @@ class RadioPlayer:
 
     async def _spawn_encoder(self) -> None:
         cmd = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error",
+            _ffmpeg(), "-hide_banner", "-loglevel", "error",
             "-f", "s16le", "-ar", str(AUDIO_RATE), "-ac", str(AUDIO_CHANNELS), "-i", "-",
             # Opus over Ogg: Opus beats MP3 at the same bitrate (transparent
             # well under half MP3's bitrate — see AUDIO_BITRATE_KBPS in
@@ -689,9 +758,10 @@ class RadioPlayer:
             "-c:a", "libopus", "-b:a", f"{self._audio_bitrate_kbps}k", "-vbr", "on",
             "-f", "ogg", "-",
         ]
-        self._encoder = await asyncio.create_subprocess_exec(
+        self._encoder = await _spawn(
             *cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE
         )
+        self._encoder_starts += 1
         log.info("Audio encoder started (%dkbps Opus).", self._audio_bitrate_kbps)
 
     async def _pump_encoder_output(self) -> None:
@@ -928,7 +998,7 @@ class RadioPlayer:
         decoder: asyncio.subprocess.Process | None = None
         try:
             try:
-                decoder = await asyncio.create_subprocess_exec(
+                decoder = await _spawn(
                     *_decoder_cmd(track.stream_url), stdout=asyncio.subprocess.PIPE
                 )
             except asyncio.CancelledError:
@@ -1043,27 +1113,27 @@ class RadioPlayer:
                 track = await self._resolver(request.webpage_url, request.requester_id)
             except Exception:
                 log.exception("Failed to re-resolve queued request: %s", request.webpage_url)
-                await self._notify(f"Couldn't load {request.requester_name}'s song — skipping it.")
+                await self._notify_failed(f"Couldn't load {request.requester_name}'s song — skipping it.")
                 return
             if track is None:
                 log.warning("Re-resolve returned nothing for %s — skipping", request.webpage_url)
-                await self._notify(f"Couldn't load {request.requester_name}'s song — skipping it.")
+                await self._notify_failed(f"Couldn't load {request.requester_name}'s song — skipping it.")
                 return
             if track.is_live:
                 log.warning("Re-resolve found %s is now live — skipping", request.webpage_url)
-                await self._notify(f"Skipped {request.requester_name}'s song — it's a livestream now.")
+                await self._notify_failed(f"Skipped {request.requester_name}'s song — it's a livestream now.")
                 return
             duration_limit = await self._current_duration_limit()
             if 0 < duration_limit < track.duration:
                 log.warning("Re-resolve found %s now exceeds the duration cap — skipping", request.webpage_url)
-                await self._notify(f"Skipped {request.requester_name}'s song — it's too long to play now.")
+                await self._notify_failed(f"Skipped {request.requester_name}'s song — it's too long to play now.")
                 return
             if self._skip_pending:
                 self._skip_pending = False
                 log.info("Skipped %s before it started playing (mid-resolve skip).", track.title)
                 return
 
-            decoder = await asyncio.create_subprocess_exec(
+            decoder = await _spawn(
                 *_decoder_cmd(track.stream_url), stdout=asyncio.subprocess.PIPE
             )
             self._current_decoder = decoder
@@ -1081,7 +1151,7 @@ class RadioPlayer:
                 first_chunk = await asyncio.wait_for(decoder.stdout.read(_CHUNK_BYTES), timeout=_DECODER_START_TIMEOUT)
             except TimeoutError:
                 log.warning("Timed out waiting for decoder output for %s — skipping.", request.webpage_url)
-                await self._notify(f"Skipped {request.requester_name}'s song — it took too long to start.")
+                await self._notify_failed(f"Skipped {request.requester_name}'s song — it took too long to start.")
                 with contextlib.suppress(ProcessLookupError):
                     decoder.kill()
                 await decoder.wait()
@@ -1153,11 +1223,13 @@ class RadioPlayer:
                         "No audio from decoder for %.0fs (stalled source?) — skipping %s.",
                         _STALL_TIMEOUT_SECONDS, request.webpage_url,
                     )
-                    await self._notify(f"Skipped {request.requester_name}'s song — playback stalled.")
+                    await self._notify_failed(f"Skipped {request.requester_name}'s song — playback stalled.")
                     break
         except asyncio.CancelledError:
             # now_playing is still set here; the finally below clears it.
-            await self._notify(f"{request.requester_name}'s song was cut off — reconnecting the stream.")
+            # Not on shutdown: the stream isn't reconnecting, it's ending.
+            if not self._stopping:
+                await self._notify(f"{request.requester_name}'s song was cut off — reconnecting the stream.")
             raise
         finally:
             with contextlib.suppress(ProcessLookupError):
@@ -1167,6 +1239,7 @@ class RadioPlayer:
             self._now_playing = None
 
     async def _announce_now_playing(self, request: QueuedRequest, track: Track) -> None:
+        counters.record("tracks_played")
         if request.requester_id == 0:
             message = f"Now Playing: {track.title}"
         else:

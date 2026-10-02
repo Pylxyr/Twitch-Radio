@@ -23,6 +23,8 @@ log = logging.getLogger(__name__)
 
 _Handler = Callable[[web.Request], Awaitable[web.StreamResponse]]
 
+_SHUTDOWN_GRACE_SECONDS = 2.0
+
 _ROUTES: tuple[tuple[str, str, _Handler], ...] = (
     ("GET", "/nowplaying.json", live.handle_nowplaying),
     ("GET", "/healthz", live.handle_healthz),
@@ -123,7 +125,12 @@ async def run_admin_server(
 
     app.on_cleanup.append(_close_thumb_session)
 
-    runner = web.AppRunner(app)
+    # aiohttp's default is a 60 s grace period for in-flight handlers on
+    # cleanup(). /stream.opus and the overlay WebSocket never finish on their
+    # own, so with OBS connected a plain Stop sat there for a full minute.
+    # The player ends the audio streams itself (close_subscribers); anything
+    # still attached after this short grace is cancelled.
+    runner = web.AppRunner(app, shutdown_timeout=_SHUTDOWN_GRACE_SECONDS)
     try:
         await runner.setup()
         await web.TCPSite(runner, host, port).start()

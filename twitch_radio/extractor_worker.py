@@ -131,7 +131,11 @@ class _Worker:
             self._respond({"id": request_id, "ok": True, "info": projected})
 
     def run(self) -> None:
-        self._respond({"ready": True})
+        import yt_dlp.version
+
+        from twitch_radio import ytdlp_loader
+
+        self._respond({"ready": True, "yt_dlp": yt_dlp.version.__version__, "source": ytdlp_loader.import_with_fallback()["source"]})
         for line in sys.stdin:
             line = line.strip()
             if not line:
@@ -154,6 +158,10 @@ def main() -> int:
     # imported anywhere in this process.
     protocol_out = sys.stdout
     sys.stdout = sys.stderr
+    from twitch_radio import ytdlp_loader
+
+    # Same override-or-bundled choice as the main core, made before yt_dlp is imported here.
+    ytdlp_loader.import_with_fallback()
     try:
         _Worker(protocol_out).run()
     except KeyboardInterrupt:

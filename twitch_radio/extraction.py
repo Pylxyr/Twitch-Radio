@@ -15,11 +15,18 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlsplit
 
-import yt_dlp
+from twitch_radio import ytdlp_loader
 
-from twitch_radio.config import BASE_DIR, DATA_DIR, Settings
-from twitch_radio.models import Track
-from twitch_radio.telemetry import counters
+# Before the first `import yt_dlp` in this process: picks the user-installed
+# copy over the bundled one when there is a newer one (see ytdlp_loader.py).
+ytdlp_loader.import_with_fallback()
+
+import yt_dlp  # noqa: E402
+
+from twitch_radio.config import BASE_DIR, DATA_DIR, Settings  # noqa: E402
+from twitch_radio.models import Track  # noqa: E402
+from twitch_radio.paths import hidden_subprocess_kwargs, is_frozen, source_root  # noqa: E402
+from twitch_radio.telemetry import counters  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -117,6 +124,10 @@ class ExtractionBackend:
     async def aclose(self) -> None:
         raise NotImplementedError
 
+    def status(self) -> dict[str, Any]:
+        """Cheap, read-only snapshot for the desktop dashboard."""
+        return {"mode": "unknown", "size": 0, "alive": 0, "idle": 0}
+
 
 class ThreadBackend(ExtractionBackend):
     """Original in-process model: yt-dlp on a ThreadPoolExecutor, with a
@@ -135,6 +146,10 @@ class ThreadBackend(ExtractionBackend):
         # don't immediately starve every future request.
         self._executor = ThreadPoolExecutor(max_workers=concurrency + 2, thread_name_prefix="ytdlp")
         self._tlocal = threading.local()
+        self._concurrency = concurrency
+
+    def status(self) -> dict[str, Any]:
+        return {"mode": "thread", "size": self._concurrency, "alive": self._concurrency, "idle": self._concurrency}
 
     def _extract_sync(self, query: str, options: dict[str, Any]) -> dict[str, Any]:
         # Keyed by the options themselves (not a fast/slow flag) so the
@@ -206,11 +221,21 @@ class _ExtractionWorker:
         # pipe would deadlock the very first request.
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
-        # Makes `-m twitch_radio.extractor_worker` resolve regardless of cwd.
-        existing_path = env.get("PYTHONPATH")
-        env["PYTHONPATH"] = f"{BASE_DIR}{os.pathsep}{existing_path}" if existing_path else str(BASE_DIR)
+        if is_frozen():
+            # sys.executable is the packaged core itself, which has no `-m`;
+            # its entry point dispatches this flag to extractor_worker.main().
+            command = [sys.executable, "--extractor-worker"]
+        else:
+            # Makes `-m twitch_radio.extractor_worker` resolve regardless of
+            # cwd. The project checkout, NOT BASE_DIR: BASE_DIR is the
+            # writable data root, which TWITCH_RADIO_HOME can point anywhere.
+            existing_path = env.get("PYTHONPATH")
+            root = str(source_root())
+            env["PYTHONPATH"] = f"{root}{os.pathsep}{existing_path}" if existing_path else root
+            command = [sys.executable, "-m", "twitch_radio.extractor_worker"]
         self._proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "twitch_radio.extractor_worker",
+            *command,
+            **hidden_subprocess_kwargs(),
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
@@ -242,7 +267,8 @@ class _ExtractionWorker:
                     return
                 text = line.decode("utf-8", "replace").rstrip()
                 if text:
-                    log.debug("[ytdlp-worker-%d] %s", self._index, text)
+                    level = logging.WARNING if "challenge solver" in text.lower() else logging.DEBUG
+                    log.log(level, "[ytdlp-worker-%d] %s", self._index, text)
         except (asyncio.CancelledError, ValueError):
             raise
         except Exception:
@@ -344,6 +370,15 @@ class ProcessBackend(ExtractionBackend):
         self._started = False
         self._closing = False
         self._next_index = 0
+
+    def status(self) -> dict[str, Any]:
+        return {
+            "mode": "process",
+            "size": self._size,
+            "alive": len(self._all),
+            "idle": self._idle.qsize(),
+            "started": self._started,
+        }
 
     async def _spawn(self) -> _ExtractionWorker:
         self._next_index += 1
@@ -496,6 +531,9 @@ class Resolver:
         # challenge (~6s on Deno) is cached on the extractor instance and
         # doesn't rerun on every !sr. They differ only in what a "worker" is.
 
+    def worker_status(self) -> dict[str, Any]:
+        return self._backend.status()
+
     async def aclose(self) -> None:
         """Async because ProcessBackend has child processes to reap. Called
         from bot.py's teardown after the player and HTTP surface are down."""
@@ -540,6 +578,13 @@ class Resolver:
         except Exception:
             log.debug("Resolver warm-up failed (non-fatal).", exc_info=True)
         log.info("Resolver warm-up finished in %.1fs.", time.monotonic() - start)
+        if not ytdlp_loader.solver_status(DATA_DIR / ytdlp_loader.CACHE_DIRNAME)["ready"]:
+            log.error(
+                "The YouTube JS solver scripts are not downloaded. yt-dlp fetches them from "
+                "github.com/yt-dlp/ejs the first time it needs them; without them most !sr requests "
+                "will fail. Check that this PC is online and that your firewall or antivirus allows "
+                "github.com, then press Restart (Settings > App shows the status)."
+            )
 
     def _build_options(
         self,
@@ -569,7 +614,10 @@ class Resolver:
             # went nowhere, so the ~7s JS-challenge solve reran on every
             # resolve instead of once per player rotation. Very likely the
             # dominant cause of "!sr is slow" under this deployment.
-            "cachedir": str(DATA_DIR / "yt-dlp-cache"),
+            "cachedir": str(DATA_DIR / ytdlp_loader.CACHE_DIRNAME),
+            # The JS solver scripts are not bundled: yt-dlp downloads the ones
+            # matching its own version from github.com/yt-dlp/ejs into cachedir.
+            "remote_components": ["ejs:github"],
         }
         extractor_args: dict[str, dict[str, list[str]]] = {}
         player_client = (

@@ -1,0 +1,138 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; img-src 'self' data: https://*.ytimg.com https://*.ggpht.com https://*.googleusercontent.com; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'none'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Twitch Radio</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="titlebar">
+  <div class="brand"><img src="logo.png" alt=""><span>Twitch Radio</span></div>
+  <div class="tb-controls">
+    <div id="statusPill" class="pill stopped"><span class="dot"></span><span id="statusText">Stopped</span></div>
+    <button id="btnStart" class="btn primary">Start</button>
+    <button id="btnStop" class="btn danger" hidden>Stop</button>
+    <button id="btnRestart" class="btn ghost" hidden>Restart</button>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="sidebar" aria-label="Main">
+    <button class="nav active" data-tab="dashboard"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg><span>Dashboard</span></button>
+    <button class="nav" data-tab="logs"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span>Logs</span><b id="logBadge" class="badge" hidden>0</b></button>
+    <button class="nav" data-tab="settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.8l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.8-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.5 1.7 1.7 0 0 0-1.8.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.8 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.5-1 1.7 1.7 0 0 0-.3-1.8l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.8.3h0a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5h0a1.7 1.7 0 0 0 1.8-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.8v0a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z"/></svg><span>Settings</span></button>
+    <div class="side-foot"><div id="sideStatus" class="muted small">Stopped</div><div id="sideVersion" class="muted small"></div></div>
+  </nav>
+
+  <main>
+    <!-- ============================ DASHBOARD ============================ -->
+    <section id="tab-dashboard" class="tab active">
+      <div id="errorBanner" class="banner err" hidden>
+        <div><strong id="errTitle"></strong><div id="errHint" class="small"></div></div>
+        <div class="row"><button class="btn ghost" data-goto="logs">View logs</button><button class="btn ghost" data-goto="settings">Open Settings</button></div>
+      </div>
+
+      <div id="setupCard" class="card setup" hidden>
+        <div class="card-head"><h2>Finish setting up</h2><span id="setupProgress" class="muted small"></span></div>
+        <ol id="setupSteps" class="steps"></ol>
+      </div>
+
+      <div class="kpis">
+        <div class="card kpi"><div class="kpi-label">Uptime</div><div id="kpiUptime" class="kpi-value">–</div><div id="kpiUptimeSub" class="kpi-sub">Not running</div></div>
+        <div class="card kpi"><div class="kpi-label">Listeners</div><div id="kpiListeners" class="kpi-value">–</div><div class="kpi-sub">OBS audio connections</div></div>
+        <div class="card kpi"><div class="kpi-label">In queue</div><div id="kpiQueue" class="kpi-value">–</div><div id="kpiQueueSub" class="kpi-sub">&nbsp;</div></div>
+        <div class="card kpi"><div class="kpi-label">Songs played <span class="muted">· last hour</span></div><div id="kpiPlayed" class="kpi-value">–</div><div id="kpiPlayedSub" class="kpi-sub">&nbsp;</div></div>
+      </div>
+
+      <div class="grid2">
+        <div class="card now" id="nowCard">
+          <div class="card-head"><h2>Now playing</h2><div class="row"><button id="btnPause" class="btn ghost sm" disabled>Pause</button><button id="btnSkip" class="btn ghost sm" disabled>Skip</button></div></div>
+          <div class="now-body">
+            <div class="art" id="nowArt"><img id="nowImg" alt="" hidden><div class="art-ph"><svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div></div>
+            <div class="now-meta">
+              <div id="nowTitle" class="now-title">Nothing playing</div>
+              <div id="nowSub" class="muted">Start the bot, then use !sr in chat.</div>
+              <div class="progress"><div id="nowBar" class="bar"></div></div>
+              <div class="row between small muted"><span id="nowElapsed">0:00</span><span id="nowTotal">0:00</span></div>
+              <div id="nowTags" class="tags"></div>
+            </div>
+          </div>
+        </div>
+        <div class="card queue">
+          <div class="card-head"><h2>Queue</h2><button id="btnClear" class="btn ghost sm" disabled>Clear</button></div>
+          <ol id="queueList" class="qlist"></ol>
+          <div id="queueEmpty" class="empty">The queue is empty.</div>
+        </div>
+      </div>
+
+      <div class="grid2">
+        <div class="card">
+          <div class="card-head"><h2>Connections &amp; health</h2></div>
+          <ul id="healthList" class="health"></ul>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Resources</h2><span id="procNote" class="muted small"></span></div>
+          <div class="spark-row"><div><div class="spark-label">CPU <b id="cpuNow">–</b></div><canvas id="sparkCpu" height="54"></canvas></div>
+          <div><div class="spark-label">Memory <b id="memNow">–</b></div><canvas id="sparkMem" height="54"></canvas></div></div>
+          <div class="spark-row single"><div><div class="spark-label">Event-loop delay <b id="lagNow">–</b> <span class="muted small">(high = audio may stutter)</span></div><canvas id="sparkLag" height="54"></canvas></div></div>
+        </div>
+      </div>
+
+      <div class="grid2">
+        <div class="card">
+          <div class="card-head"><h2>Activity <span class="muted">· last hour</span></h2></div>
+          <div id="counters" class="counters"></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Add to OBS</h2></div>
+          <div class="obs">
+            <div class="obs-row"><div><div class="obs-name">Audio source <span class="muted small">Media Source · uncheck “Local file”</span></div><code id="urlStream">http://localhost:8098/stream.opus</code></div><button class="btn ghost sm" data-copy="urlStream">Copy</button></div>
+            <div class="obs-row"><div><div class="obs-name">Now-playing overlay <span class="muted small">Browser Source</span></div><code id="urlOverlay">http://localhost:8098/overlay</code></div><button class="btn ghost sm" data-copy="urlOverlay">Copy</button></div>
+            <div class="obs-row"><div><div class="obs-name">Web settings page <span class="muted small">optional, in your browser</span></div><code id="urlSettings">http://localhost:8098/settings</code></div><button class="btn ghost sm" id="btnOpenWeb">Open</button></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================================ LOGS ============================= -->
+    <section id="tab-logs" class="tab">
+      <div class="log-tools">
+        <div class="chips" id="levelChips">
+          <button class="chip on" data-level="DEBUG">Debug</button>
+          <button class="chip on" data-level="INFO">Info</button>
+          <button class="chip on" data-level="WARNING">Warning</button>
+          <button class="chip on" data-level="ERROR">Error</button>
+        </div>
+        <input id="logSearch" class="input grow" type="search" placeholder="Search logs…" autocomplete="off" spellcheck="false">
+        <button id="btnFollow" class="btn ghost sm on">Follow</button>
+        <button id="btnLogCopy" class="btn ghost sm">Copy</button>
+        <button id="btnLogExport" class="btn ghost sm">Export</button>
+        <button id="btnLogFolder" class="btn ghost sm">Log folder</button>
+        <button id="btnLogClear" class="btn ghost sm">Clear</button>
+      </div>
+      <div class="log-wrap">
+        <div id="logViewport" class="log-viewport" tabindex="0"><div id="logSizer"><div id="logRows"></div></div></div>
+        <button id="btnJump" class="jump" hidden>Jump to latest ↓</button>
+        <div id="logEmpty" class="empty overlay">No log lines match.</div>
+      </div>
+      <div class="log-foot muted small"><span id="logCount"></span><span>The log file on disk keeps the full history (rotated at 5 MB).</span></div>
+    </section>
+
+    <!-- ============================== SETTINGS ============================ -->
+    <section id="tab-settings" class="tab">
+      <div id="settingsRestart" class="banner warn" hidden><div><strong>Saved.</strong> Restart the bot for these changes to take effect.</div><button id="btnRestartNow" class="btn primary sm">Restart now</button></div>
+      <div id="settingsForm" class="settings"></div>
+      <div id="saveBar" class="savebar" hidden>
+        <span>You have unsaved changes.</span>
+        <div class="row"><span id="saveError" class="err-text small"></span><button id="btnDiscard" class="btn ghost">Discard</button><button id="btnSave" class="btn primary">Save changes</button></div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<script src="app.js"></script>
+</body>
+</html>

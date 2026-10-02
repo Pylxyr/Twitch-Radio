@@ -12,7 +12,7 @@ import logging
 from pathlib import Path
 from string import Template
 
-from twitch_radio.config import BASE_DIR
+from twitch_radio.paths import resource_dir
 
 log = logging.getLogger(__name__)
 
@@ -20,7 +20,7 @@ STATIC_DIR = Path(__file__).resolve().parent / "static"
 # Served at /logo.png (96px) and /logo.png?s=32 (favicon). A missing asset
 # degrades to "no logo", never an error — it's decoration, and a checkout that
 # skipped the assets directory should still get working pages.
-LOGO_DIR = BASE_DIR / "assets"
+LOGO_DIR = resource_dir() / "assets"
 
 STATIC_FILES = (
     "overlay.html",

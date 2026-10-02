@@ -1,0 +1,85 @@
+{
+  "name": "twitch-radio",
+  "productName": "Twitch Radio",
+  "version": "1.0.0",
+  "description": "Twitch Radio: desktop control panel for the song-request radio",
+  "main": "main.js",
+  "private": true,
+  "author": "Twitch Radio",
+  "license": "Unlicense",
+  "scripts": {
+    "start": "electron .",
+    "lint": "eslint .",
+    "check": "node scripts/check-syntax.js",
+    "check:build": "node scripts/check-build-config.js",
+    "dist": "electron-builder --win nsis --x64",
+    "dist:dir": "electron-builder --win dir --x64",
+    "test": "node --test \"test/*.test.js\""
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "electron": "42.11.10",
+    "electron-builder": "26.15.3",
+    "eslint": "10.11.0",
+    "globals": "17.13.0"
+  },
+  "build": {
+    "appId": "com.twitchradio.app",
+    "productName": "Twitch Radio",
+    "copyright": "Twitch Radio",
+    "directories": {
+      "output": "../dist/app",
+      "buildResources": "build"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "updates.js",
+      "renderer/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "../dist/core/TwitchRadioCore",
+        "to": "core",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../packaging/bin",
+        "to": "bin",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../THIRD_PARTY_NOTICES.txt",
+        "to": "THIRD_PARTY_NOTICES.txt"
+      }
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "deleteAppDataOnUninstall": false,
+      "shortcutName": "Twitch Radio",
+      "artifactName": "${productName} Setup ${version}.${ext}"
+    }
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}
