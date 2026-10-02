@@ -127,27 +127,81 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run dist
-      - name: Collect release files and checksums
+      - name: Collect release files
         shell: pwsh
         run: |
           $built = "dist/app/Twitch Radio Setup $env:VERSION.exe"
           if (-not (Test-Path $built)) { throw "Installer not found: $built" }
           New-Item -ItemType Directory -Force -Path release | Out-Null
           # GitHub turns spaces in asset names into dots; name the file as users will receive it.
-          $asset = "Twitch.Radio.Setup.$env:VERSION.exe"
-          Copy-Item $built "release/$asset"
-          Copy-Item THIRD_PARTY_NOTICES.txt release/THIRD_PARTY_NOTICES.txt
-          $hash = (Get-FileHash -Algorithm SHA256 "release/$asset").Hash.ToLowerInvariant()
-          "$hash  $asset" | Set-Content -Encoding ascii release/SHA256SUMS.txt
-          Get-Content release/SHA256SUMS.txt
+          Copy-Item $built "release/Twitch.Radio.Setup.$env:VERSION.exe"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-files
+          name: release-windows
+          path: release/*
+          if-no-files-found: error
+
+  build-linux:
+    needs: version-guard
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version-guard.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: requirements*.txt
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: gui/package-lock.json
+      - run: pip install -r requirements-build.txt
+      - name: Fetch ffmpeg and Deno (pinned, checksum-verified)
+        run: ./packaging/fetch-tools.sh
+      - name: Build the core with PyInstaller
+        run: pyinstaller packaging/core.spec --noconfirm --distpath dist/core --workpath build/pyinstaller
+      - name: Smoke test the frozen core
+        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore --bin packaging/bin
+      # Best effort, like the Windows job: YouTube often refuses GitHub-hosted runners.
+      - name: Real YouTube resolve + JS solver download (best effort)
+        id: live-resolve
+        continue-on-error: true
+        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore --bin packaging/bin --resolve-only
+      - name: Flag a failed live YouTube check
+        if: steps.live-resolve.outcome == 'failure'
+        run: |
+          echo "::warning title=Live YouTube check failed (Linux)::YouTube refused the CI runner or the JS solver could not be downloaded. The release was not blocked."
+      - name: Install GUI dependencies
+        working-directory: gui
+        run: npm ci
+      - name: Check the electron-builder config and build inputs
+        working-directory: gui
+        run: npm run check:build -- --require-built
+      - name: Build the AppImage and tarball
+        working-directory: gui
+        run: npm run dist:linux
+      - name: Collect release files
+        run: |
+          mkdir -p release
+          for ext in AppImage tar.gz; do
+            f="dist/app/Twitch-Radio-${VERSION}-linux-x64.${ext}"
+            test -f "$f" || { echo "Not found: $f"; exit 1; }
+            cp "$f" release/
+          done
+          ls -la release
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-linux
           path: release/*
           if-no-files-found: error
 
   publish:
-    needs: [version-guard, build]
+    needs: [version-guard, build, build-linux]
     # A tag push, or a call from cut-release.yml. A manual dry run has neither.
     if: github.event_name == 'push' || inputs.tag != ''
     runs-on: ubuntu-latest
@@ -167,15 +221,24 @@ jobs:
           fetch-depth: 0
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: release-files
+          pattern: release-*
+          merge-multiple: true
           path: release
+      - name: Checksums and notices
+        run: |
+          cp THIRD_PARTY_NOTICES.txt release/
+          cd release
+          sha256sum Twitch.Radio.Setup.*.exe Twitch-Radio-*-linux-x64.* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
       # Needs a public repo, or GitHub Enterprise Cloud for a private one. Never blocks the release.
       - name: Attest build provenance
         id: attest
         continue-on-error: true
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: release/Twitch.Radio.Setup.*.exe
+          subject-path: |
+            release/Twitch.Radio.Setup.*.exe
+            release/Twitch-Radio-*-linux-x64.*
       - name: Write release notes
         run: |
           {
@@ -187,13 +250,14 @@ jobs:
               echo "See the commit history for what changed."
             }
             echo
-            echo "## About this installer"
+            echo "## About these builds"
             echo
             if [ "$SIGNED" = "true" ]; then
-              echo "This installer is code-signed."
+              echo "The Windows installer is code-signed."
             else
-              echo "This installer is **not code-signed**, so SmartScreen will warn about it."
+              echo "The Windows installer is **not code-signed**, so SmartScreen will warn about it."
             fi
+            echo "The Linux builds are not signed; check them against \`SHA256SUMS.txt\`."
             if [ "${{ steps.attest.outcome }}" = "success" ]; then
               echo "Build provenance: verify with \`gh attestation verify <file> --repo ${GITHUB_REPOSITORY}\`."
             fi
@@ -206,6 +270,8 @@ jobs:
           case "$TAG" in *-*) flags+=(--prerelease) ;; esac
           gh release create "$TAG" \
             "release/Twitch.Radio.Setup.${VERSION}.exe#Twitch Radio Setup ${VERSION}.exe" \
+            "release/Twitch-Radio-${VERSION}-linux-x64.AppImage" \
+            "release/Twitch-Radio-${VERSION}-linux-x64.tar.gz" \
             release/SHA256SUMS.txt \
             release/THIRD_PARTY_NOTICES.txt \
             --title "Twitch Radio ${VERSION}" \
