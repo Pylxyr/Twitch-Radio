@@ -189,7 +189,7 @@ def test_render_prefers_ai_text() -> None:
     text = release_notes.render(
         "v1.1.0", "v1.0.0", "me/repo", [("a1", "Fix bug")], ["- x"], "### Added\n- A thing"
     )
-    assert "- A thing" in text and "Summarised automatically by Claude" in text
+    assert "- A thing" in text and "Summarised automatically by AI" in text
     assert "Fix bug" not in text and "detected from the code" not in text
 
 
@@ -210,8 +210,9 @@ class _FakeResponse:
         return self._buf.read(*a)
 
 
-def test_ai_summary_without_key_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+def test_ai_summary_without_any_service_returns_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("ANTHROPIC_API_KEY", "AI_API_KEY", "AI_BASE_URL", "GITHUB_TOKEN"):
+        monkeypatch.delenv(name, raising=False)
     assert release_notes.ai_summary("v1.0.0", "v1.1.0", []) is None
 
 
@@ -226,15 +227,88 @@ def test_ai_summary_accepts_good_reply_and_rejects_bad(monkeypatch: pytest.Monke
     assert release_notes.ai_summary("v1.0.0", "v1.1.0", []) is None
 
 
-def test_trim_diff_drops_lockfiles_and_caps_size() -> None:
-    big = "diff --git a/big.py b/big.py\n" + ("+x\n" * 20000)
+def test_trim_diff_drops_lockfiles_and_caps_each_file() -> None:
+    big = "diff --git a/twitch_radio/big.py b/twitch_radio/big.py\n" + ("+x\n" * 20000)
     lock = "diff --git a/gui/package-lock.json b/gui/package-lock.json\n+huge\n"
-    out = release_notes._trim_diff(lock + big)
+    out = release_notes._trim_diff(lock + big, 50_000)
     assert "package-lock" not in out
-    assert "truncated" in out and len(out) < 20000
+    assert "omitted" in out and len(out) < 4_000
 
 
 def test_functions_in_new_files_are_not_listed() -> None:
     diff = "+++ b/twitch_radio/new_module.py\n+def helper_one() -> None:\n+class Thing:\n+++ b/twitch_radio/old.py\n+def added_later() -> None:\n"
     logic = release_notes.detect_logic(diff, frozenset({"twitch_radio/new_module.py"}))
     assert logic["code"]["added"] == {"added_later()"}
+
+
+def test_pick_provider_order() -> None:
+    both = {
+        "ANTHROPIC_API_KEY": "a",
+        "AI_API_KEY": "b",
+        "AI_BASE_URL": "https://x/v1",
+        "AI_MODEL": "m",
+        "GITHUB_TOKEN": "g",
+    }
+    assert release_notes.pick_provider(both).name == "Claude"
+    del both["ANTHROPIC_API_KEY"]
+    generic = release_notes.pick_provider(both)
+    assert generic.name == "AI" and generic.url == "https://x/v1/chat/completions" and generic.model == "m"
+    only_token = release_notes.pick_provider({"GITHUB_TOKEN": "g"})
+    assert only_token.name == "GitHub Models" and only_token.url.endswith("/inference/chat/completions")
+    assert only_token.budget <= 24_000  # stays inside the free tier's 8,000-token input limit
+    assert release_notes.pick_provider({}) is None
+    # a generic key without a model or base URL is not enough to pick that service
+    assert release_notes.pick_provider({"AI_API_KEY": "k", "AI_BASE_URL": "https://x"}) is None
+
+
+def test_prompt_stays_inside_the_budget_and_puts_product_code_first() -> None:
+    def chunk(path: str) -> str:
+        return f"diff --git a/{path} b/{path}\n" + "+line of change\n" * 120
+
+    diff = (
+        chunk("tests/test_a.py") + chunk("BUILD.md") + chunk("twitch_radio/player.py") + chunk("gui/main.js")
+    )
+    prompt = release_notes.build_prompt("v2", "v1", [("a", "Fix crash")], "stat", diff, 5_000)
+    assert len(prompt) <= 5_000
+    assert prompt.index("player.py") < prompt.index("main.js") or "main.js" in prompt
+    assert "twitch_radio/player.py" in prompt
+    assert (
+        "not shown" in prompt and "test_a.py" in prompt.split("not shown")[1]
+    )  # low priority files are only named
+
+
+def test_prompt_leaves_out_generic_commit_messages() -> None:
+    prompt = release_notes.build_prompt(
+        "v2", "v1", [("a", "Add files via upload"), ("b", "Fix crash")], "", "", 5_000
+    )
+    assert "Fix crash" in prompt and "via upload" not in prompt
+
+
+def test_ai_summary_reads_openai_style_replies(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("ANTHROPIC_API_KEY", "AI_API_KEY", "AI_BASE_URL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.setattr(
+        release_notes, "git", lambda *a: "diff --git a/twitch_radio/x.py b/twitch_radio/x.py\n+print(1)\n"
+    )
+    seen = {}
+
+    def fake_urlopen(request, timeout=0):  # type: ignore[no-untyped-def]
+        seen["url"] = request.full_url
+        seen["auth"] = request.get_header("Authorization")
+        return _FakeResponse({"choices": [{"message": {"content": "### Fixed\n- Something"}}]})
+
+    monkeypatch.setattr(release_notes.urllib.request, "urlopen", fake_urlopen)
+    assert release_notes.ai_summary("v1", "v2", [("a", "Fix x")]) == "### Fixed\n- Something"
+    assert seen["url"].startswith("https://models.github.ai/inference") and seen["auth"] == "Bearer t"
+
+
+def test_ai_summary_survives_a_quota_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GITHUB_TOKEN", "t")
+    monkeypatch.setattr(release_notes, "git", lambda *a: "")
+
+    def boom(*a, **k):  # type: ignore[no-untyped-def]
+        raise release_notes.urllib.error.HTTPError("u", 429, "Too Many Requests", {}, None)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(release_notes.urllib.request, "urlopen", boom)
+    assert release_notes.ai_summary("v1", "v2", []) is None

@@ -25,10 +25,6 @@ ffmpeg - GNU GPL (v3 or later)
     --enable-gpl and --enable-version3; its licence is FFMPEG-LICENSE.txt next
     to it.
 
-Deno - MIT
-    JavaScript runtime that yt-dlp uses to run YouTube's player scripts.
-    https://github.com/denoland/deno
-
 Python application core (frozen with PyInstaller)
 -------------------------------------------------
 
@@ -56,7 +52,8 @@ Desktop shell
 
 Electron - MIT                             https://github.com/electron/electron
 Chromium and Node.js, included in Electron - see LICENSES.chromium.html in the
-    installed app folder, and https://nodejs.org/
+    installed app folder, and https://nodejs.org/. The app also runs Electron's
+    Node.js to execute the YouTube solver scripts for yt-dlp.
 electron-builder (build tool, not shipped) - MIT
 
 Downloaded at runtime, not shipped
@@ -67,7 +64,7 @@ yt-dlp JS challenge solver scripts - Unlicense
     These are NOT part of the installer. yt-dlp downloads the scripts that match
     its own version over HTTPS the first time it needs them and keeps them in
     the Twitch Radio data folder (%APPDATA%\TwitchRadio\data\yt-dlp-cache). They
-    run inside Deno.
+    run inside the Node.js that is part of Electron.
 
 yt-dlp updates - Unlicense
     If you press "Update" in Settings > App, a newer yt-dlp release is downloaded

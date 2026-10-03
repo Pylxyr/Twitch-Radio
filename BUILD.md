@@ -1,6 +1,6 @@
 # Building the Twitch Radio desktop app (Windows and Linux)
 
-The installer is made in four automatic steps: Python environment, ffmpeg + Deno download,
+The installer is made in four automatic steps: Python environment, ffmpeg download,
 the bot core (PyInstaller), and the desktop app (Electron + electron-builder).
 This page is written for Windows; [Linux](#linux-arch--cachyos) has its own section below.
 
@@ -10,7 +10,7 @@ This page is written for Windows; [Linux](#linux-arch--cachyos) has its own sect
 |---|---|---|
 | Python | 3.11 or newer, 64-bit, "Add python.exe to PATH" ticked | https://www.python.org/downloads/ |
 | Node.js | 22 LTS or newer (includes npm; Electron 42 needs 22.12+) | https://nodejs.org |
-| Internet | for pip, npm, ffmpeg and Deno downloads | |
+| Internet | for pip, npm and ffmpeg downloads | |
 
 Users of the finished installer need **nothing** installed.
 
@@ -38,8 +38,8 @@ run-gui.bat        (starts the desktop app against your source checkout)
 ```
 
 In this mode the app uses your existing `.env` and `data\` folder in the project directory.
-Source installs need Deno for YouTube too: put `deno` (2.3 or newer) on PATH, or set
-`YTDLP_JS_RUNTIME_PATH` in `.env`.
+Source installs need a JavaScript runtime for YouTube (the installed app brings its own, see
+"YouTube JS solver" below): put `deno` (2.3 or newer) on PATH, or set `YTDLP_JS_RUNTIME_PATH` in `.env`.
 
 ## What ends up where (installed app)
 
@@ -55,14 +55,13 @@ To move an existing install: copy your old `.env` and `data\` folder into `%APPD
 
 ## Pinned tools
 
-`packaging\tools.lock.json` pins ffmpeg and Deno (version, URL, SHA-256). `packaging\fetch-tools.ps1`
+`packaging\tools.lock.json` pins ffmpeg (version, URL, SHA-256). `packaging\fetch-tools.ps1`
 verifies every download against it and fails the build on a mismatch (the bad file is deleted).
 To bump a tool: change `version` and `url`, download the file once, put its SHA-256 in `sha256`
-(`Get-FileHash <file>`). For Deno, compare with the `.sha256sum` file next to the release asset.
-Deno must stay at 2.3 or newer (what the yt-dlp JS solver requires).
+(`Get-FileHash <file>`).
 
-`build-windows.bat` still reuses `ffmpeg` / `deno` found on your PATH instead of downloading, which
-bypasses the pins. For a reproducible build, delete `packaging\bin` and remove them from PATH, or
+`build-windows.bat` still reuses an `ffmpeg` found on your PATH instead of downloading, which
+bypasses the pin. For a reproducible build, delete `packaging\bin` and remove it from PATH, or
 run `powershell -File packaging\fetch-tools.ps1 -Force`. The release workflow always uses the pins.
 
 `THIRD_PARTY_NOTICES.txt` (repo root) is copied into the installer. Keep it current when you add
@@ -99,7 +98,7 @@ The second command resolves a real YouTube video and needs YouTube and GitHub re
 ## Linux (Arch / CachyOS)
 
 Releases include `Twitch-Radio-x.y.z-linux-x64.AppImage` and a `.tar.gz` of the unpacked app
-(x86-64). ffmpeg (a static build) and Deno are bundled.
+(x86-64). ffmpeg (a static build) is bundled.
 
 **Run a release build**
 
@@ -121,8 +120,8 @@ scripts/build-linux.sh
 ```
 
 This runs the same four steps as `build-windows.bat` and leaves the AppImage and tarball in
-`dist/app/`. `packaging/fetch-tools.sh` always downloads the pinned static ffmpeg and Deno from the
-`linux` section of `packaging/tools.lock.json` and verifies their SHA-256 (a system ffmpeg is
+`dist/app/`. `packaging/fetch-tools.sh` always downloads the pinned static ffmpeg from the
+`linux` section of `packaging/tools.lock.json` and verifies its SHA-256 (a system ffmpeg is
 dynamically linked and would not run on other distributions). Bump them the same way as the Windows
 pins.
 
@@ -200,16 +199,21 @@ Cloud for a private one; where it isn't available the step is skipped without fa
 
 ## How the update mechanisms behave
 
-**YouTube JS solver.** yt-dlp needs a JavaScript runtime (the bundled Deno) and "solver" scripts to
-read some YouTube links. The `yt-dlp-ejs` pip package is deliberately **not** bundled. yt-dlp is
+**YouTube JS solver.** yt-dlp needs a JavaScript runtime and "solver" scripts to read some YouTube
+links. The installed app ships no separate runtime (that was a 93 MB Deno, about 29 MB inside the
+installer): the desktop app's own executable is Electron, which contains Node, and the core starts it
+with `ELECTRON_RUN_AS_NODE=1` as yt-dlp's "node" runtime (`twitch_radio/config.py`; `gui/main.js`
+passes the path as `TWITCH_RADIO_HOST_JS_EXE`). CI proves the built app can do this
+(`scripts/check_host_runtime.py`); if you ever turn off Electron's `runAsNode` fuse, that check fails
+the release. A Deno placed in `bin\` or set via `YTDLP_JS_RUNTIME_PATH` still takes precedence. The `yt-dlp-ejs` pip package is deliberately **not** bundled. yt-dlp is
 started with `remote_components: ["ejs:github"]`, downloads the scripts that match its own version
 from github.com/yt-dlp/ejs over HTTPS the first time it needs them, and caches them in
 `data\yt-dlp-cache`, so they survive restarts. If the download is blocked, the Logs tab shows an
 error after start-up, the setup checklist keeps "Download the YouTube JS solver" open, and
 Settings > App shows "JS solver: not downloaded yet". Allow github.com and restart the bot.
-yt-dlp runs the scripts in `deno run` with no `--allow-*` permissions, so they get no file,
-network, environment or process access, and it checks the downloaded script against a hash it
-ships with.
+yt-dlp runs the scripts with the runtime's permission model on (`--permission`, no grants), so they
+get no file, network, environment or process access, and it checks the downloaded script against a
+hash it ships with.
 
 **yt-dlp updates.** yt-dlp is frozen into the core, but Settings > App can install a newer release
 without a new installer. The core downloads the release's `yt-dlp` zipimport file and

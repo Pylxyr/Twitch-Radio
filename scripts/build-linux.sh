@@ -10,7 +10,7 @@ echo "=== 1/4  Python environment ==="
 .venv/bin/python -m pip install --disable-pip-version-check -r requirements-build.txt
 .venv/bin/python -c "import yt_dlp.version as v; print('[ok] yt-dlp', v.__version__)"
 
-echo "=== 2/4  ffmpeg + deno (pinned, checksum-verified static builds) ==="
+echo "=== 2/4  ffmpeg (pinned, checksum-verified static build) ==="
 ./packaging/fetch-tools.sh
 
 echo "=== 3/4  Bot core (PyInstaller) ==="

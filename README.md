@@ -2,7 +2,7 @@
 
 > **Desktop app available.** This project can also be built into a double-click Windows app (and a
 > Linux AppImage, see BUILD.md) with a
-> dashboard, live log viewer, Start/Stop buttons and a Settings screen, with ffmpeg and Deno bundled
+> dashboard, live log viewer, Start/Stop buttons and a Settings screen, with ffmpeg bundled
 > (no terminal, no manual installs for end users). See [BUILD.md](BUILD.md). The steps below still
 > work if you prefer running from source.
 

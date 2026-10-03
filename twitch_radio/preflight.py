@@ -90,10 +90,14 @@ def build_report() -> dict[str, Any]:
         ffmpeg = shutil.which("ffmpeg")
         js = shutil.which(js_path) if js_path else shutil.which(js_name)
         report["ffmpeg"] = {"path": ffmpeg, "version": _first_line([ffmpeg, "-version"]) if ffmpeg else None}
+        # The desktop app's executable doubles as Node only with ELECTRON_RUN_AS_NODE=1 (set when the
+        # settings picked it); run bare, it would start the whole GUI, so never probe it without that.
+        is_host = bool(js) and js == os.getenv("TWITCH_RADIO_HOST_JS_EXE")
+        probe_ok = bool(js) and (not is_host or os.getenv("ELECTRON_RUN_AS_NODE") == "1")
         report["js_runtime"] = {
             "name": js_name,
             "path": js,
-            "version": _first_line([js, "--version"]) if js else None,
+            "version": _first_line([js, "--version"]) if js and probe_ok else None,
         }
 
         bot_id = settings.bot_id if settings else os.getenv("TWITCH_BOT_ID", "").strip() or None

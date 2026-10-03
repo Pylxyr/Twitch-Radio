@@ -101,6 +101,10 @@ function coreEnv() {
   const env = { ...process.env, TWITCH_RADIO_HOME: HOME, PYTHONIOENCODING: 'utf-8', PYTHONUNBUFFERED: '1' };
   const bin = app.isPackaged ? path.join(process.resourcesPath, 'bin') : path.join(PROJECT_ROOT, 'packaging', 'bin');
   if (fs.existsSync(bin)) env.TWITCH_RADIO_BIN = bin;
+  // The installer ships no JavaScript runtime for yt-dlp: with ELECTRON_RUN_AS_NODE=1 this executable
+  // is Node (the core sets that variable itself, see twitch_radio/config.py). Needs Electron's runAsNode
+  // fuse left on, which scripts/check_host_runtime.py verifies against the built app in CI.
+  if (app.isPackaged) env.TWITCH_RADIO_HOST_JS_EXE = process.execPath;
   return env;
 }
 

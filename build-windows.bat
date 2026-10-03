@@ -2,7 +2,7 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 rem Builds the installer: dist\app\Twitch Radio Setup x.y.z.exe
-rem Needs: Python 3.11+, Node.js 22+ (npm). ffmpeg and deno are reused from PATH if present (so they are NOT the pinned versions), else the pinned ones are downloaded and checksum-verified. See BUILD.md.
+rem Needs: Python 3.11+, Node.js 22+ (npm). ffmpeg is reused from PATH if present (so it is NOT the pinned version), else the pinned one is downloaded and checksum-verified. See BUILD.md.
 
 set "BIN=%~dp0packaging\bin"
 
@@ -25,12 +25,13 @@ python -m pip install --disable-pip-version-check -r requirements-build.txt || g
 python -c "import yt_dlp.version as v; print('[ok] yt-dlp', v.__version__)" || goto :fail
 
 echo.
-echo === 2/4  ffmpeg + deno ===
+echo === 2/4  ffmpeg ===
 if not exist "%BIN%" mkdir "%BIN%"
+rem Older builds put deno.exe here; anything in bin\ is bundled, so drop the leftover.
+if exist "%BIN%\deno.exe" del /q "%BIN%\deno.exe"
 call :reuse_tool ffmpeg -version
-call :reuse_tool deno --version
-if exist "%BIN%\ffmpeg.exe" if exist "%BIN%\deno.exe" goto :tools_ready
-echo Downloading the missing tool^(s^)...
+if exist "%BIN%\ffmpeg.exe" goto :tools_ready
+echo Downloading ffmpeg...
 powershell -NoProfile -ExecutionPolicy Bypass -File packaging\fetch-tools.ps1 || goto :fail
 :tools_ready
 

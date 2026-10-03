@@ -49,7 +49,7 @@ def last_json(text: str) -> dict[str, object]:
     return {}
 
 
-def basic(exe: str, env: dict[str, str], bin_dir: str | None) -> None:
+def basic(exe: str, env: dict[str, str], bin_dir: str | None, host_js: str | None = None) -> None:
     done = run(exe, ["--preflight"], env)
     report = last_json(done.stdout)
     check(bool(report), "--preflight prints JSON", done.stderr[-300:])
@@ -61,13 +61,27 @@ def basic(exe: str, env: dict[str, str], bin_dir: str | None) -> None:
     )  # type: ignore[index]
     check(isinstance(report.get("js_solver"), dict), "preflight reports the JS solver")
     if bin_dir:
-        runtime = report.get("js_runtime") or {}
-        deno = str(runtime.get("path") or "")  # type: ignore[attr-defined]
+        ffmpeg = str((report.get("ffmpeg") or {}).get("path") or "")  # type: ignore[attr-defined]
         check(
-            deno.startswith(str(Path(bin_dir).resolve())) and bool(runtime.get("version")),
-            "bundled Deno is found and runs",
+            ffmpeg.startswith(str(Path(bin_dir).resolve()))
+            and bool((report.get("ffmpeg") or {}).get("version")),  # type: ignore[attr-defined]
+            "bundled ffmpeg is found and runs",
+            str(report.get("ffmpeg")),
+        )
+        stale = [p.name for p in Path(bin_dir).glob("deno*")]
+        check(not stale, "no JavaScript runtime is bundled (the app brings its own)", str(stale))
+    if host_js:
+        # What the desktop app does: hand over its own executable as the JS runtime for yt-dlp.
+        runtime = report.get("js_runtime") or {}
+        got = str(runtime.get("path") or "")  # type: ignore[attr-defined]
+        check(
+            runtime.get("name") == "node"  # type: ignore[attr-defined]
+            and bool(got)
+            and Path(got).resolve() == Path(host_js).resolve()
+            and str(runtime.get("version") or "").startswith("v"),  # type: ignore[attr-defined]
+            "frozen core uses the host app as its JavaScript runtime",
             str(runtime),
-        )  # type: ignore[attr-defined]
+        )
 
     done = run(exe, ["--hash-password-stdin"], env, stdin="smoke-test-password\n")
     check(
@@ -133,7 +147,12 @@ def main() -> int:
     parser.add_argument("--home", help="data folder to use (default: a temp folder)")
     parser.add_argument(
         "--bin",
-        help="folder with the bundled ffmpeg/deno (packaging/bin); the desktop app passes it as TWITCH_RADIO_BIN",
+        help="folder with the bundled ffmpeg (packaging/bin); the desktop app passes it as TWITCH_RADIO_BIN",
+    )
+    parser.add_argument(
+        "--host-js",
+        help="a Node-compatible executable to act as the desktop app, which the app passes as"
+        " TWITCH_RADIO_HOST_JS_EXE (CI uses the runner's own node)",
     )
     args = parser.parse_args()
     exe = str(Path(args.exe).resolve())
@@ -149,11 +168,13 @@ def main() -> int:
     }
     if args.bin:
         env["TWITCH_RADIO_BIN"] = str(Path(args.bin).resolve())
+    if args.host_js:
+        env["TWITCH_RADIO_HOST_JS_EXE"] = str(Path(args.host_js).resolve())
     for name in ("YTDLP_PLAYER_CLIENT", "YTDLP_JS_RUNTIME_PATH", "TWITCH_RADIO_NO_YTDLP_OVERRIDE"):
         env.pop(name, None)
     print(f"exe: {exe}\nhome: {home}")
     if not args.resolve_only:
-        basic(exe, env, args.bin)
+        basic(exe, env, args.bin, args.host_js)
     if args.resolve or args.resolve_only:
         resolve(exe, env, home, args.url)
     print("\nFAILED: " + "; ".join(failures) if failures else "\nall checks passed")

@@ -3,12 +3,15 @@
 
   python scripts/release_notes.py --tag v1.2.0 --repo owner/name            # previous release found automatically
   python scripts/release_notes.py --tag v1.2.0 --prev v1.1.0 --repo owner/name
-  python scripts/release_notes.py --tag v1.2.0 --repo owner/name --ai       # needs ANTHROPIC_API_KEY
+  python scripts/release_notes.py --tag v1.2.0 --repo owner/name --ai       # needs an AI service (below)
 
 Three layers, best first:
 
-1. AI summary (only with --ai and an ANTHROPIC_API_KEY): Claude reads the actual diff and writes the
-   notes. If the key is missing or the call fails, the next layers are used.
+1. AI summary (only with --ai): a model reads the actual diff and writes the notes. In GitHub Actions
+   this works for free through GitHub Models (the workflow's own token, permission `models: read`);
+   ANTHROPIC_API_KEY, or AI_API_KEY + AI_BASE_URL + AI_MODEL for any OpenAI-compatible service such as
+   Gemini or Groq, are used first when set. If nothing is configured or the call fails, the next layers
+   are used.
 2. Commit messages, grouped by their first word ("Add ..." -> Added, "Fix ..." -> Fixed; the
    conventional `feat:` / `fix:` prefixes work too). Release bumps, automatic formatting commits and
    merge commits are left out.
@@ -328,64 +331,166 @@ _AI_SYSTEM = (
     "CI only if they affect users, otherwise omit them. Never invent changes the diff does not show. "
     "Output only the markdown sections."
 )
-_MAX_DIFF_CHARS = 120_000
-_MAX_FILE_DIFF_CHARS = 12_000
+_MAX_FILE_DIFF_CHARS = 3_000
+_MAX_HEAD_CHARS = 3_500  # commit list + file summary
+# Files that matter to the people running the bot come first; whatever does not fit is only named.
+_LOW_PRIORITY_AREAS = ("Build and release", "Tests", "Documentation", "Other")
 
 
-def _trim_diff(diff: str) -> str:
-    """Cap each file's share of the diff and the total, so one huge file cannot crowd out the rest."""
-    chunks = re.split(r"(?m)^(?=diff --git )", diff)
-    out, total = [], 0
+class Provider:
+    """Where to send the prompt. `budget` is the most characters of prompt the service accepts:
+    GitHub Models' free tier allows 8,000 input tokens per request, which is roughly 20,000 characters
+    of code once the instructions are counted, so that budget is kept well under it."""
+
+    def __init__(self, name: str, kind: str, url: str, key: str, model: str, budget: int) -> None:
+        self.name, self.kind, self.url, self.key, self.model, self.budget = (
+            name,
+            kind,
+            url,
+            key,
+            model,
+            budget,
+        )
+
+
+def pick_provider(env: dict[str, str] | None = None) -> Provider | None:
+    """The first configured AI service, or None.
+
+    1. ANTHROPIC_API_KEY                         -> Claude
+    2. AI_API_KEY + AI_BASE_URL + AI_MODEL       -> any OpenAI-compatible service (Gemini, Groq, ...)
+    3. GITHUB_TOKEN                              -> GitHub Models, free, no secret to create
+                                                    (the workflow needs `models: read`)
+    """
+    env = dict(os.environ if env is None else env)
+    model = env.get("RELEASE_NOTES_MODEL", "").strip()
+    if key := env.get("ANTHROPIC_API_KEY", "").strip():
+        base = env.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
+        return Provider(
+            "Claude", "anthropic", f"{base}/v1/messages", key, model or "claude-sonnet-5-5", 120_000
+        )
+    if (key := env.get("AI_API_KEY", "").strip()) and (base := env.get("AI_BASE_URL", "").strip()):
+        budget = int(env.get("AI_MAX_INPUT_CHARS", "") or 24_000)
+        chosen = env.get("AI_MODEL", "").strip() or model
+        if chosen:
+            return Provider("AI", "openai", f"{base.rstrip('/')}/chat/completions", key, chosen, budget)
+    if key := env.get("GITHUB_TOKEN", "").strip():
+        base = env.get("GITHUB_MODELS_BASE_URL", "https://models.github.ai/inference").rstrip("/")
+        return Provider(
+            "GitHub Models", "openai", f"{base}/chat/completions", key, model or "openai/gpt-4o-mini", 20_000
+        )
+    return None
+
+
+def _file_priority(chunk_header: str) -> int:
+    match = re.search(r" b/(\S+)", chunk_header)
+    area = area_of(match.group(1)) if match else "Other"
+    return 1 if area in _LOW_PRIORITY_AREAS else 0
+
+
+def _trim_diff(diff: str, budget: int) -> str:
+    """The diff cut to `budget` characters: user-facing code first, each file capped, lockfiles dropped,
+    and the names of anything left out listed at the end."""
+    chunks = [c for c in re.split(r"(?m)^(?=diff --git )", diff) if c.strip()]
+    chunks = [c for c in chunks if not any(name in c.split("\n", 1)[0] for name in _LOCKFILES)]
+    chunks.sort(key=lambda c: _file_priority(c.split("\n", 1)[0]))  # stable: keeps git's order within a tier
+    out: list[str] = []
+    omitted: list[str] = []
+    used = 0
     for chunk in chunks:
-        if not chunk or any(name in chunk.split("\n", 1)[0] for name in _LOCKFILES):
-            continue
+        name = (re.search(r" b/(\S+)", chunk.split("\n", 1)[0]) or [None, "?"])[1]
         if len(chunk) > _MAX_FILE_DIFF_CHARS:
-            chunk = chunk[:_MAX_FILE_DIFF_CHARS] + "\n[... file diff truncated ...]\n"
-        if total + len(chunk) > _MAX_DIFF_CHARS:
-            out.append("[... remaining files omitted ...]\n")
-            break
+            chunk = chunk[:_MAX_FILE_DIFF_CHARS] + "\n[... rest of this file's diff omitted ...]\n"
+        if used + len(chunk) > budget:
+            omitted.append(name)
+            continue
         out.append(chunk)
-        total += len(chunk)
+        used += len(chunk)
+    if omitted:
+        out.append("[files changed but not shown: " + ", ".join(omitted[:25]) + "]\n")
     return "".join(out)
 
 
-def ai_summary(prev: str, tag: str, commits: list[tuple[str, str]]) -> str | None:
-    """Notes written by Claude from the real diff, or None when unavailable (no key, error, odd reply)."""
-    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-    if not key:
-        print("No ANTHROPIC_API_KEY set; using commit messages and code analysis.", file=sys.stderr)
-        return None
-    try:
-        stat = git("diff", "--no-renames", "--stat=200", f"{prev}..{tag}")
-        diff = _trim_diff(git("diff", "--no-renames", "-U2", f"{prev}..{tag}"))
-        prompt = (
-            f"Release {tag}, changes since {prev}.\n\n## Commit messages\n"
-            + "\n".join(f"- {s}" for _, s in commits if not _NOISE.match(s))
-            + f"\n\n## Files changed\n{stat}\n\n## Diff\n{diff}"
-        )
-        body = json.dumps(
+def build_prompt(
+    tag: str, prev: str, commits: list[tuple[str, str]], stat: str, diff: str, budget: int
+) -> str:
+    """The user message, kept within `budget` characters (the system prompt is counted by the caller)."""
+    head = (
+        f"Release {tag}, changes since {prev}.\n\n## Commit messages\n"
+        + "\n".join(f"- {s}" for _, s in commits if not _NOISE.match(s) and not is_generic(s))
+        + f"\n\n## Files changed\n{stat}"
+    )[:_MAX_HEAD_CHARS]
+    room = max(0, budget - len(head) - 40)
+    return f"{head}\n\n## Diff\n{_trim_diff(diff, room)}"
+
+
+def _post_json(url: str, headers: dict[str, str], payload: dict) -> dict:
+    request = urllib.request.Request(
+        url, data=json.dumps(payload).encode(), headers={"content-type": "application/json", **headers}
+    )
+    with urllib.request.urlopen(request, timeout=90) as response:  # noqa: S310 (https endpoint chosen by the workflow)
+        return json.load(response)
+
+
+def ask_model(provider: Provider, prompt: str) -> str:
+    if provider.kind == "anthropic":
+        data = _post_json(
+            provider.url,
+            {"x-api-key": provider.key, "anthropic-version": "2023-06-01"},
             {
-                "model": os.environ.get("RELEASE_NOTES_MODEL", "claude-sonnet-5-5"),
+                "model": provider.model,
                 "max_tokens": 1500,
                 "system": _AI_SYSTEM,
                 "messages": [{"role": "user", "content": prompt}],
-            }
-        ).encode()
-        base = os.environ.get("ANTHROPIC_BASE_URL", "https://api.anthropic.com").rstrip("/")
-        request = urllib.request.Request(
-            f"{base}/v1/messages",
-            data=body,
-            headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            },
         )
-        with urllib.request.urlopen(request, timeout=90) as response:  # noqa: S310 (fixed https endpoint)
-            data = json.load(response)
-        text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
-    except (urllib.error.URLError, TimeoutError, subprocess.CalledProcessError, ValueError, OSError) as exc:
-        print(f"AI summary unavailable ({type(exc).__name__}: {exc}); using code analysis.", file=sys.stderr)
+        return "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text").strip()
+    data = _post_json(
+        provider.url,
+        {"authorization": f"Bearer {provider.key}"},
+        {
+            "model": provider.model,
+            "max_tokens": 1500,
+            "temperature": 0.2,
+            "messages": [{"role": "system", "content": _AI_SYSTEM}, {"role": "user", "content": prompt}],
+        },
+    )
+    return str(data["choices"][0]["message"]["content"] or "").strip()
+
+
+def ai_summary(prev: str, tag: str, commits: list[tuple[str, str]]) -> str | None:
+    """Notes written by an AI service from the real diff, or None when unavailable (nothing configured,
+    a network or quota error, or a reply that is not release notes)."""
+    provider = pick_provider()
+    if provider is None:
+        print(
+            "No AI service configured (ANTHROPIC_API_KEY, AI_API_KEY, or GITHUB_TOKEN with models: read);"
+            " using commit messages and code analysis.",
+            file=sys.stderr,
+        )
+        return None
+    try:
+        stat = git("diff", "--no-renames", "--stat=100", f"{prev}..{tag}")
+        diff = git("diff", "--no-renames", "-U1", f"{prev}..{tag}")
+        prompt = build_prompt(tag, prev, commits, stat, diff, provider.budget - len(_AI_SYSTEM))
+        text = ask_model(provider, prompt)
+    except (
+        urllib.error.URLError,
+        TimeoutError,
+        subprocess.CalledProcessError,
+        ValueError,
+        KeyError,
+        IndexError,
+        OSError,
+    ) as exc:
+        print(
+            f"{provider.name} summary unavailable ({type(exc).__name__}: {exc}); using code analysis.",
+            file=sys.stderr,
+        )
         return None
     if not re.search(r"(?m)^### (Added|Fixed|Changed|Removed)\b", text) or len(text) > 8000:
-        print("AI summary had an unexpected shape; using code analysis.", file=sys.stderr)
+        print(f"{provider.name} reply was not release notes; using code analysis.", file=sys.stderr)
         return None
+    print(f"Release notes written by {provider.name} ({provider.model}).", file=sys.stderr)
     return text
 
 
@@ -405,7 +510,12 @@ def render(
         out += ["First release.", ""]
     else:
         if ai_text:
-            out += [ai_text, "", "_Summarised automatically by Claude from the code changes._", ""]
+            out += [
+                ai_text,
+                "",
+                "_Summarised automatically by AI from the code changes; check the full diff for details._",
+                "",
+            ]
         else:
             sections = build_sections(commits)
             for name, lines in sections.items():

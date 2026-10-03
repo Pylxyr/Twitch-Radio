@@ -1,7 +1,8 @@
-# Downloads the two external programs the bot needs and puts them in
-# packaging/bin, from where the installer bundles them:
+# Downloads the external program the bot needs and puts it in packaging/bin,
+# from where the installer bundles it:
 #   ffmpeg  - audio decoding / Opus encoding
-#   deno    - JavaScript runtime yt-dlp uses for some YouTube links
+# There is no JavaScript runtime to fetch: the packaged app uses Electron's own
+# (see twitch_radio/config.py), which keeps the installer about 29 MB smaller.
 # Versions, URLs and SHA-256 checksums are pinned in packaging/tools.lock.json;
 # a download whose checksum differs is deleted and the build fails.
 # Re-running skips anything already present (use -Force to fetch again).
@@ -34,8 +35,10 @@ function Get-Verified($tool) {
 }
 
 if ($Force) {
-    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $bin "ffmpeg.exe"), (Join-Path $bin "deno.exe")
+    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $bin "ffmpeg.exe")
 }
+# Older builds put deno.exe here; anything in bin\ is bundled, so drop the leftover.
+Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $bin "deno.exe")
 
 if (-not (Test-Path (Join-Path $bin "ffmpeg.exe"))) {
     $zip = Get-Verified $lock.ffmpeg
@@ -49,16 +52,8 @@ if (-not (Test-Path (Join-Path $bin "ffmpeg.exe"))) {
     if ($license) { Copy-Item $license.FullName (Join-Path $bin "FFMPEG-LICENSE.txt") }
 }
 
-if (-not (Test-Path (Join-Path $bin "deno.exe"))) {
-    $zip = Get-Verified $lock.deno
-    Expand-Archive -Path $zip -DestinationPath $bin -Force
-}
-
 $ffmpegLine = (& (Join-Path $bin "ffmpeg.exe") -version | Select-Object -First 1)
-$denoLine = (& (Join-Path $bin "deno.exe") --version | Select-Object -First 1)
 Write-Host $ffmpegLine
-Write-Host $denoLine
-# Tools already in bin\ (reused from PATH by build-windows.bat) may differ from the pins; say so.
-if ($denoLine -notlike "*$($lock.deno.version)*") { Write-Warning "deno in packaging\bin is not the pinned $($lock.deno.version)." }
+# A tool already in bin\ (reused from PATH by build-windows.bat) may differ from the pin; say so.
 if ($ffmpegLine -notlike "*$($lock.ffmpeg.version)*") { Write-Warning "ffmpeg in packaging\bin is not the pinned $($lock.ffmpeg.version)." }
 Write-Host "Tools ready in $bin"
