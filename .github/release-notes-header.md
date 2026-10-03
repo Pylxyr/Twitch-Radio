@@ -15,4 +15,4 @@ chmod +x Twitch-Radio-*-linux-x64.AppImage
 ./Twitch-Radio-*-linux-x64.AppImage
 ```
 
-The AppImage needs FUSE 2 (`sudo pacman -S fuse2`). Without it, extract the `.tar.gz` and run `./twitch-radio` inside. ffmpeg and Deno are bundled. Settings live in `~/.config/TwitchRadio`. Check downloads with `sha256sum -c --ignore-missing SHA256SUMS.txt`.
+The AppImage needs FUSE 2 (`sudo pacman -S fuse2`). Without it, extract the `.tar.gz` and run `./twitch-radio` inside. ffmpeg is bundled. Settings live in `~/.config/TwitchRadio`. Check downloads with `sha256sum -c --ignore-missing SHA256SUMS.txt`.

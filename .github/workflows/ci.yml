@@ -127,16 +127,20 @@ jobs:
           cache: pip
           cache-dependency-path: requirements*.txt
       - run: pip install -r requirements-build.txt
-      - name: Fetch ffmpeg and Deno (pinned, checksum-verified)
+      - name: Fetch ffmpeg (pinned, checksum-verified)
         shell: pwsh
         run: ./packaging/fetch-tools.ps1
       - name: Build the core with PyInstaller
         run: pyinstaller packaging/core.spec --noconfirm --distpath dist/core --workpath build/pyinstaller
       - name: Smoke test the frozen core
-        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore.exe --bin packaging/bin
+        run: |
+          $node = (Get-Command node).Source
+          python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore.exe --bin packaging/bin --host-js $node
       - name: Real YouTube resolve + JS solver download (needs the network; may fail on a PR)
         continue-on-error: true
-        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore.exe --bin packaging/bin --resolve-only
+        run: |
+          $node = (Get-Command node).Source
+          python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore.exe --bin packaging/bin --resolve-only --host-js $node
 
   linux-build-smoke:
     needs: changes
@@ -150,12 +154,12 @@ jobs:
           cache: pip
           cache-dependency-path: requirements*.txt
       - run: pip install -r requirements-build.txt
-      - name: Fetch ffmpeg and Deno (pinned, checksum-verified)
+      - name: Fetch ffmpeg (pinned, checksum-verified)
         run: bash packaging/fetch-tools.sh
       - name: Build the core with PyInstaller
         run: pyinstaller packaging/core.spec --noconfirm --distpath dist/core --workpath build/pyinstaller
       - name: Smoke test the frozen core
-        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore --bin packaging/bin
+        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore --bin packaging/bin --host-js "$(command -v node)"
       - name: Real YouTube resolve + JS solver download (needs the network; may fail on a PR)
         continue-on-error: true
-        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore --bin packaging/bin --resolve-only
+        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore --bin packaging/bin --resolve-only --host-js "$(command -v node)"

@@ -71,13 +71,15 @@ jobs:
           cache: npm
           cache-dependency-path: gui/package-lock.json
       - run: pip install -r requirements-build.txt
-      - name: Fetch ffmpeg and Deno (pinned, checksum-verified)
+      - name: Fetch ffmpeg (pinned, checksum-verified)
         shell: pwsh
         run: ./packaging/fetch-tools.ps1
       - name: Build the core with PyInstaller
         run: pyinstaller packaging/core.spec --noconfirm --distpath dist/core --workpath build/pyinstaller
       - name: Smoke test the frozen core
-        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore.exe --bin packaging/bin
+        run: |
+          $node = (Get-Command node).Source
+          python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore.exe --bin packaging/bin --host-js $node
       # Best effort. YouTube routinely answers GitHub-hosted runners with "Sign in to confirm you're not a
       # bot", which says nothing about the build, so a failure here is a warning and does not stop the
       # release. The frozen-core checks above stay required. After a release, play one link from the
@@ -85,7 +87,9 @@ jobs:
       - name: Real YouTube resolve + JS solver download (best effort)
         id: live-resolve
         continue-on-error: true
-        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore.exe --bin packaging/bin --resolve-only
+        run: |
+          $node = (Get-Command node).Source
+          python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore.exe --bin packaging/bin --resolve-only --host-js $node
       - name: Flag a failed live YouTube check
         if: steps.live-resolve.outcome == 'failure'
         shell: bash
@@ -127,6 +131,10 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npm run dist
+      # The installer has no JavaScript runtime of its own: yt-dlp runs the app's executable as Node.
+      # This proves the built app can do that (and that Electron's runAsNode fuse is still on).
+      - name: Packaged app works as the JavaScript runtime
+        run: python scripts/check_host_runtime.py "dist/app/win-unpacked/Twitch Radio.exe"
       - name: Collect release files
         shell: pwsh
         run: |
@@ -161,17 +169,17 @@ jobs:
           cache: npm
           cache-dependency-path: gui/package-lock.json
       - run: pip install -r requirements-build.txt
-      - name: Fetch ffmpeg and Deno (pinned, checksum-verified)
+      - name: Fetch ffmpeg (pinned, checksum-verified)
         run: bash packaging/fetch-tools.sh
       - name: Build the core with PyInstaller
         run: pyinstaller packaging/core.spec --noconfirm --distpath dist/core --workpath build/pyinstaller
       - name: Smoke test the frozen core
-        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore --bin packaging/bin
+        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore --bin packaging/bin --host-js "$(command -v node)"
       # Best effort, like the Windows job: YouTube often refuses GitHub-hosted runners.
       - name: Real YouTube resolve + JS solver download (best effort)
         id: live-resolve
         continue-on-error: true
-        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore --bin packaging/bin --resolve-only
+        run: python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore --bin packaging/bin --resolve-only --host-js "$(command -v node)"
       - name: Flag a failed live YouTube check
         if: steps.live-resolve.outcome == 'failure'
         run: |
@@ -185,6 +193,8 @@ jobs:
       - name: Build the AppImage and tarball
         working-directory: gui
         run: npm run dist:linux
+      - name: Packaged app works as the JavaScript runtime
+        run: python scripts/check_host_runtime.py dist/app/linux-unpacked/twitch-radio
       - name: Collect release files
         run: |
           mkdir -p release
@@ -209,6 +219,7 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+      models: read # lets the release-notes step use GitHub Models (free) with the built-in token
     env:
       TAG: ${{ needs.version-guard.outputs.tag }}
       VERSION: ${{ needs.version-guard.outputs.version }}
@@ -241,9 +252,17 @@ jobs:
             release/Twitch-Radio-*-linux-x64.*
       - name: Write release notes
         env:
-          # Optional. With this secret set, Claude reads the code changes and writes the notes;
-          # without it the notes come from commit messages and a static read of the code.
+          # AI release notes, tried in this order; with none available the notes come from commit
+          # messages and a static read of the code (see scripts/release_notes.py).
+          #  1. ANTHROPIC_API_KEY (optional secret)
+          #  2. AI_API_KEY secret + AI_BASE_URL and AI_MODEL variables (any OpenAI-compatible service,
+          #     e.g. Gemini's free tier)
+          #  3. GitHub Models, free, using the built-in token (needs `models: read` above)
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          AI_API_KEY: ${{ secrets.AI_API_KEY }}
+          AI_BASE_URL: ${{ vars.AI_BASE_URL }}
+          AI_MODEL: ${{ vars.AI_MODEL }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           {
             cat .github/release-notes-header.md
