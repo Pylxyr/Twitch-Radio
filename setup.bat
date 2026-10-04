@@ -37,7 +37,7 @@ if errorlevel 1 (
 )
 
 if not exist .env (
-    copy deploy\.env.example .env >nul
+    copy .env.example .env >nul
     echo.
     echo Created .env from the template.
     echo Open .env in Notepad, fill in your Twitch app details, then run run.bat.

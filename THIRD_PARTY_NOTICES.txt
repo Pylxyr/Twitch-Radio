@@ -35,7 +35,6 @@ yt-dlp - Unlicense                         https://github.com/yt-dlp/yt-dlp
 twitchio - MIT                             https://github.com/PythonistaGuild/TwitchIO
 aiohttp - Apache-2.0                       https://github.com/aio-libs/aiohttp
 python-dotenv - BSD-3-Clause               https://github.com/theskumar/python-dotenv
-psutil - BSD-3-Clause                      https://github.com/giampaolo/psutil
 curl_cffi - MIT                            https://github.com/lexiforest/curl_cffi
 Brotli - MIT                               https://github.com/google/brotli
 certifi - MPL-2.0                          https://github.com/certifi/python-certifi
