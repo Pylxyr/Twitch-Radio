@@ -23,12 +23,6 @@ from twitch_radio.tunables import TUNABLE_BOUNDS, TUNABLE_LABELS, TwitchTunables
 FORM_MARKER = "_settings_form"
 
 
-# Only offered when a password is set (otherwise there is no session to end).
-_SIGNOUT_FORM = (
-    '<form class="signout" method="post" action="/logout"><button type="submit">Sign out</button></form>'
-)
-
-
 @dataclass(frozen=True, slots=True)
 class LiveStatus:
     """What the header chips show on first paint; from then on the page's own
@@ -96,7 +90,6 @@ def render_settings_page(
     broadcast_info: dict[str, str],
     status: LiveStatus,
     has_logo: bool,
-    can_sign_out: bool = False,
     message: str | None = None,
     error: bool = False,
 ) -> str:
@@ -112,7 +105,6 @@ def render_settings_page(
         css=static_text("settings.css"),
         js=static_text("settings.js"),
         logo=logo,
-        signout=_SIGNOUT_FORM if can_sign_out else "",
         status_chips=_status_chips(status),
         banner=banner,
         form_marker=FORM_MARKER,

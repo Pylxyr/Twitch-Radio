@@ -27,9 +27,6 @@ STATIC_FILES = (
     "settings.html",
     "settings.css",
     "settings.js",
-    "login.html",
-    "login.css",
-    "login.js",
 )
 
 

@@ -15,7 +15,6 @@
     width: 420px; padding: 14px 18px;
     background: var(--panel-bg, rgba(15, 14, 20));
     border-radius: 14px;
-    backdrop-filter: blur(6px);
     box-shadow: 0 8px 24px rgba(0,0,0,0.35);
     --accent-primary: #9146FF;
     --accent-secondary: #FF9D42;
@@ -77,9 +76,13 @@
   .time { font-size: 11px; color: #9B9FB3; width: 34px; flex-shrink: 0; }
   .time.right { text-align: right; }
   .bar { flex: 1; height: 4px; border-radius: 2px; background: rgba(255,255,255,0.12); overflow: hidden; }
+  /* Progress is a transform, not a width: it animates on the compositor, so a
+     one-second JS tick is all it takes to look smooth (a width change would
+     re-lay-out the panel on every frame of the transition). */
   .fill {
-    height: 100%; width: 0%; background: var(--accent-secondary); border-radius: 2px;
-    transition: background 0.4s ease;
+    height: 100%; width: 100%; background: var(--accent-secondary); border-radius: 2px;
+    transform: scaleX(0); transform-origin: left center;
+    transition: transform 1s linear, background 0.4s ease;
   }
   .idle { font-size: 13px; color: #9B9FB3; padding: 6px 2px; }
   .next { margin-top: 10px; padding-top: 10px; border-top: 1px solid rgba(255,255,255,0.10); }
@@ -276,6 +279,8 @@ function animateNewQueueItems(wrap, newTitles, oldTitles) {
   });
 }
 
+let lastPct = 0;
+
 function render(data, elapsed) {
   if (!data.playing) {
     if (lastTrackKey !== null) {
@@ -390,13 +395,19 @@ function render(data, elapsed) {
     }
   }
 
-  // Runs every frame via tick() — only touches the two per-frame-changing
-  // nodes, not a full innerHTML rebuild (which would undo the animations above).
+  // Runs once a second via refresh() — only touches the two changing nodes,
+  // not a full innerHTML rebuild (which would undo the animations above).
   const pct = data.duration_seconds > 0 ? Math.min(100, (elapsed / data.duration_seconds) * 100) : 0;
   const fillEl = document.getElementById('t-fill');
   const elapsedEl = document.getElementById('t-elapsed');
-  if (fillEl) fillEl.style.width = pct + '%';
-  if (elapsedEl) elapsedEl.textContent = fmt(elapsed);
+  if (fillEl) {
+    // A new track starts again from zero: jump there rather than sweeping back.
+    fillEl.style.transition = pct < lastPct ? 'none' : '';
+    fillEl.style.transform = `scaleX(${(pct / 100).toFixed(4)})`;
+    lastPct = pct;
+  }
+  const elapsedText = fmt(elapsed);
+  if (elapsedEl && elapsedEl.textContent !== elapsedText) elapsedEl.textContent = elapsedText;
 }
 
 function escapeHtml(s) {
@@ -416,6 +427,7 @@ async function poll() {
     const res = await fetch('/nowplaying.json');
     last = await res.json();
     lastFetchedAt = performance.now();
+    refresh();
   } catch (e) { /* keep showing the last known state */ }
 }
 
@@ -433,23 +445,26 @@ function connectWs() {
     try {
       last = JSON.parse(ev.data);
       lastFetchedAt = performance.now();
+      refresh();
     } catch (e) { /* malformed frame — next one (or poll()) recovers */ }
   };
   socket.onclose = () => { if (ws === socket) ws = null; setTimeout(connectWs, 2000); };
   socket.onerror = () => { try { socket.close(); } catch (e) {} };
 }
 
-function tick() {
-  if (last) {
-    const drift = last.playing ? (performance.now() - lastFetchedAt) / 1000 : 0;
-    render(last, (last.elapsed_seconds || 0) + drift);
-  }
-  requestAnimationFrame(tick);
+// Draws the current state. Called when a message arrives and once a second to
+// advance the clock; nothing runs per frame, and nothing at all while OBS has
+// the source hidden.
+function refresh() {
+  if (!last || document.hidden) return;
+  const drift = last.playing ? (performance.now() - lastFetchedAt) / 1000 : 0;
+  render(last, (last.elapsed_seconds || 0) + drift);
 }
 
 connectWs();
 poll();
-setInterval(poll, 2000);
-tick();
+setInterval(poll, 5000);
+setInterval(refresh, 1000);
+document.addEventListener('visibilitychange', refresh);
 </script>
 </body></html>

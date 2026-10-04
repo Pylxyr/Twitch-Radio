@@ -6,12 +6,14 @@ Protocol (one JSON object per line, UTF-8):
     {"t":"hello", ...}          once, as soon as the process is up
     {"t":"log", ts, level, logger, msg, cont?}
     {"t":"phase", "phase": "starting|running|stopping|stopped"}
-    {"t":"state", ...}          about once a second while running
+    {"t":"state", ...}          when the player's state changes, plus every few
+                                seconds while the app says it is watching
     {"t":"fatal", message, hint, code}
     {"t":"ack", id, ok, ...}    reply to a command that carried an "id"
 
   app -> core (stdin)
     {"cmd":"stop"|"skip"|"pause"|"resume"|"clear_queue", "id"?: n}
+    {"cmd":"watch", "on": true|false}   the dashboard is / is not on screen
 
 stdin reaching EOF means the app is gone (closed, crashed, killed): the bot
 stops itself rather than keep playing audio nobody can control.
@@ -117,6 +119,8 @@ def _read_commands(loop: asyncio.AbstractEventLoop, runtime: BotRuntime, emitter
             reply["ok"] = runtime.resume()
         elif command == "clear_queue":
             reply["removed"] = runtime.clear_queue()
+        elif command == "watch":
+            runtime.set_watching(bool(message.get("on")))
         else:
             reply.update(ok=False, error=f"unknown command {command!r}")
             log.warning("Ignoring unknown command %r", command)

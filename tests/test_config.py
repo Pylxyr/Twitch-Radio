@@ -184,3 +184,50 @@ def test_solver_hint_is_silent_when_the_solver_is_ready(
     with caplog.at_level("INFO", logger=extraction.log.name):
         Resolver(settings)._hint_if_solver_missing(Exception("Requested format is not available"))
     assert not caplog.records
+
+
+def test_loudness_mode_defaults_to_static(settings: config.Settings) -> None:
+    assert settings.loudness_mode == "static"
+
+
+@pytest.mark.parametrize("raw,expected", [("dynamic", "dynamic"), (" OFF ", "off"), ("Static", "static")])
+def test_loudness_mode_accepts_the_three_modes(
+    monkeypatch: pytest.MonkeyPatch, settings: config.Settings, raw: str, expected: str
+) -> None:
+    monkeypatch.setenv("LOUDNESS_MODE", raw)
+    assert config.load_settings().loudness_mode == expected
+
+
+def test_unknown_loudness_mode_falls_back_to_static(
+    monkeypatch: pytest.MonkeyPatch, settings: config.Settings
+) -> None:
+    monkeypatch.setenv("LOUDNESS_MODE", "loud")
+    assert config.load_settings().loudness_mode == "static"
+
+
+def test_worker_idle_seconds_default_and_clamp(
+    monkeypatch: pytest.MonkeyPatch, settings: config.Settings
+) -> None:
+    assert settings.ytdlp_worker_idle_seconds == 120
+    monkeypatch.setenv("YTDLP_WORKER_IDLE_SECONDS", "1")
+    assert config.load_settings().ytdlp_worker_idle_seconds == 15
+    monkeypatch.setenv("YTDLP_WORKER_IDLE_SECONDS", "999999")
+    assert config.load_settings().ytdlp_worker_idle_seconds == 3600
+
+
+def test_removed_hosting_settings_are_gone(settings: config.Settings) -> None:
+    for name in (
+        "nowplaying_host",
+        "settings_password",
+        "trusted_proxies",
+        "session_hours",
+        "ytdlp_worker_mode",
+    ):
+        assert not hasattr(settings, name), name
+
+
+def test_env_template_ships_next_to_the_code() -> None:
+    from twitch_radio import paths
+
+    assert paths.env_template_path().name == ".env.example"
+    assert paths.env_template_path().exists()

@@ -147,6 +147,10 @@ def test_unsafe_archive_paths_are_rejected(tmp_path: Path, name: str) -> None:
     assert not (tmp_path / "evil.py").exists()
 
 
+@pytest.mark.skipif(
+    os.sep == "\\",
+    reason="zipfile rewrites '\\' to '/' on Windows (on write and on read), so a raw backslash entry can't exist there",
+)
 def test_entries_outside_yt_dlp_are_ignored_not_extracted(tmp_path: Path) -> None:
     artifact = make_artifact("2026.09.01", {"../outside.py": b"x", "yt_dlp\\odd.py": b"x"})
     upd.extract_yt_dlp(artifact, tmp_path / "out")

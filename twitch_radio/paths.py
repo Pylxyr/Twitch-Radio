@@ -56,7 +56,7 @@ def home_dir() -> Path:
 
 
 def env_template_path() -> Path:
-    return resource_dir() / "deploy" / ".env.example"
+    return resource_dir() / ".env.example"
 
 
 def bin_dirs() -> list[Path]:

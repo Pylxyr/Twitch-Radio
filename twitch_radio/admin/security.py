@@ -1,9 +1,11 @@
-"""Security helpers for the admin server that need nothing but the stdlib.
+"""Security helpers for the local admin server. Stdlib only.
 
-Everything here is a plain function or class with no aiohttp dependency, so
-the rules that actually protect /settings and /thumb-proxy live in one small
-module that can be read (and reasoned about) on its own instead of being
-spread through the request handlers.
+The server listens on 127.0.0.1 and nothing else, so there is no login. What
+still matters on a loopback server is that a *web page* the streamer happens
+to have open can't talk to it: a cross-site form POST (CSRF) or a DNS-rebinding
+page that makes the browser treat 127.0.0.1 as its own origin. Those two rules
+- Host allow-list and Origin/Sec-Fetch-Site matching - plus the /thumb-proxy
+URL checks live here, in one module that can be read on its own.
 """
 
 from __future__ import annotations
@@ -14,31 +16,21 @@ from collections.abc import Callable
 from urllib.parse import urljoin, urlsplit
 
 # ---------------------------------------------------------------------------
-# Login redirects and CSRF
+# Host allow-list and CSRF
 # ---------------------------------------------------------------------------
 
-DEFAULT_LANDING = "/settings"
-_MAX_NEXT_LENGTH = 512
-_NEXT_DENYLIST = ("/login", "/logout")
+_LOOPBACK_NAMES = ("127.0.0.1", "localhost", "[::1]")
 
 
-def safe_next_path(raw: str | None, default: str = DEFAULT_LANDING) -> str:
-    """A same-site absolute path from the `next` field, else `default`."""
-    if not raw or len(raw) > _MAX_NEXT_LENGTH:
-        return default
-    if not raw.startswith("/") or raw.startswith("//") or "\\" in raw:
-        return default
-    if any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in raw):
-        return default
-    try:
-        parts = urlsplit(raw)
-    except ValueError:
-        return default
-    if parts.scheme or parts.netloc:
-        return default
-    if parts.path.rstrip("/") in _NEXT_DENYLIST:
-        return default
-    return raw
+def allowed_hosts(port: int) -> frozenset[str]:
+    """Every Host header value a legitimate local client can send."""
+    return frozenset(f"{name}:{port}" for name in _LOOPBACK_NAMES)
+
+
+def host_allowed(host_header: str | None, port: int) -> bool:
+    """False for any Host that isn't this loopback server, which is what a
+    DNS-rebinding page looks like (its own hostname resolving to 127.0.0.1)."""
+    return (host_header or "").strip().lower() in allowed_hosts(port)
 
 
 def origin_matches_host(origin: str | None, referer: str | None, hosts: tuple[str | None, ...]) -> bool:
@@ -135,34 +127,6 @@ class _SlidingWindow:
 
     def __len__(self) -> int:
         return len(self._events)
-
-
-class AuthRateLimiter:
-    """Lockout for failed /login attempts, keyed by client address. In-memory."""
-
-    def __init__(
-        self,
-        max_attempts: int = 10,
-        window_seconds: float = 300.0,
-        *,
-        clock: Callable[[], float] = time.monotonic,
-    ) -> None:
-        self._max_attempts = max_attempts
-        self._failures = _SlidingWindow(window_seconds, clock=clock)
-
-    def is_blocked(self, key: str) -> bool:
-        return self._failures.count(key) >= self._max_attempts
-
-    def record_failure(self, key: str) -> None:
-        self._failures.add(key)
-
-    def record_success(self, key: str) -> None:
-        self._failures.clear(key)
-
-    def retry_after(self, key: str) -> int:
-        if not self.is_blocked(key):
-            return 0
-        return max(1, int(self._failures.seconds_until_below(key, self._max_attempts)) + 1)
 
 
 class RequestRateLimiter:
