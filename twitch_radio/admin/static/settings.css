@@ -47,12 +47,6 @@ h1 {
 }
 .sub::before { content: ""; width: 12px; height: 2px; background: var(--accent); flex-shrink: 0; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; }
-.signout { margin: 0; }
-.signout button {
-  padding: 6px 13px; font-size: 12px; font-weight: 600; color: var(--muted);
-  background: transparent; border: 1px solid var(--line); border-radius: 7px;
-}
-.signout button:hover { color: var(--text); border-color: var(--muted-2); filter: none; }
 .chip {
   font-family: var(--font-mono); font-size: 11.5px; padding: 4px 10px; border-radius: 6px;
   background: var(--panel-2); border: 1px solid var(--line); color: var(--muted);

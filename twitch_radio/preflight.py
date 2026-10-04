@@ -90,10 +90,11 @@ def build_report() -> dict[str, Any]:
         ffmpeg = shutil.which("ffmpeg")
         js = shutil.which(js_path) if js_path else shutil.which(js_name)
         report["ffmpeg"] = {"path": ffmpeg, "version": _first_line([ffmpeg, "-version"]) if ffmpeg else None}
-        # The desktop app's executable doubles as Node only with ELECTRON_RUN_AS_NODE=1 (set when the
-        # settings picked it); run bare, it would start the whole GUI, so never probe it without that.
+        # The desktop app's executable doubles as Node (with ELECTRON_RUN_AS_NODE=1), but asking it
+        # for a version would start a whole Electron process (about 100 MB and a third of a CPU-second)
+        # just to print a number nobody needs, so it is never probed.
         is_host = bool(js) and js == os.getenv("TWITCH_RADIO_HOST_JS_EXE")
-        probe_ok = bool(js) and (not is_host or os.getenv("ELECTRON_RUN_AS_NODE") == "1")
+        probe_ok = bool(js) and not is_host
         report["js_runtime"] = {
             "name": js_name,
             "path": js,
@@ -107,11 +108,7 @@ def build_report() -> dict[str, Any]:
         report["ytdlp"] = ytdlp_loader.describe()
         report["js_solver"] = ytdlp_loader.solver_status(config.DATA_DIR / ytdlp_loader.CACHE_DIRNAME)
         if settings:
-            report["http"] = {
-                "host": settings.nowplaying_host,
-                "port": settings.nowplaying_port,
-                "password_set": settings.settings_password is not None,
-            }
+            report["http"] = {"port": settings.nowplaying_port}
 
         def _data_file(env_name: str, default: str) -> str:
             return str(config.DATA_DIR / (os.getenv(env_name, default).strip() or default))
@@ -122,6 +119,16 @@ def build_report() -> dict[str, Any]:
             "tunables": _data_file("TWITCH_TUNABLES_FILE", "tunables.json"),
             "toggles": _data_file("TWITCH_TOGGLES_FILE", "toggles.json"),
             "blocklist": _data_file("TWITCH_BLOCKLIST_FILE", "blocklist.json"),
+        }
+        # The one definition of the live limits' ranges and defaults, so the desktop
+        # app doesn't keep its own copy that can drift.
+        from dataclasses import asdict
+
+        from twitch_radio.tunables import TUNABLE_BOUNDS, TwitchTunables
+
+        report["tunables"] = {
+            "bounds": {key: list(bounds) for key, bounds in TUNABLE_BOUNDS.items()},
+            "defaults": asdict(TwitchTunables()),
         }
         report["warnings"] = collector.messages
         report["ok"] = bool(report["config_ok"] and ffmpeg)

@@ -1,4 +1,5 @@
-"""The sign-in-gated routes: /settings (view and save)."""
+"""The /settings routes (view and save). Local only: the server binds to
+loopback, and the app-wide Host check plus origin_ok() on save are the guards."""
 
 from __future__ import annotations
 
@@ -9,8 +10,8 @@ from typing import Any
 
 from aiohttp import web
 
-from twitch_radio.admin.context import AdminContext, client_ip, get_ctx
-from twitch_radio.admin.handlers.auth import authorize, origin_ok, protect
+from twitch_radio.admin.context import AdminContext, get_ctx
+from twitch_radio.admin.handlers.auth import origin_ok, protect
 from twitch_radio.admin.render.settings_page import FORM_MARKER, LiveStatus, render_settings_page
 from twitch_radio.toggles import TOGGLE_KEYS, FeatureToggles
 from twitch_radio.tunables import TUNABLE_BOUNDS, TwitchTunables
@@ -74,7 +75,6 @@ async def _page_response(
         broadcast_info=ctx.broadcast_info,
         status=_live_status(ctx),
         has_logo=ctx.logo is not None,
-        can_sign_out=ctx.settings_password is not None,
         message=message,
         error=error,
     )
@@ -83,9 +83,6 @@ async def _page_response(
 
 async def handle_settings_get(request: web.Request) -> web.Response:
     ctx = get_ctx(request)
-    denied = authorize(ctx, request)
-    if denied is not None:
-        return denied
     return await _page_response(
         ctx,
         tunables=TwitchTunables.from_dict(await ctx.tunables_store.read()),
@@ -95,9 +92,6 @@ async def handle_settings_get(request: web.Request) -> web.Response:
 
 async def handle_settings_post(request: web.Request) -> web.Response:
     ctx = get_ctx(request)
-    denied = authorize(ctx, request)
-    if denied is not None:
-        return denied
     if not origin_ok(request):
         return protect(web.Response(status=403, text="Origin check failed — refusing to save."))
     form = await request.post()
@@ -140,12 +134,7 @@ async def handle_settings_post(request: web.Request) -> web.Response:
 
     tunables_result = await ctx.tunables_store.update(_mutate_tunables)
     toggles_result = await ctx.toggles_store.update(_mutate_toggles)
-    log.info(
-        "Settings updated via /settings from %s: tunables=%s toggles=%s",
-        client_ip(request),
-        tunables_result,
-        toggles_result,
-    )
+    log.info("Settings updated via /settings: tunables=%s toggles=%s", tunables_result, toggles_result)
     return await _page_response(
         ctx,
         tunables=TwitchTunables.from_dict(tunables_result),

@@ -3,30 +3,24 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import dataclasses
-import functools
 import json
 import logging
 import os
 import re
 import sys
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlsplit
 
 from twitch_radio import ytdlp_loader
+from twitch_radio.config import BASE_DIR, DATA_DIR, Settings
+from twitch_radio.models import Track
+from twitch_radio.paths import hidden_subprocess_kwargs, is_frozen, source_root
+from twitch_radio.telemetry import counters
 
-# Before the first `import yt_dlp` in this process: picks the user-installed
-# copy over the bundled one when there is a newer one (see ytdlp_loader.py).
-ytdlp_loader.import_with_fallback()
-
-import yt_dlp  # noqa: E402
-
-from twitch_radio.config import BASE_DIR, DATA_DIR, Settings  # noqa: E402
-from twitch_radio.models import Track  # noqa: E402
-from twitch_radio.paths import hidden_subprocess_kwargs, is_frozen, source_root  # noqa: E402
-from twitch_radio.telemetry import counters  # noqa: E402
+# yt_dlp is deliberately NOT imported in this process. Every extraction runs in
+# a child process (extractor_worker.py), so the bot itself never needs the
+# ~40 MB the import costs; only the workers load it.
 
 log = logging.getLogger(__name__)
 
@@ -107,13 +101,9 @@ class UnsupportedSourceError(DownloadError):
 
 
 class ExtractionBackend:
-    """Where an extraction physically runs.
-
-    Two implementations below, chosen by YTDLP_WORKER_MODE. They present the
-    same surface to Resolver, which is the whole point: the fast/fallback
-    client dance, the caching, the request coalescing and the Track building
-    all live in Resolver and are identical either way, so switching backends
-    on a live deployment changes only the execution model.
+    """Where an extraction physically runs. Resolver only needs this surface,
+    which keeps the fast/fallback client dance, the caching, the request
+    coalescing and the Track building independent of the process model.
 
     `extract` must raise DownloadError for a timeout or a yt-dlp failure and
     return a (possibly empty) info dict otherwise.
@@ -122,83 +112,12 @@ class ExtractionBackend:
     async def extract(self, query: str, options: dict[str, Any], timeout: float) -> dict[str, Any]:
         raise NotImplementedError
 
-    async def warm(self, query: str, options: dict[str, Any], concurrency: int) -> None:
-        raise NotImplementedError
-
     async def aclose(self) -> None:
         raise NotImplementedError
 
     def status(self) -> dict[str, Any]:
         """Cheap, read-only snapshot for the desktop dashboard."""
-        return {"mode": "unknown", "size": 0, "alive": 0, "idle": 0}
-
-
-class ThreadBackend(ExtractionBackend):
-    """Original in-process model: yt-dlp on a ThreadPoolExecutor, with a
-    YoutubeDL instance reused per (thread, options) so the solved signature
-    challenge survives between calls.
-
-    Kept as an escape hatch for sandboxes that can't spawn child processes.
-    Known limitation (why ProcessBackend exists): a timed-out wait_for()
-    cancels only the wait, not the thread, so a wedged extraction occupies
-    a worker indefinitely.
-    """
-
-    def __init__(self, concurrency: int) -> None:
-        self._semaphore = asyncio.Semaphore(concurrency)
-        # Wider than the semaphore so repeated hangs (see class docstring)
-        # don't immediately starve every future request.
-        self._executor = ThreadPoolExecutor(max_workers=concurrency + 2, thread_name_prefix="ytdlp")
-        self._tlocal = threading.local()
-        self._concurrency = concurrency
-
-    def status(self) -> dict[str, Any]:
-        return {
-            "mode": "thread",
-            "size": self._concurrency,
-            "alive": self._concurrency,
-            "idle": self._concurrency,
-        }
-
-    def _extract_sync(self, query: str, options: dict[str, Any]) -> dict[str, Any]:
-        # Keyed by the options themselves (not a fast/slow flag) so the
-        # radio-mix lookup's third options shape gets its own instance too.
-        instances: dict[str, Any] | None = getattr(self._tlocal, "instances", None)
-        if instances is None:
-            instances = {}
-            self._tlocal.instances = instances
-        key = json.dumps(options, sort_keys=True)
-        ydl = instances.get(key)
-        if ydl is None:
-            ydl = yt_dlp.YoutubeDL(options)
-            instances[key] = ydl
-        info = ydl.extract_info(query, download=False)
-        return info if isinstance(info, dict) else {}
-
-    async def extract(self, query: str, options: dict[str, Any], timeout: float) -> dict[str, Any]:
-        loop = asyncio.get_running_loop()
-        async with self._semaphore:
-            try:
-                return await asyncio.wait_for(
-                    loop.run_in_executor(
-                        self._executor, functools.partial(self._extract_sync, query, options)
-                    ),
-                    timeout=timeout,
-                )
-            except TimeoutError as exc:
-                raise DownloadError(f"Timed out resolving {query!r}") from exc
-            except yt_dlp.utils.DownloadError as exc:
-                raise DownloadError(str(exc)) from exc
-
-    async def warm(self, query: str, options: dict[str, Any], concurrency: int) -> None:
-        async def _one() -> None:
-            with contextlib.suppress(Exception):
-                await self.extract(query, options, _FAST_EXTRACT_TIMEOUT_SECONDS * 4)
-
-        await asyncio.gather(*(_one() for _ in range(concurrency)))
-
-    async def aclose(self) -> None:
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        return {"mode": "process", "size": 0, "alive": 0, "idle": 0}
 
 
 class _WorkerCrashed(Exception):
@@ -210,8 +129,8 @@ class _WorkerCrashed(Exception):
 class _ExtractionWorker:
     """One `python -m twitch_radio.extractor_worker` child process.
 
-    Handles one request at a time — ProcessBackend's idle pool guarantees
-    exclusive access, so request() can read the reply inline instead of
+    Handles one request at a time — ProcessBackend hands a worker to one caller
+    at a time, so request() can read the reply inline instead of
     demultiplexing by id. The id is still checked: a mismatch means the
     framing desynced and the process can't be trusted anymore.
     """
@@ -221,6 +140,8 @@ class _ExtractionWorker:
         self._proc: asyncio.subprocess.Process | None = None
         self._stderr_task: asyncio.Task[None] | None = None
         self._next_id = 0
+        # Set by ProcessBackend when the worker goes back on the idle shelf.
+        self.idle_since = 0.0
 
     @property
     def pid(self) -> int | None:
@@ -355,131 +276,140 @@ class _ExtractionWorker:
 
 
 class ProcessBackend(ExtractionBackend):
-    """A pool of long-lived extraction worker processes. Three wins over
-    ThreadBackend:
+    """Extraction worker processes, started on demand and retired when idle.
+
+    Why child processes at all:
 
     1. Extraction is GIL-bound Python (regex, multi-MB JSON parsing, format
-       sorting) — sharing an interpreter with RadioPlayer's real-time feed
-       loop is why resolves and stream stutter correlate. A separate
-       process fixes that.
-    2. Timeouts become real: wait_for on a thread only cancels the wait;
-       here it kills the process.
-    3. A runaway extraction is charged to its own process, so systemd's
-       MemoryMax bounds it without taking the bot down too.
+       sorting) - sharing an interpreter with RadioPlayer's real-time feed
+       loop is why resolves and stream stutter correlate.
+    2. Timeouts become real: a wedged extraction is killed, not just
+       abandoned.
+    3. A runaway extraction is charged to its own process.
 
-    Cost: the in-memory signature cache is lost when a worker recycles —
-    acceptable since the expensive half (the cipher) is persisted to disk
-    under `cachedir` and shared across processes anyway; the "n" challenge
-    was never cacheable regardless.
+    Why on demand: a worker holds roughly 50-80 MB while it exists and is
+    only busy for a second or two per request, so a resident pool was the
+    largest share of the bot's idle memory. Now the first request after a
+    quiet spell starts a worker (about a second, normally hidden by the
+    player's look-ahead), the most recently used worker is reused first, and
+    any worker idle for `idle_seconds` exits. Up to `size` run at once.
+
+    The in-memory signature cache dies with a worker, which is fine: the
+    expensive half (the cipher) is persisted to disk under `cachedir` and
+    shared across processes.
     """
 
-    def __init__(self, size: int) -> None:
+    def __init__(self, size: int, idle_seconds: float) -> None:
         self._size = size
-        self._idle: asyncio.Queue[_ExtractionWorker] = asyncio.Queue()
+        self._idle_seconds = idle_seconds
+        self._slots = asyncio.Semaphore(size)
+        self._idle: list[_ExtractionWorker] = []  # most recently used last
         self._all: list[_ExtractionWorker] = []
-        self._start_lock = asyncio.Lock()
-        self._started = False
         self._closing = False
         self._next_index = 0
+        self._reap_handle: asyncio.TimerHandle | None = None
+        self._background: set[asyncio.Task[None]] = set()
 
     def status(self) -> dict[str, Any]:
         return {
             "mode": "process",
             "size": self._size,
             "alive": len(self._all),
-            "idle": self._idle.qsize(),
-            "started": self._started,
+            "idle": len(self._idle),
         }
 
     async def _spawn(self) -> _ExtractionWorker:
         self._next_index += 1
         worker = _ExtractionWorker(self._next_index)
-        await worker.start()
+        try:
+            await worker.start()
+        except Exception as exc:
+            await worker.kill()
+            raise DownloadError(
+                f"Couldn't start the extraction process: {exc or type(exc).__name__}"
+            ) from exc
         self._all.append(worker)
+        log.debug("Extraction worker %d started (%d alive).", worker._index, len(self._all))
         return worker
 
-    async def start(self) -> None:
-        """Spawns the pool. Raises if not a single worker comes up, which is
-        Resolver's signal to fall back to ThreadBackend rather than leave
-        song requests permanently broken."""
-        async with self._start_lock:
-            if self._started:
-                return
-            spawned = 0
-            for _ in range(self._size):
-                try:
-                    self._idle.put_nowait(await self._spawn())
-                    spawned += 1
-                except Exception:
-                    log.warning("Extraction worker failed to start.", exc_info=True)
-            if spawned == 0:
-                raise RuntimeError("no extraction workers could be started")
-            if spawned < self._size:
-                log.warning("Only %d of %d extraction workers started.", spawned, self._size)
-            self._started = True
-            log.info("Extraction worker pool ready (%d process(es)).", spawned)
-
-    async def _ensure_started(self) -> None:
-        if not self._started:
-            await self.start()
-
-    async def _recycle(self, worker: _ExtractionWorker) -> None:
-        """Kill a worker and put a fresh one in its place, so the pool never
-        silently shrinks after a hang. If the replacement can't be spawned,
-        the pool runs one narrower rather than failing the request that
-        happened to notice."""
+    async def _discard(self, worker: _ExtractionWorker) -> None:
         with contextlib.suppress(ValueError):
             self._all.remove(worker)
         await worker.kill()
+
+    def _release(self, worker: _ExtractionWorker) -> None:
         if self._closing:
+            self._spawn_background(self._discard(worker))
             return
-        try:
-            self._idle.put_nowait(await self._spawn())
-        except Exception:
-            log.warning("Couldn't replace a recycled extraction worker.", exc_info=True)
+        worker.idle_since = asyncio.get_running_loop().time()
+        self._idle.append(worker)
+        self._arm_reaper()
+
+    def _spawn_background(self, coro: Any) -> None:
+        task = asyncio.get_running_loop().create_task(coro)
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    def _arm_reaper(self) -> None:
+        """One timer, re-armed only while something is idle - no periodic wakeups."""
+        if self._reap_handle is not None or not self._idle:
+            return
+        loop = asyncio.get_running_loop()
+        oldest = min(w.idle_since for w in self._idle)
+        delay = max(0.5, oldest + self._idle_seconds - loop.time())
+        self._reap_handle = loop.call_later(delay, self._reap)
+
+    def _reap(self) -> None:
+        self._reap_handle = None
+        now = asyncio.get_running_loop().time()
+        keep = [w for w in self._idle if now - w.idle_since < self._idle_seconds]
+        expired = [w for w in self._idle if now - w.idle_since >= self._idle_seconds]
+        self._idle = keep
+        for worker in expired:
+            self._spawn_background(self._discard(worker))
+        if expired:
+            log.debug("Stopped %d idle extraction worker(s).", len(expired))
+        self._arm_reaper()
 
     async def extract(self, query: str, options: dict[str, Any], timeout: float) -> dict[str, Any]:
-        await self._ensure_started()
-        worker = await self._idle.get()
-        try:
-            info = await worker.request(query, options, timeout)
-        except TimeoutError as exc:
-            log.info("Extraction worker %s timed out on %r — recycling it.", worker.pid, query)
-            await self._recycle(worker)
-            raise DownloadError(f"Timed out resolving {query!r}") from exc
-        except _WorkerCrashed as exc:
-            log.warning("Extraction worker problem (%s) — recycling it.", exc)
-            await self._recycle(worker)
-            raise DownloadError(str(exc)) from exc
-        except asyncio.CancelledError:
-            # The worker is still mid-extraction and its eventual reply would
-            # desynchronise the next caller's read, so it can't go back in
-            # the pool.
-            await self._recycle(worker)
-            raise
-        except DownloadError:
-            # A clean "yt-dlp couldn't do it" — the worker is fine.
-            self._idle.put_nowait(worker)
-            raise
-        else:
-            self._idle.put_nowait(worker)
-            return info
-
-    async def warm(self, query: str, options: dict[str, Any], concurrency: int) -> None:
-        await self._ensure_started()
-
-        async def _one() -> None:
-            with contextlib.suppress(Exception):
-                await self.extract(query, options, _FAST_EXTRACT_TIMEOUT_SECONDS * 4)
-
-        # One per worker: each has its own interpreter and therefore its own
-        # cold in-memory caches.
-        await asyncio.gather(*(_one() for _ in range(max(1, len(self._all)))))
+        if self._closing:
+            raise DownloadError("The bot is shutting down.")
+        async with self._slots:
+            worker = self._idle.pop() if self._idle else await self._spawn()
+            try:
+                info = await worker.request(query, options, timeout)
+            except TimeoutError as exc:
+                log.info("Extraction worker %s timed out on %r - stopping it.", worker.pid, query)
+                await self._discard(worker)
+                raise DownloadError(f"Timed out resolving {query!r}") from exc
+            except _WorkerCrashed as exc:
+                log.warning("Extraction worker problem (%s) - stopping it.", exc)
+                await self._discard(worker)
+                raise DownloadError(str(exc)) from exc
+            except asyncio.CancelledError:
+                # The worker is still mid-extraction and its eventual reply
+                # would desynchronise the next caller's read, so it can't be reused.
+                await self._discard(worker)
+                raise
+            except DownloadError:
+                # A clean "yt-dlp couldn't do it" - the worker is fine.
+                self._release(worker)
+                raise
+            else:
+                self._release(worker)
+                return info
 
     async def aclose(self) -> None:
         self._closing = True
-        await asyncio.gather(*(w.kill() for w in list(self._all)), return_exceptions=True)
+        if self._reap_handle is not None:
+            self._reap_handle.cancel()
+            self._reap_handle = None
+        workers = list(self._all)
+        self._idle.clear()
+        await asyncio.gather(*(w.kill() for w in workers), return_exceptions=True)
         self._all.clear()
+        if self._background:
+            await asyncio.gather(*list(self._background), return_exceptions=True)
 
 
 class Resolver:
@@ -490,21 +420,11 @@ class Resolver:
     feature in-process to protect from contention.
     """
 
-    # YouTube's first-ever upload — stable, always public, never actually
-    # queued/played. Only resolved and discarded to warm the JS-challenge
-    # cache before a real listener's first !sr. See warm_up().
-    _WARMUP_QUERY = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
-
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        # "process" (default) lets a timeout actually kill the work; "thread"
-        # is the original in-process path, selectable via YTDLP_WORKER_MODE.
-        # Everything below is identical either way — see ExtractionBackend.
-        self._backend: ExtractionBackend
-        if settings.ytdlp_worker_mode == "thread":
-            self._backend = ThreadBackend(settings.ytdlp_concurrency)
-        else:
-            self._backend = ProcessBackend(settings.ytdlp_concurrency)
+        self._backend: ExtractionBackend = ProcessBackend(
+            settings.ytdlp_concurrency, settings.ytdlp_worker_idle_seconds
+        )
         # A !sr resolves once in chat (confirm/queue) and again in the
         # player right before it plays (see resolve()). Keyed by the
         # resolved webpage_url, plus the case-folded search text for
@@ -538,63 +458,17 @@ class Resolver:
 
         self._ytdl_options: dict[str, Any] | None = None
         self._fast_ytdl_options: dict[str, Any] | None = None
-        # Both backends reuse one YoutubeDL instance per (worker, options)
-        # rather than a fresh one per call, so the solved JS signature
-        # challenge (~6s on Deno) is cached on the extractor instance and
-        # doesn't rerun on every !sr. They differ only in what a "worker" is.
+        # Each worker reuses one YoutubeDL instance per options shape, so the
+        # solved JS signature challenge is cached on the extractor instance
+        # for as long as the worker lives.
 
     def worker_status(self) -> dict[str, Any]:
         return self._backend.status()
 
     async def aclose(self) -> None:
-        """Async because ProcessBackend has child processes to reap. Called
-        from bot.py's teardown after the player and HTTP surface are down."""
+        """Async because the worker processes need reaping. Called from the
+        service's teardown after the player and HTTP surface are down."""
         await self._backend.aclose()
-
-    async def warm_up(self) -> None:
-        """Best-effort: resolves a throwaway video on every worker so the
-        first real !sr after a restart doesn't pay the full cold-start cost
-        alone. Meant to run as a background task right after construction,
-        never awaited inline — a failure here just means a real request
-        pays the cold-start cost itself, same as if this never ran.
-        """
-        start = time.monotonic()
-        # Starting the backend is part of warming up: for ProcessBackend,
-        # spawning the pool now pays the yt_dlp import cost per child ahead
-        # of the first real !sr. If the pool can't start at all, fall back
-        # to the in-process path rather than leave song requests broken.
-        if isinstance(self._backend, ProcessBackend):
-            try:
-                await self._backend.start()
-            except Exception:
-                log.warning(
-                    "Couldn't start the extraction worker pool — falling back to in-process "
-                    "threads for this run (set YTDLP_WORKER_MODE=thread to make that the "
-                    "default and silence this).",
-                    exc_info=True,
-                )
-                with contextlib.suppress(Exception):
-                    await self._backend.aclose()
-                self._backend = ThreadBackend(self._settings.ytdlp_concurrency)
-
-        try:
-            # fast=False even when the fast path is enabled — warming up
-            # exists to populate the on-disk signature-challenge cache, and
-            # the fast client skips that challenge entirely, which would
-            # leave the expensive part exactly as cold as it started.
-            await self._backend.warm(
-                self._WARMUP_QUERY,
-                self._get_ytdl_options(fast=False),
-                self._settings.ytdlp_concurrency,
-            )
-        except Exception:
-            log.debug("Resolver warm-up failed (non-fatal).", exc_info=True)
-        log.info("Resolver warm-up finished in %.1fs.", time.monotonic() - start)
-        if not ytdlp_loader.solver_status(DATA_DIR / ytdlp_loader.CACHE_DIRNAME)["ready"]:
-            log.info(
-                "YouTube JS solver scripts: not downloaded, and not needed so far. yt-dlp fetches "
-                "them from github.com/yt-dlp/ejs on demand if YouTube starts requiring them."
-            )
 
     def _build_options(
         self,
@@ -615,15 +489,13 @@ class Resolver:
             "socket_timeout": 15,
             "extract_flat": False,
             "allowed_extractors": _ALLOWED_EXTRACTORS,
-            # yt-dlp's default cache dir is unwritable under the systemd
-            # unit's ProtectHome=read-only; DATA_DIR is covered by
-            # ReadWritePaths instead.
+            # Keep yt-dlp's cache inside the bot's own data folder rather than
+            # the user's profile, so everything the bot writes lives in one place.
             #
             # Key is "cachedir", no underscore (yt_dlp.cache.Cache
             # ._get_root_dir()) — an earlier "cache_dir" typo here silently
             # went nowhere, so the ~7s JS-challenge solve reran on every
-            # resolve instead of once per player rotation. Very likely the
-            # dominant cause of "!sr is slow" under this deployment.
+            # resolve instead of once per player rotation.
             "cachedir": str(DATA_DIR / ytdlp_loader.CACHE_DIRNAME),
             # The JS solver scripts are not bundled: yt-dlp downloads the ones
             # matching its own version from github.com/yt-dlp/ejs into cachedir.

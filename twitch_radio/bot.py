@@ -2,11 +2,14 @@
 
     python bot.py                 run the bot in this console (Ctrl+C stops it)
     python bot.py --check-config  validate .env and exit
-    python bot.py --hash-password make a /settings password hash
 
 The desktop app starts the same code with --headless (see headless.py) and
-uses --preflight / --hash-password-stdin for its Settings screen. The
-lifecycle itself lives in service.py.
+uses --preflight / --env-json / --env-update-stdin for its Settings screen.
+The lifecycle itself lives in service.py.
+
+Everything heavy (twitchio, aiohttp, the player) is imported only on the code
+path that needs it, so the one-shot commands the desktop app runs often
+(preflight, reading .env) start in a fraction of the time and memory.
 """
 
 from __future__ import annotations
@@ -17,11 +20,9 @@ import logging
 import logging.handlers
 import sys
 
-from twitch_radio.admin.passwords import is_password_hash
 from twitch_radio.config import Settings, load_settings
 from twitch_radio.logbus import LogBus
 from twitch_radio.paths import prepend_bundled_bins_to_path
-from twitch_radio.service import BotRuntime
 
 # One generation of 5 MB x 3 is days of INFO logging; the file used to grow
 # without bound.
@@ -72,16 +73,6 @@ def run() -> None:
         "--check-config",
         action="store_true",
         help="Validate .env and exit - doesn't start the bot, spawn ffmpeg, or touch Twitch/yt-dlp.",
-    )
-    parser.add_argument(
-        "--hash-password",
-        action="store_true",
-        help="Prompt for a /settings password and print the hash to put in TWITCH_SETTINGS_PASSWORD.",
-    )
-    parser.add_argument(
-        "--hash-password-stdin",
-        action="store_true",
-        help="(desktop app) read a password from stdin, print its hash.",
     )
     parser.add_argument(
         "--env-json", action="store_true", help="(desktop app) print the .env values as JSON and exit."
@@ -140,8 +131,6 @@ def run() -> None:
         sys.exit(_ytdlp_selftest(args.ytdlp_selftest))
     if args.resolve_test:
         sys.exit(_resolve_test(args.resolve_test))
-    if args.hash_password_stdin:
-        sys.exit(_hash_password_stdin())
     if args.env_json:
         sys.exit(_env_json())
     if args.env_update_stdin:
@@ -159,8 +148,8 @@ def run() -> None:
         os._exit(code)
     if args.check_config:
         sys.exit(_check_config())
-    if args.hash_password:
-        sys.exit(_hash_password())
+
+    from twitch_radio.service import BotRuntime
 
     settings = _load_settings_or_exit()
     configure_logging(settings)
@@ -176,42 +165,6 @@ def _load_settings_or_exit() -> Settings:
         return load_settings()
     except RuntimeError as exc:
         sys.exit(f"Config check FAILED: {exc}")
-
-
-def _hash_password() -> int:
-    import getpass
-
-    from twitch_radio.admin.passwords import MAX_PASSWORD_LENGTH, hash_password
-
-    password = getpass.getpass("New /settings password: ")
-    if not password:
-        print("Nothing entered - aborting.")
-        return 1
-    if len(password) > MAX_PASSWORD_LENGTH:
-        print(f"Too long - the login form accepts at most {MAX_PASSWORD_LENGTH} characters.")
-        return 1
-    if getpass.getpass("Repeat it: ") != password:
-        print("Those didn't match - aborting.")
-        return 1
-    print("\nPut this line in .env (replacing any existing TWITCH_SETTINGS_PASSWORD), then restart:\n")
-    print(f"TWITCH_SETTINGS_PASSWORD={hash_password(password)}")
-    return 0
-
-
-def _hash_password_stdin() -> int:
-    """Reads the password from stdin (never argv, which other programs can
-    list) and prints only the hash."""
-    from twitch_radio.admin.passwords import MAX_PASSWORD_LENGTH, hash_password
-
-    raw = sys.stdin.buffer.readline().decode("utf-8", errors="replace").rstrip("\r\n")
-    if not raw:
-        print("Nothing entered.", file=sys.stderr)
-        return 1
-    if len(raw) > MAX_PASSWORD_LENGTH:
-        print(f"Too long - at most {MAX_PASSWORD_LENGTH} characters.", file=sys.stderr)
-        return 1
-    print(hash_password(raw))
-    return 0
 
 
 def _ytdlp_update_command(args: argparse.Namespace) -> int:
@@ -348,31 +301,19 @@ def _check_config() -> int:
             "some YouTube links. Install it, or point YTDLP_JS_RUNTIME_PATH at it in .env."
         )
 
-    # Deliberately never prints client_secret or settings_password.
+    # Deliberately never prints client_secret.
     print("Config OK:")
     print(f"  Twitch: bot_id={settings.bot_id} owner_id={settings.owner_id} prefix={settings.prefix!r}")
     print(
         f"  Audio: {settings.audio_bitrate_kbps} kbps, pause_when_no_listeners={settings.pause_when_no_listeners}"
     )
-    if settings.settings_password is None:
-        login = "no password - /settings is reachable only from this machine, never through a proxy"
-    else:
-        login = f"password {'hashed' if is_password_hash(settings.settings_password) else 'set (plain text)'}"
-    print(f"  HTTP: http://{settings.nowplaying_host}:{settings.nowplaying_port} ({login})")
-    print(
-        f"  Sessions: {settings.session_hours}h"
-        + (
-            f", or {settings.session_remember_days}d with 'keep me signed in'"
-            if settings.session_remember_days
-            else ""
-        )
-    )
-    print(f"  Trusted proxies: {', '.join(str(net) for net in settings.trusted_proxies) or 'none'}")
+    print(f"  Local server: http://127.0.0.1:{settings.nowplaying_port} (this PC only)")
+    print(f"  Loudness: {settings.loudness_mode}")
     token_status = "found" if settings.token_path.exists() else "missing - run OAuth setup before starting"
     print(f"  Token file: {settings.token_path} ({token_status})")
     print(
-        f"  yt-dlp: mode={settings.ytdlp_worker_mode} "
-        f"concurrency={settings.ytdlp_concurrency} "
+        f"  yt-dlp: up to {settings.ytdlp_concurrency} on-demand worker(s), "
+        f"idle exit {settings.ytdlp_worker_idle_seconds}s, "
         f"timeout={settings.ytdlp_extract_timeout_seconds}s "
         f"cookies={'configured' if settings.ytdlp_cookies_file else 'none'}"
     )

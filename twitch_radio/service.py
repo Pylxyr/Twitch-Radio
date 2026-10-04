@@ -5,8 +5,8 @@ Ctrl+C. The desktop app needs three more things from it, all provided here:
 
 * a stop() that does an orderly shutdown from any caller (a button, a signal,
   the controlling app disappearing),
-* live state for the dashboard (what is playing, who is connected, how the
-  machine is coping), and
+* live state for the dashboard (what is playing, who is connected), pushed
+  when something changes rather than polled, and
 * failures reported as one clear message and an exit code instead of a
   traceback in a console nobody is looking at.
 
@@ -45,12 +45,20 @@ EXIT_OK = 0
 EXIT_CONFIG = 2  # the user has to change something; retrying is pointless
 EXIT_RUNTIME = 3  # may well work on a retry (network down, Twitch hiccup)
 
+LOCAL_HOST = "127.0.0.1"
+
 # TwitchIO's built-in OAuth web server (twitchio.web.AiohttpAdapter) - the
 # bot cannot be authorized without it.
 OAUTH_PORT = 4343
 
-_STATE_INTERVAL_SECONDS = 1.0
-_PROC_SAMPLE_SECONDS = 2.0
+# While the dashboard is on screen the core re-sends its state this often even
+# if nothing changed (chat/token status, counters, event-loop lag); the
+# progress bar between sends is extrapolated by the page. While nothing is
+# watching, state goes out only when the player's state actually changes.
+_HEARTBEAT_SECONDS = 5.0
+# A burst of changes (a track ending, the next one starting, the queue being
+# rewritten) becomes one snapshot.
+_COALESCE_SECONDS = 0.25
 _STEP_TIMEOUT_SECONDS = 8.0
 _MAX_QUEUE_IN_SNAPSHOT = 100
 
@@ -100,64 +108,6 @@ def describe_failure(exc: BaseException) -> tuple[str, str, int]:
     return f"{type(exc).__name__}: {exc}", "See the Logs tab for the full traceback.", EXIT_RUNTIME
 
 
-class _ProcSampler:
-    """CPU / memory of the core and everything it spawned (ffmpeg, yt-dlp
-    workers). psutil is optional: without it the dashboard just shows no
-    numbers instead of the app failing to start."""
-
-    def __init__(self) -> None:
-        try:
-            import psutil
-        except ImportError:
-            self._ps: Any = None
-            self._me: Any = None
-            self._cpus = 1
-            self._cache: dict[int, Any] = {}
-            return
-        self._ps = psutil
-        self._me = psutil.Process()
-        self._cpus = psutil.cpu_count() or 1
-        self._cache = {}
-        with contextlib.suppress(Exception):
-            self._me.cpu_percent(None)
-
-    def sample(self) -> dict[str, Any]:
-        ps = self._ps
-        if ps is None:
-            return {"available": False}
-        try:
-            procs = [self._me, *self._me.children(recursive=True)]
-        except Exception:  # noqa: BLE001 - a vanished process mid-walk is routine
-            return {"available": False}
-        alive: dict[int, Any] = {}
-        cpu = 0.0
-        rss = 0
-        core_rss = 0
-        threads = 0
-        for proc in procs:
-            pid = proc.pid
-            proc = self._cache.get(pid, proc)  # keep the object so cpu_percent has a baseline
-            try:
-                cpu += proc.cpu_percent(None)
-                mem = proc.memory_info().rss
-                rss += mem
-                threads += proc.num_threads()
-                if pid == self._me.pid:
-                    core_rss = mem
-            except (ps.NoSuchProcess, ps.AccessDenied, ps.ZombieProcess):
-                continue
-            alive[pid] = proc
-        self._cache = alive
-        return {
-            "available": True,
-            "cpu": round(cpu / self._cpus, 1),
-            "mem_mb": round(rss / 1048576, 1),
-            "core_mem_mb": round(core_rss / 1048576, 1),
-            "processes": len(alive),
-            "threads": threads,
-        }
-
-
 class BotRuntime:
     def __init__(self, settings: Settings, emit: EmitFn | None = None) -> None:
         self.settings = settings
@@ -174,11 +124,10 @@ class BotRuntime:
         self._toggles_store: JsonStore | None = None
         self._admin: aiohttp.web.AppRunner | None = None
         self._bot: TwitchChatBot | None = None
-        self._warmup: asyncio.Task[None] | None = None
         self._monitor: asyncio.Task[None] | None = None
-        self._sampler_task: asyncio.Task[None] | None = None
-        self._sampler = _ProcSampler()
-        self._proc_stats: dict[str, Any] = {"available": False}
+        self._changes: asyncio.Queue[None] | None = None
+        self._watching = False
+        self._lag_ms = 0.0
         self._tokens: dict[str, object] = {}
         self._tokens_at = 0.0
         self._radio_autoplay: bool | None = None
@@ -208,6 +157,14 @@ class BotRuntime:
 
     def resume(self) -> bool:
         return bool(self._player and self._player.resume())
+
+    def set_watching(self, on: bool) -> None:
+        """The app says whether its dashboard is on screen. Turning it on sends
+        a fresh snapshot straight away and starts the slow heartbeat."""
+        self._watching = on
+        if on and self._changes is not None:
+            with contextlib.suppress(asyncio.QueueFull):
+                self._changes.put_nowait(None)
 
     def clear_queue(self) -> int:
         if self._player is None:
@@ -242,7 +199,7 @@ class BotRuntime:
 
     def _check_ports(self) -> None:
         s = self.settings
-        if port_in_use(s.nowplaying_host, s.nowplaying_port):
+        if port_in_use(LOCAL_HOST, s.nowplaying_port):
             raise StartupError(
                 f"Port {s.nowplaying_port} is already in use.",
                 code=EXIT_CONFIG,
@@ -265,13 +222,10 @@ class BotRuntime:
         self._toggles_store = JsonStore(s.toggles_path)
         blocklist = BlockList(JsonStore(s.blocklist_path))
 
-        # Warms yt-dlp's workers before the first real !sr; never awaited
-        # inline (must not delay startup) and non-fatal by design.
-        self._warmup = asyncio.create_task(self._resolver.warm_up(), name="resolver-warmup")
-
         player = self._player = RadioPlayer(
             resolver=self._resolver.resolve,
             audio_bitrate_kbps=s.audio_bitrate_kbps,
+            loudness_mode=s.loudness_mode,
             pause_when_no_listeners=s.pause_when_no_listeners,
             prefetch_enabled=s.ytdlp_cache_ttl_seconds > 0,
         )
@@ -294,7 +248,6 @@ class BotRuntime:
 
         if self._emit is not None:
             self._monitor = asyncio.create_task(self._monitor_loop(), name="gui-monitor")
-            self._sampler_task = asyncio.create_task(self._sampler_loop(), name="gui-sampler")
 
         restored = await player.restore_queue()
         if restored:
@@ -319,25 +272,19 @@ class BotRuntime:
                 player=player,
                 tunables_store=tunables_store,
                 toggles_store=toggles_store,
-                settings_password=s.settings_password,
                 broadcast_info={
                     "Audio stream": "/stream.opus",
                     "Overlay": "/overlay",
                     "Audio bitrate": f"{s.audio_bitrate_kbps} kbps",
                     "Chat command prefix": s.prefix,
                 },
-                host=s.nowplaying_host,
                 port=s.nowplaying_port,
-                trusted_proxies=s.trusted_proxies,
-                session_hours=s.session_hours,
-                session_remember_days=s.session_remember_days,
-                allow_open_settings=s.settings_allow_open,
             )
         except OSError as exc:
             raise StartupError(
-                f"Couldn't start the web server on {s.nowplaying_host}:{s.nowplaying_port} ({exc.strerror or exc}).",
+                f"Couldn't start the web server on {LOCAL_HOST}:{s.nowplaying_port} ({exc.strerror or exc}).",
                 code=EXIT_CONFIG,
-                hint="Change the address or port in Settings > Network.",
+                hint="Change the port in Settings > Network.",
             ) from exc
         if self._stop.is_set():
             return
@@ -400,15 +347,12 @@ class BotRuntime:
     async def _teardown(self) -> None:
         self._set_phase("stopping")
         log.info("Shutting down...")
-        for task in (self._monitor, self._sampler_task):
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
-        if self._warmup is not None and not self._warmup.done():
-            self._warmup.cancel()
+        if self._monitor is not None:
+            self._monitor.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._warmup
+                await self._monitor
+        if self._player is not None and self._changes is not None:
+            self._player.unsubscribe_state(self._changes)
 
         # 1. Twitch first: stops new chat commands arriving mid-teardown and
         #    saves the OAuth tokens. Idempotent after start() already closed it.
@@ -472,23 +416,37 @@ class BotRuntime:
         if self._emit is not None:
             self._emit(self.snapshot())
 
-    async def _sampler_loop(self) -> None:
-        while True:
-            self._proc_stats = await asyncio.to_thread(self._sampler.sample)
-            await asyncio.sleep(_PROC_SAMPLE_SECONDS)
-
     async def _monitor_loop(self) -> None:
+        """Sends a snapshot when the player's state changes, and (only while
+        the dashboard is on screen) every _HEARTBEAT_SECONDS. With nothing
+        changing and nobody watching this task sleeps indefinitely."""
         loop = asyncio.get_running_loop()
-        lag_ms = 0.0
+        changes: asyncio.Queue[None] = asyncio.Queue(maxsize=4)
+        if self._player is not None:
+            changes = self._player.subscribe_state()
+        self._changes = changes
         while True:
+            timeout = _HEARTBEAT_SECONDS if self._watching else None
             started = loop.time()
-            await asyncio.sleep(_STATE_INTERVAL_SECONDS)
-            # How late the loop woke us is how long it was blocked: the number
-            # that predicts audio stutter, since the same loop paces the stream.
-            lag_ms = max(0.0, (loop.time() - started - _STATE_INTERVAL_SECONDS) * 1000)
+            heartbeat = False
+            try:
+                await asyncio.wait_for(changes.get(), timeout)
+            except TimeoutError:
+                heartbeat = True
+                # How late the loop woke us is how long it was blocked: the
+                # number that predicts audio stutter, since the same loop
+                # paces the stream.
+                self._lag_ms = max(0.0, (loop.time() - started - _HEARTBEAT_SECONDS) * 1000)
+                if not self._watching:
+                    continue
+            if not heartbeat:
+                # Let a burst of changes settle into one snapshot.
+                await asyncio.sleep(_COALESCE_SECONDS)
+                while not changes.empty():
+                    changes.get_nowait()
             await self._refresh_slow_state()
             try:
-                self._emit_snapshot(lag_ms)
+                self._emit_snapshot(self._lag_ms)
             except Exception:  # noqa: BLE001 - a bad snapshot must not end monitoring
                 log.debug("Snapshot failed.", exc_info=True)
 
@@ -547,8 +505,7 @@ class BotRuntime:
                 "encoder_running": player.encoder_running,
                 "encoder_starts": player.encoder_starts,
             }
-        host = "localhost" if s.nowplaying_host in ("0.0.0.0", "", "::") else s.nowplaying_host
-        base = f"http://{host}:{s.nowplaying_port}"
+        base = f"http://{LOCAL_HOST}:{s.nowplaying_port}"
         return {
             "t": "state",
             "phase": self._phase,
@@ -569,7 +526,6 @@ class BotRuntime:
                 "stream": f"{base}/stream.opus",
                 "overlay": f"{base}/overlay",
                 "settings": f"{base}/settings",
-                "exposed": s.nowplaying_host not in ("127.0.0.1", "localhost", "::1"),
             },
             "workers": self._resolver.worker_status() if self._resolver is not None else None,
             "counters": {
@@ -583,5 +539,5 @@ class BotRuntime:
                     "requests_queued",
                 )
             },
-            "proc": {**self._proc_stats, "loop_lag_ms": round(lag_ms, 1)},
+            "health": {"loop_lag_ms": round(lag_ms, 1)},
         }

@@ -7,7 +7,7 @@ import asyncio
 import aiohttp
 from aiohttp import web
 
-from twitch_radio.admin.context import client_ip, get_ctx
+from twitch_radio.admin.context import get_ctx
 from twitch_radio.admin.security import resolve_thumb_redirect, validate_thumb_url
 
 _THUMB_HOP_TIMEOUT = aiohttp.ClientTimeout(total=5)
@@ -76,7 +76,7 @@ async def handle_thumb_proxy(request: web.Request) -> web.Response:
     hosts, no parser tricks), redirects are re-validated hop by hop, only
     raster image types come back, and clients are rate limited."""
     ctx = get_ctx(request)
-    if not ctx.thumb_limiter.allow(client_ip(request)):
+    if not ctx.thumb_limiter.allow(request.remote or "local"):
         return web.Response(status=429, text="Too many requests")
     url = validate_thumb_url(request.query.get("url", ""))
     if url is None:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import re
 import shutil
 import time
 from collections.abc import Awaitable, Callable, Coroutine
@@ -25,6 +26,34 @@ _SILENCE_CHUNK = b"\x00" * _CHUNK_BYTES
 _STREAM_CHUNK_BYTES = 8192
 # ~5-10s of Opus at typical bitrates; a stalled listener gets dropped, not buffered forever.
 _SUBSCRIBER_QUEUE_SIZE = 50
+
+# The Opus encoder only runs while somebody is connected to /stream.opus, plus
+# this long after the last listener leaves (so an OBS reconnect doesn't churn
+# a process). With nobody listening, decoded audio is simply dropped.
+_ENCODER_IDLE_GRACE_SECONDS = 30.0
+# Idle poll interval while no encoder runs. Anything that matters (a new
+# request, pause/resume, a listener arriving) wakes the loop immediately; this
+# only bounds how stale the radio-autoplay and toggle checks can get.
+_IDLE_TICK_SECONDS = 2.0
+# libopus complexity. 10 is the default; 5 costs about a third less CPU for a
+# difference nobody can hear at 160 kbps.
+_OPUS_COMPLEXITY = 5
+
+# -- loudness ---------------------------------------------------------------
+_DYNAMIC_LOUDNESS_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
+_LOUDNESS_TARGET_LUFS = -16.0
+# Where in the track to measure, and for how long. A window at 40% beat the
+# first seconds (which are often a quieter intro) in testing: within 0.8 dB of
+# the whole-track figure on every track tried.
+_LOUDNESS_WINDOW_FRACTION = 0.40
+_LOUDNESS_WINDOW_SECONDS = 20.0
+_LOUDNESS_WHOLE_TRACK_MAX_SECONDS = 60.0
+_LOUDNESS_MIN_GAIN_DB = -15.0
+_LOUDNESS_MAX_GAIN_DB = 12.0
+_LOUDNESS_TIMEOUT_SECONDS = 20.0
+# Below this the window was silence (or the measurement is meaningless).
+_LOUDNESS_FLOOR_LUFS = -60.0
+_LUFS_RE = re.compile(r"I:\s+(-?\d+(?:\.\d+)?)\s+LUFS")
 # How far behind real time a listener typically hears /stream.opus (client
 # buffering) — the overlay's title change is held back by this much so it
 # doesn't jump ahead of what's actually audible. Tune to taste.
@@ -103,8 +132,8 @@ async def _spawn(*args: str, **kwargs: Any) -> asyncio.subprocess.Process:
     return await asyncio.create_subprocess_exec(*args, **hidden_subprocess_kwargs(), **kwargs)  # type: ignore[misc]
 
 
-def _decoder_cmd(stream_url: str) -> list[str]:
-    return [
+def _decoder_cmd(stream_url: str, audio_filter: str | None) -> list[str]:
+    cmd = [
         # fatal, not error: a mid-pull TLS reset is exactly what -reconnect
         # below recovers from on its own — logging it at "error" was just
         # noise on every transient CDN hiccup.
@@ -134,16 +163,10 @@ def _decoder_cmd(stream_url: str) -> list[str]:
         "-re",
         "-i",
         stream_url,
-        # Single-pass (dynamic) EBU R128 loudness normalization — every
-        # track lands around the same perceived volume regardless of how
-        # loud the original upload was, instead of a jump on every track
-        # change. -16 LUFS sits between Spotify/YouTube's ~-14 and
-        # broadcast's -23; -1.5 dBTP true-peak ceiling leaves headroom so
-        # this never clips. Two-pass would sound marginally better but
-        # needs the whole file decoded first — not compatible with
-        # starting playback immediately.
-        "-af",
-        "loudnorm=I=-16:TP=-1.5:LRA=11",
+    ]
+    if audio_filter:
+        cmd += ["-af", audio_filter]
+    return cmd + [
         "-f",
         "s16le",
         "-ar",
@@ -152,6 +175,70 @@ def _decoder_cmd(stream_url: str) -> list[str]:
         str(AUDIO_CHANNELS),
         "-",
     ]
+
+
+async def _measure_lufs(stream_url: str, start: float, length: float) -> float | None:
+    """Integrated loudness (LUFS) of `length` seconds of the stream from
+    `start`, or None if it couldn't be measured. A cheap, short-lived ffmpeg
+    (about a fifth of a CPU-second for 20 s of audio)."""
+    cmd = [
+        _ffmpeg(),
+        "-hide_banner",
+        "-nostdin",
+        "-nostats",
+        "-vn",
+        "-ss",
+        f"{start:.2f}",
+        "-t",
+        f"{length:.2f}",
+        "-i",
+        stream_url,
+        "-af",
+        "ebur128",
+        "-f",
+        "null",
+        "-",
+    ]
+    proc: asyncio.subprocess.Process | None = None
+    try:
+        proc = await _spawn(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
+        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=_LOUDNESS_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        log.debug("Loudness measurement failed.", exc_info=True)
+        return None
+    finally:
+        if proc is not None and proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+    matches = _LUFS_RE.findall(stderr.decode("utf-8", "replace"))
+    return float(matches[-1]) if matches else None
+
+
+async def _static_gain_db(stream_url: str, duration: int) -> float | None:
+    """The fixed gain that brings this track to the target loudness, from one
+    short measurement; None when it can't be worked out (unknown length,
+    silent window, ffmpeg trouble), which makes the caller fall back to the
+    dynamic filter for that track."""
+    if duration <= 0:
+        return None
+    if duration <= _LOUDNESS_WHOLE_TRACK_MAX_SECONDS:
+        start, length = 0.0, float(duration)
+    else:
+        start = duration * _LOUDNESS_WINDOW_FRACTION
+        length = min(_LOUDNESS_WINDOW_SECONDS, duration - start)
+    lufs = await _measure_lufs(stream_url, start, length)
+    if lufs is None or lufs < _LOUDNESS_FLOOR_LUFS:
+        return None
+    return max(_LOUDNESS_MIN_GAIN_DB, min(_LOUDNESS_MAX_GAIN_DB, _LOUDNESS_TARGET_LUFS - lufs))
+
+
+def _static_filter(gain_db: float) -> str:
+    # The limiter (ceiling about -1.5 dBFS) is what makes a fixed boost safe.
+    return f"volume={gain_db:.2f}dB,alimiter=limit=0.84:level=disabled"
 
 
 class TrackResolver(Protocol):
@@ -226,11 +313,12 @@ class _PreparedNext:
 
 
 class RadioPlayer:
-    """Owns one persistent ffmpeg encoder producing a continuous Opus stream
-    from resolved tracks + silence between them, fanned out to any number of
-    HTTP subscribers (see subscribe()/unsubscribe()) — e.g. an OBS Media
-    Source. Nothing is pushed anywhere on its own; playback only happens
-    where something is actually listening.
+    """Plays the queue and, while anyone is listening, runs one ffmpeg encoder
+    producing a continuous Opus stream from resolved tracks + silence between
+    them, fanned out to any number of HTTP subscribers (see
+    subscribe()/unsubscribe()) — e.g. an OBS Media Source. The encoder starts
+    with the first listener and stops shortly after the last one leaves;
+    meanwhile the queue still advances in real time.
     """
 
     def __init__(
@@ -238,11 +326,13 @@ class RadioPlayer:
         *,
         resolver: TrackResolver,
         audio_bitrate_kbps: int,
+        loudness_mode: str = "static",
         pause_when_no_listeners: bool = False,
         prefetch_enabled: bool = True,
     ) -> None:
         self._resolver = resolver
         self._audio_bitrate_kbps = audio_bitrate_kbps
+        self._loudness_mode = loudness_mode
         self._pause_when_no_listeners = pause_when_no_listeners
         # Pointless when Resolver's cache is disabled
         # (YTDLP_CACHE_TTL_SECONDS=0) — the prefetch's result would just be
@@ -283,6 +373,15 @@ class RadioPlayer:
         # replayed to new subscribers in handle_stream(). See ogg_header_snapshot().
         self._ogg_header_bytes: bytes = b""
         self._ogg_header_ready: bool = False
+        # Every byte the encoder has produced since it started, kept only
+        # until the header is complete. A listener who connects in that
+        # window is handed these (see subscribe()) so it still sees the
+        # stream from its very first byte.
+        self._ogg_prehistory: list[bytes] = []
+        # Set when a listener arrives or leaves: wakes the encoder manager.
+        self._subs_changed = asyncio.Event()
+        # Set by anything the idle feed loop should react to at once.
+        self._wake = asyncio.Event()
         # Cleared every time a new request becomes active (see _play_one),
         # so votes never carry over from one song to the next.
         self._skip_votes: set[int] = set()
@@ -494,12 +593,23 @@ class RadioPlayer:
         return self._paused
 
     def subscribe(self) -> asyncio.Queue[bytes]:
+        """A queue of encoder output. The first listener starts the encoder.
+
+        Call ogg_header_snapshot() straight after (no await in between): it is
+        empty while the header is still being captured, in which case this
+        queue has already been seeded with everything produced so far."""
         q: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_SUBSCRIBER_QUEUE_SIZE)
+        if not self._ogg_header_ready:
+            for chunk in self._ogg_prehistory:
+                q.put_nowait(chunk)
         self._subscribers.add(q)
+        self._subs_changed.set()
+        self._wake.set()
         return q
 
     def unsubscribe(self, q: asyncio.Queue[bytes]) -> None:
         self._subscribers.discard(q)
+        self._subs_changed.set()
 
     def ogg_header_snapshot(self) -> bytes:
         """Current session's Ogg header pages, or empty if not captured yet."""
@@ -518,6 +628,9 @@ class RadioPlayer:
         self._state_subscribers.discard(q)
 
     def _notify_state_changed(self) -> None:
+        # Everything that changes what the feed loop should do (a request
+        # arriving, pause/resume, a cancel) also lands here.
+        self._wake.set()
         for q in list(self._state_subscribers):
             with contextlib.suppress(asyncio.QueueFull):
                 q.put_nowait(None)
@@ -683,6 +796,7 @@ class RadioPlayer:
                 except asyncio.QueueFull:
                     with contextlib.suppress(asyncio.QueueEmpty):
                         q.get_nowait()
+        self._subs_changed.set()
 
     async def stop(self) -> None:
         self._stopping = True
@@ -726,12 +840,18 @@ class RadioPlayer:
             with contextlib.suppress(ProcessLookupError):
                 self._current_decoder.kill()
             self._current_decoder = None
-        if self._encoder is not None:
+        encoder, self._encoder = self._encoder, None
+        if encoder is not None:
             with contextlib.suppress(ProcessLookupError):
-                self._encoder.kill()
+                encoder.kill()
             with contextlib.suppress(Exception):
-                await self._encoder.wait()
-            self._encoder = None
+                await encoder.wait()
+        self._reset_ogg_state()
+
+    def _reset_ogg_state(self) -> None:
+        self._ogg_header_bytes = b""
+        self._ogg_header_ready = False
+        self._ogg_prehistory = []
 
     async def _run_forever(self) -> None:
         self._backoff = _MIN_BACKOFF
@@ -750,13 +870,12 @@ class RadioPlayer:
             self._backoff = min(self._backoff * 2, _MAX_BACKOFF)
 
     async def _run_one_session(self) -> None:
-        await self._spawn_encoder()
-        self._encoder_spawned_at = time.monotonic()
+        self._encoder_spawned_at = time.monotonic()  # session start; see _STABLE_UPTIME_SECONDS
         self._backoff_reset_done = False
         feed_task = asyncio.create_task(self._feed_loop())
-        pump_task = asyncio.create_task(self._pump_encoder_output())
+        manager_task = asyncio.create_task(self._encoder_manager(), name="radio-player-encoder-manager")
         try:
-            done, pending = await asyncio.wait({feed_task, pump_task}, return_when=asyncio.FIRST_COMPLETED)
+            done, pending = await asyncio.wait({feed_task, manager_task}, return_when=asyncio.FIRST_COMPLETED)
             for task in pending:
                 task.cancel()
             for task in pending:
@@ -766,9 +885,78 @@ class RadioPlayer:
                 task.result()
         finally:
             feed_task.cancel()
-            pump_task.cancel()
+            manager_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await asyncio.gather(feed_task, pump_task, return_exceptions=True)
+                await asyncio.gather(feed_task, manager_task, return_exceptions=True)
+
+    async def _encoder_manager(self) -> None:
+        """Keeps the encoder running exactly while someone is listening (plus a
+        short grace period), and raises if it dies on its own so the session
+        restarts through the usual backoff path."""
+        loop = asyncio.get_running_loop()
+        pump: asyncio.Task[None] | None = None
+        empty_since: float | None = None
+        try:
+            while True:
+                # Cleared before looking at the state, so a change that lands
+                # while we are busy below leaves the event set and the wait at
+                # the bottom returns at once.
+                self._subs_changed.clear()
+                if self._subscribers:
+                    empty_since = None
+                    if self._encoder is None:
+                        await self._spawn_encoder()
+                        assert self._encoder is not None
+                        pump = asyncio.create_task(
+                            self._pump_encoder_output(self._encoder), name="radio-player-encoder-pump"
+                        )
+                elif self._encoder is not None:
+                    now = loop.time()
+                    if empty_since is None:
+                        empty_since = now
+                    if now - empty_since >= _ENCODER_IDLE_GRACE_SECONDS:
+                        await self._retire_encoder(pump)
+                        pump = None
+                        empty_since = None
+
+                timeout: float | None = None
+                if not self._subscribers and self._encoder is not None and empty_since is not None:
+                    timeout = max(0.1, _ENCODER_IDLE_GRACE_SECONDS - (loop.time() - empty_since))
+                waiter = asyncio.ensure_future(self._subs_changed.wait())
+                watched: set[asyncio.Future[Any]] = {waiter}
+                if pump is not None:
+                    watched.add(pump)
+                try:
+                    await asyncio.wait(watched, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+                finally:
+                    waiter.cancel()
+                if pump is not None and pump.done():
+                    pump.result()  # raises when the encoder died; ends the session
+        finally:
+            if pump is not None and not pump.done():
+                pump.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await pump
+
+    async def _retire_encoder(self, pump: asyncio.Task[None] | None) -> None:
+        """Stops the encoder because nobody is listening. `self._encoder` is
+        cleared first so a write already in flight sees it was retired on
+        purpose rather than treating the broken pipe as a crash."""
+        encoder, self._encoder = self._encoder, None
+        if pump is not None:
+            pump.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await pump
+        self._reset_ogg_state()
+        if encoder is not None:
+            with contextlib.suppress(Exception):
+                if encoder.stdin is not None:
+                    encoder.stdin.close()
+            with contextlib.suppress(ProcessLookupError):
+                encoder.kill()
+            with contextlib.suppress(Exception):
+                await encoder.wait()
+        log.info("Audio encoder stopped (nobody is listening).")
 
     async def _spawn_encoder(self) -> None:
         cmd = [
@@ -795,31 +983,32 @@ class RadioPlayer:
             f"{self._audio_bitrate_kbps}k",
             "-vbr",
             "on",
+            "-compression_level",
+            str(_OPUS_COMPLEXITY),
             "-f",
             "ogg",
             "-",
         ]
+        self._reset_ogg_state()
         self._encoder = await _spawn(*cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
         self._encoder_starts += 1
         log.info("Audio encoder started (%dkbps Opus).", self._audio_bitrate_kbps)
 
-    async def _pump_encoder_output(self) -> None:
-        assert self._encoder is not None and self._encoder.stdout is not None
-        stdout = self._encoder.stdout
-        # Reset per session — a restarted ffmpeg is a new logical bitstream.
-        self._ogg_header_bytes = b""
-        self._ogg_header_ready = False
+    async def _pump_encoder_output(self, encoder: asyncio.subprocess.Process) -> None:
+        assert encoder.stdout is not None
+        stdout = encoder.stdout
+        # Per encoder — a restarted ffmpeg is a new logical bitstream
+        # (_spawn_encoder already reset the header state).
         header_parse_buf = b""
         while True:
             chunk = await stdout.read(_STREAM_CHUNK_BYTES)
             if not chunk:
                 # EOF means ffmpeg itself exited (crashed, OOM-killed) —
-                # stop() cancels this task directly before a read could
-                # return empty during a normal shutdown. Raising routes
-                # this through the same backoff/restart path as any other
-                # encoder failure, with a log line explaining why.
-                returncode = self._encoder.returncode if self._encoder is not None else None
-                raise RuntimeError(f"Encoder stdout closed unexpectedly (exit code {returncode})")
+                # stop() and _retire_encoder() cancel this task directly
+                # before a read could return empty on purpose. Raising
+                # routes this through the same backoff/restart path as any
+                # other encoder failure, with a log line explaining why.
+                raise RuntimeError(f"Encoder stdout closed unexpectedly (exit code {encoder.returncode})")
             if not self._ogg_header_ready:
                 header_parse_buf += chunk
                 pages, header_parse_buf = _iter_ogg_pages(header_parse_buf)
@@ -833,6 +1022,10 @@ class RadioPlayer:
                     self._ogg_header_ready = True
                 if self._ogg_header_ready:
                     header_parse_buf = b""
+            if self._ogg_header_ready:
+                self._ogg_prehistory = []
+            else:
+                self._ogg_prehistory.append(chunk)
             for q in list(self._subscribers):
                 try:
                     q.put_nowait(chunk)
@@ -849,11 +1042,10 @@ class RadioPlayer:
                         q.put_nowait(b"")
 
     async def _feed_loop(self) -> None:
-        assert self._encoder is not None and self._encoder.stdin is not None
-        encoder_stdin = self._encoder.stdin
         while not self._stopping:
-            if self._encoder.returncode is not None:
-                raise RuntimeError(f"Encoder exited with code {self._encoder.returncode}")
+            encoder = self._encoder
+            if encoder is not None and encoder.returncode is not None:
+                raise RuntimeError(f"Encoder exited with code {encoder.returncode}")
             if (
                 not self._backoff_reset_done
                 and time.monotonic() - self._encoder_spawned_at >= _STABLE_UPTIME_SECONDS
@@ -865,7 +1057,7 @@ class RadioPlayer:
                 # below, this never falls through to a dequeue or reaches
                 # _maybe_start_radio_fill(), so autoplay can't sneak a track
                 # in while a mod has explicitly paused things.
-                await self._write_paced_silence(encoder_stdin)
+                await self._write_paced_silence()
                 continue
             about_to_resume = bool(self._pending) and self._pending[0].bypass_listener_pause
             if self._pending and not (
@@ -883,7 +1075,7 @@ class RadioPlayer:
                 # Else: track-boundary pause only (not mid-track) — checked
                 # fresh every loop tick, so playback resumes on its own the
                 # instant a subscriber (re)connects.
-                await self._write_paced_silence(encoder_stdin)
+                await self._write_paced_silence()
                 continue
             if request.cancelled:
                 if self._prepared is not None and self._prepared.request is request:
@@ -892,49 +1084,70 @@ class RadioPlayer:
             if request.on_start is not None:
                 with contextlib.suppress(Exception):
                     request.on_start()
-            await self._play_one(request, encoder_stdin)
+            await self._play_one(request)
 
-    async def _write_silence_chunk(self, encoder_stdin: asyncio.StreamWriter) -> None:
-        encoder_stdin.write(_SILENCE_CHUNK)
-        await encoder_stdin.drain()
+    async def _write_pcm(self, chunk: bytes) -> None:
+        """Hands decoded audio to the encoder. With nobody listening there is
+        no encoder, and the audio is dropped: the decoder's own -re pacing
+        already keeps a track playing in real time."""
+        encoder = self._encoder
+        if encoder is None or encoder.stdin is None:
+            return
+        try:
+            encoder.stdin.write(chunk)
+            await encoder.stdin.drain()
+        except (BrokenPipeError, ConnectionResetError):
+            if encoder is self._encoder:
+                raise  # it died on its own: the session restarts
+            # else: retired on purpose while this write was in flight
 
-    async def _write_paced_silence(self, encoder_stdin: asyncio.StreamWriter) -> None:
+    async def _idle_wait(self, timeout: float) -> None:
+        """Sleeps until something wakes the feed loop (see _wake) or `timeout`."""
+        self._wake.clear()
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(self._wake.wait(), timeout)
+
+    async def _write_paced_silence(self) -> None:
         """Writes one silence chunk and sleeps until the *deadline* for the
         next one, rather than a flat _CHUNK_DURATION sleep.
 
         The flat-sleep version fed 0.1s of audio per (0.1s + write + event-
         loop latency) of wall clock, so the encoder ran slower than real
         time whenever silent — ~0.3% on an idle box (~11s of listener-buffer
-        drain per hour), worse under load since yt-dlp's GIL-bound
-        extraction runs on this same interpreter and every oversleep is
-        kept, not amortised. OBS's Media Source pays for it as a
-        progressive underrun.
+        drain per hour), worse under load. OBS's Media Source pays for it as
+        a progressive underrun.
 
         Accumulating against a monotonic deadline lets a late tick borrow
         from the next one instead of building permanent debt. The max()
         clamps the deadline forward after a long gap (a track just ended,
         the loop was paused) so it never "catches up" by dumping a burst
         of silence into the encoder.
+
+        With no encoder (nobody listening) there is nothing to keep
+        continuous, so this just waits for something to happen.
         """
-        await self._write_silence_chunk(encoder_stdin)
+        if self._encoder is None:
+            await self._idle_wait(_IDLE_TICK_SECONDS)
+            return
+        await self._write_pcm(_SILENCE_CHUNK)
         self._silence_deadline = max(self._silence_deadline + _CHUNK_DURATION, time.monotonic())
         delay = self._silence_deadline - time.monotonic()
         if delay > 0:
             await asyncio.sleep(delay)
 
-    async def _trickle_silence_until_cancelled(self, encoder_stdin: asyncio.StreamWriter) -> None:
+    async def _trickle_silence_until_cancelled(self) -> None:
         try:
             while True:
-                await self._write_paced_silence(encoder_stdin)
+                await self._write_paced_silence()
         except asyncio.CancelledError:
             raise
 
-    async def _play_one(self, request: QueuedRequest, encoder_stdin: asyncio.StreamWriter) -> None:
+    async def _play_one(self, request: QueuedRequest) -> None:
         self._active_request = request
         self._skip_votes.clear()
         self._notify_state_changed()
         try:
-            await self._play_one_inner(request, encoder_stdin)
+            await self._play_one_inner(request)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -994,6 +1207,9 @@ class RadioPlayer:
         track = await self._resolve_ahead(candidate)
         if track is None:
             return
+        # Measured now, in the long lead-up, so the decoder spawn at the end
+        # of it stays as quick as it always was.
+        audio_filter = await self._audio_filter_for(track)
 
         decoder_at = started_at + max(0.0, current_duration - _DECODER_PREP_LEAD_SECONDS)
         remaining = decoder_at - time.monotonic()
@@ -1004,7 +1220,7 @@ class RadioPlayer:
         # sleeping/awaiting, and !remove can cancel `candidate` outright.
         if not self._pending or self._pending[0] is not candidate or candidate.cancelled:
             return
-        prepared = await self._spawn_ahead(candidate, track)
+        prepared = await self._spawn_ahead(candidate, track, audio_filter)
         if prepared is None:
             return
         # One more re-check: the spawn itself just awaited too.
@@ -1038,12 +1254,32 @@ class RadioPlayer:
             return None
         return track
 
-    async def _spawn_ahead(self, request: QueuedRequest, track: Track) -> _PreparedNext | None:
+    async def _audio_filter_for(self, track: Track) -> str | None:
+        """The ffmpeg -af chain that evens out this track's loudness, per
+        LOUDNESS_MODE. "static" measures a short window once and applies a
+        fixed gain (about a tenth of the CPU and memory of "dynamic"), and
+        falls back to the dynamic filter for a track it can't measure."""
+        mode = self._loudness_mode
+        if mode == "off":
+            return None
+        if mode == "static":
+            gain = await _static_gain_db(track.stream_url, track.duration)
+            if gain is not None:
+                log.debug("Loudness gain for %r: %+.1f dB", track.title, gain)
+                return _static_filter(gain)
+            log.info("Couldn't measure the loudness of %r - using dynamic normalisation for it.", track.title)
+        return _DYNAMIC_LOUDNESS_FILTER
+
+    async def _spawn_ahead(
+        self, request: QueuedRequest, track: Track, audio_filter: str | None
+    ) -> _PreparedNext | None:
         """The decoder-spawn+first-chunk half — see _resolve_ahead."""
         decoder: asyncio.subprocess.Process | None = None
         try:
             try:
-                decoder = await _spawn(*_decoder_cmd(track.stream_url), stdout=asyncio.subprocess.PIPE)
+                decoder = await _spawn(
+                    *_decoder_cmd(track.stream_url, audio_filter), stdout=asyncio.subprocess.PIPE
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -1133,7 +1369,7 @@ class RadioPlayer:
             return await self._duration_limit_getter()
         return 0
 
-    async def _play_one_inner(self, request: QueuedRequest, encoder_stdin: asyncio.StreamWriter) -> None:
+    async def _play_one_inner(self, request: QueuedRequest) -> None:
         prepared, self._prepared = self._prepared, None
         if prepared is not None and (prepared.request is not request or request.cancelled):
             # Belonged to a different track than the one actually about to
@@ -1146,14 +1382,12 @@ class RadioPlayer:
             prepared = None
 
         if prepared is not None:
-            await self._start_and_stream(
-                prepared.track, prepared.decoder, prepared.first_chunk, request, encoder_stdin
-            )
+            await self._start_and_stream(prepared.track, prepared.decoder, prepared.first_chunk, request)
             return
 
         self._skip_pending = False
         silence_task = asyncio.create_task(
-            self._trickle_silence_until_cancelled(encoder_stdin), name="radio-player-prefeed-silence"
+            self._trickle_silence_until_cancelled(), name="radio-player-prefeed-silence"
         )
         decoder: asyncio.subprocess.Process | None = None
         track: Track | None = None
@@ -1188,7 +1422,14 @@ class RadioPlayer:
                 log.info("Skipped %s before it started playing (mid-resolve skip).", track.title)
                 return
 
-            decoder = await _spawn(*_decoder_cmd(track.stream_url), stdout=asyncio.subprocess.PIPE)
+            audio_filter = await self._audio_filter_for(track)
+            if self._skip_pending:
+                self._skip_pending = False
+                log.info("Skipped %s while its loudness was being measured.", track.title)
+                return
+            decoder = await _spawn(
+                *_decoder_cmd(track.stream_url, audio_filter), stdout=asyncio.subprocess.PIPE
+            )
             self._current_decoder = decoder
             if self._skip_pending:
                 self._skip_pending = False
@@ -1223,7 +1464,7 @@ class RadioPlayer:
 
         if decoder is None or track is None:
             return
-        await self._start_and_stream(track, decoder, first_chunk, request, encoder_stdin)
+        await self._start_and_stream(track, decoder, first_chunk, request)
 
     async def _start_and_stream(
         self,
@@ -1231,7 +1472,6 @@ class RadioPlayer:
         decoder: asyncio.subprocess.Process,
         first_chunk: bytes,
         request: QueuedRequest,
-        encoder_stdin: asyncio.StreamWriter,
     ) -> None:
         """Common tail for both playback paths — a freshly resolved-and-
         spawned track (the slow path above) and one handed off from
@@ -1271,8 +1511,7 @@ class RadioPlayer:
         try:
             chunk = first_chunk
             while chunk:
-                encoder_stdin.write(chunk)
-                await encoder_stdin.drain()
+                await self._write_pcm(chunk)
                 try:
                     chunk = await asyncio.wait_for(stdout.read(_CHUNK_BYTES), timeout=_STALL_TIMEOUT_SECONDS)
                 except TimeoutError:

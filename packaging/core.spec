@@ -11,12 +11,12 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 ROOT = os.path.abspath(os.path.join(SPECPATH, ".."))
 
 datas = [
-    (os.path.join(ROOT, "deploy", ".env.example"), "deploy"),
+    (os.path.join(ROOT, ".env.example"), "."),
     (os.path.join(ROOT, "assets"), "assets"),
     (os.path.join(ROOT, "twitch_radio", "admin", "static"), os.path.join("twitch_radio", "admin", "static")),
 ]
 binaries = []
-hiddenimports = collect_submodules("twitch_radio") + ["psutil", "dotenv"]
+hiddenimports = collect_submodules("twitch_radio") + ["dotenv"]
 
 # yt-dlp loads extractors/plugins dynamically; curl_cffi ships native
 # browser-impersonation libraries. yt_dlp_ejs is deliberately NOT collected:

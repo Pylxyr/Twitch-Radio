@@ -77,16 +77,15 @@ def basic(exe: str, env: dict[str, str], bin_dir: str | None, host_js: str | Non
         check(
             runtime.get("name") == "node"  # type: ignore[attr-defined]
             and bool(got)
-            and Path(got).resolve() == Path(host_js).resolve()
-            and str(runtime.get("version") or "").startswith("v"),  # type: ignore[attr-defined]
+            and Path(got).resolve() == Path(host_js).resolve(),
             "frozen core uses the host app as its JavaScript runtime",
             str(runtime),
         )
 
-    done = run(exe, ["--hash-password-stdin"], env, stdin="smoke-test-password\n")
+    done = run(exe, ["--env-json"], env)
     check(
-        done.returncode == 0 and done.stdout.strip().startswith("scrypt:"),
-        "--hash-password-stdin hashes",
+        done.returncode == 0 and isinstance(last_json(done.stdout), dict),
+        "--env-json reads the .env",
         done.stderr[-300:],
     )
 
