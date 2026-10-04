@@ -108,7 +108,7 @@ function coreEnv() {
   return env;
 }
 
-/** One-shot run of the core (preflight, env read/write, password hash). */
+/** One-shot run of the core (preflight, env read/write, yt-dlp update checks). */
 function runCore(extraArgs, input, timeout = 30000) {
   return new Promise((resolve) => {
     const { cmd, args } = coreCommand();
@@ -152,6 +152,7 @@ const core = {
   pendingAcks: new Map(),
   ackId: 0,
   lastState: null,
+  watching: false, // whether the core has been told the dashboard is on screen
   crashTimes: [],
   restartTimer: null,
   restartAt: null,
@@ -187,6 +188,7 @@ function startBot() {
   core.exitCode = null;
   core.userStopped = false;
   core.lastState = null;
+  core.watching = false;
   core.startedAt = Date.now();
   const { cmd, args } = coreCommand();
   guiLog('INFO', `Starting the bot (${path.basename(cmd)}).`);
@@ -217,6 +219,7 @@ function startBot() {
     failStart(`Couldn't launch the bot: ${error.message}`);
   });
   child.once('exit', (code, signal) => onCoreExit(code, signal));
+  updateWatching(true);
   return status();
 }
 
@@ -357,29 +360,42 @@ function sendCommand(name) {
   });
 }
 
+/**
+ * Tells the core whether the dashboard is on screen. Hidden, the core sends a
+ * state message only when the player's state actually changes; visible, it also
+ * sends a slow heartbeat. `force` re-sends the current answer (a fresh core
+ * starts out assuming nobody is watching).
+ */
+function updateWatching(force = false) {
+  const visible = !!(win && !win.isDestroyed() && win.isVisible() && !win.isMinimized());
+  if (!force && visible === core.watching) return;
+  core.watching = visible;
+  if (!core.child) return;
+  try {
+    core.child.stdin.write(JSON.stringify({ cmd: 'watch', on: visible }) + '\n');
+  } catch {
+    /* the core is exiting; the 'exit' handler reports it */
+  }
+}
+
 // ------------------------------------------------------- configuration ---
 const ENV_KEYS = new Set([
   'TWITCH_CLIENT_ID', 'TWITCH_CLIENT_SECRET', 'TWITCH_BOT_ID', 'TWITCH_OWNER_ID',
-  'AUDIO_BITRATE_KBPS', 'PAUSE_QUEUE_WHEN_NO_LISTENERS',
-  'TWITCH_NOWPLAYING_HOST', 'TWITCH_NOWPLAYING_PORT', 'TWITCH_SETTINGS_PASSWORD',
-  'YTDLP_COOKIES_FILE', 'YTDLP_CONCURRENCY', 'YTDLP_EXTRACT_TIMEOUT_SECONDS', 'YTDLP_CACHE_TTL_SECONDS',
+  'AUDIO_BITRATE_KBPS', 'LOUDNESS_MODE', 'PAUSE_QUEUE_WHEN_NO_LISTENERS', 'TWITCH_NOWPLAYING_PORT',
+  'YTDLP_COOKIES_FILE', 'YTDLP_CONCURRENCY', 'YTDLP_WORKER_IDLE_SECONDS', 'YTDLP_EXTRACT_TIMEOUT_SECONDS',
+  'YTDLP_CACHE_TTL_SECONDS',
   'LOG_LEVEL', 'LOG_TO_FILE',
 ]);
-// Mirrors twitch_radio/tunables.py TUNABLE_BOUNDS; the bot clamps again when it reads the file.
-const TUNABLE_BOUNDS = {
-  max_pending_per_chatter: [1, 10],
-  request_cooldown_seconds: [0, 3600],
-  queue_cap: [1, 200],
-  max_request_duration_seconds: [30, 3600],
-  vote_skip_threshold: [2, 20],
-};
-const TUNABLE_DEFAULTS = {
-  max_pending_per_chatter: 2, request_cooldown_seconds: 0, queue_cap: 50,
-  max_request_duration_seconds: 600, vote_skip_threshold: 3,
-};
-
 let lastPreflight = null;
-async function preflight() {
+let lastPreflightAt = 0;
+const PREFLIGHT_FRESH_MS = 120000;
+/**
+ * Runs the core's preflight (it starts a short-lived process, so nothing polls
+ * it). A page that is just being reopened gets the cached report; callers that
+ * know something changed pass force.
+ */
+async function preflight(force = true) {
+  if (!force && lastPreflight && Date.now() - lastPreflightAt < PREFLIGHT_FRESH_MS) return lastPreflight;
   const result = await runCore(['--preflight']);
   const report = lastJsonLine(result.stdout);
   if (!report) {
@@ -387,10 +403,15 @@ async function preflight() {
   } else {
     lastPreflight = report;
   }
+  lastPreflightAt = Date.now();
   return lastPreflight;
 }
+function tunableSpec() {
+  const spec = (lastPreflight && lastPreflight.tunables) || {};
+  return { bounds: spec.bounds || {}, defaults: spec.defaults || {} };
+}
 async function liveFiles() {
-  if (!lastPreflight || !lastPreflight.files) await preflight();
+  if (!lastPreflight || !lastPreflight.files || !lastPreflight.tunables) await preflight();
   const files = (lastPreflight && lastPreflight.files) || {};
   return {
     tunables: files.tunables || path.join(HOME, 'data', 'tunables.json'),
@@ -415,21 +436,13 @@ function saveEnv(payload) {
 }
 
 async function saveEnvNow(payload) {
-  const { values = {}, newPassword = '', clearPassword = false } = payload || {};
+  const { values = {} } = payload || {};
   const updates = {};
   for (const [key, raw] of Object.entries(values)) {
-    if (!ENV_KEYS.has(key) || key === 'TWITCH_SETTINGS_PASSWORD') continue;
+    if (!ENV_KEYS.has(key)) continue;
     const value = String(raw ?? '').trim();
     if (key === 'TWITCH_CLIENT_SECRET' && !value) continue; // a blank never erases the stored secret
     updates[key] = value;
-  }
-  if (clearPassword) {
-    updates.TWITCH_SETTINGS_PASSWORD = '';
-  } else if (newPassword) {
-    const hashed = await runCore(['--hash-password-stdin'], newPassword + '\n');
-    const line = String(hashed.stdout || '').trim().split(/\r?\n/).pop();
-    if (hashed.code !== 0 || !line) return { ok: false, error: (hashed.stderr || '').trim() || "Couldn't hash the password." };
-    updates.TWITCH_SETTINGS_PASSWORD = line;
   }
   if (!Object.keys(updates).length) {
     return { ok: true, preflight: lastPreflight || (await preflight()), needsRestart: false };
@@ -446,29 +459,28 @@ async function getEnv() {
   const values = lastJsonLine(result.stdout) || {};
   const safe = {};
   for (const key of ENV_KEYS) safe[key] = values[key] ?? '';
-  // Never hand the stored hash or the client secret to the page; it only needs to know they exist.
-  const passwordSet = !!safe.TWITCH_SETTINGS_PASSWORD;
+  // Never hand the client secret to the page; it only needs to know it exists.
   const secretSet = !!safe.TWITCH_CLIENT_SECRET;
-  delete safe.TWITCH_SETTINGS_PASSWORD;
   delete safe.TWITCH_CLIENT_SECRET;
-  return { values: safe, passwordSet, secretSet, envPath: path.join(HOME, '.env') };
+  return { values: safe, secretSet, envPath: path.join(HOME, '.env') };
 }
 
 async function getLive() {
   const files = await liveFiles();
   const t = readJson(files.tunables);
   const g = readJson(files.toggles);
+  const { bounds, defaults } = tunableSpec();
   const tunables = {};
-  for (const key of Object.keys(TUNABLE_BOUNDS)) {
+  for (const key of Object.keys(bounds)) {
     const n = Number.parseInt(t[key], 10);
-    tunables[key] = Number.isFinite(n) ? n : TUNABLE_DEFAULTS[key];
+    tunables[key] = Number.isFinite(n) ? n : defaults[key];
   }
-  return { tunables, bounds: TUNABLE_BOUNDS, radio_autoplay_enabled: g.radio_autoplay_enabled !== false };
+  return { tunables, bounds, radio_autoplay_enabled: g.radio_autoplay_enabled !== false };
 }
 async function saveLive(payload) {
   const files = await liveFiles();
   const current = readJson(files.tunables);
-  for (const [key, [lo, hi]] of Object.entries(TUNABLE_BOUNDS)) {
+  for (const [key, [lo, hi]] of Object.entries(tunableSpec().bounds)) {
     const n = Number.parseInt(payload?.tunables?.[key], 10);
     if (Number.isFinite(n)) current[key] = Math.max(lo, Math.min(hi, n));
   }
@@ -558,7 +570,8 @@ function scheduleStartupChecks() {
 let win = null;
 let tray = null;
 let quitting = false;
-let startHidden = process.argv.includes('--hidden');
+// Launched at login: start with only the tray icon; the window is built when it is first opened.
+const startHidden = process.argv.includes('--hidden');
 
 function send(channel, payload) {
   if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.send(channel, payload);
@@ -588,9 +601,10 @@ function createWindow() {
   win.setMenuBarVisibility(false);
   win.loadFile(path.join(__dirname, 'renderer', 'index.html'));
   win.once('ready-to-show', () => {
-    if (!startHidden) win.show();
-    startHidden = false;
+    win.show();
+    updateWatching();
   });
+  for (const event of ['show', 'hide', 'minimize', 'restore']) win.on(event, () => updateWatching());
   // The page is a fixed local file: never navigate away, never open windows.
   win.webContents.on('will-navigate', (event) => event.preventDefault());
   win.webContents.setWindowOpenHandler(({ url }) => {
@@ -600,6 +614,7 @@ function createWindow() {
   win.on('close', onWindowClose);
   win.on('closed', () => {
     win = null;
+    updateWatching();
   });
 }
 
@@ -635,7 +650,10 @@ async function onWindowClose(event) {
   if (action === 'quit') {
     app.quit();
   } else if (win) {
-    win.hide();
+    // Not win.hide(): a hidden window keeps its renderer and GPU processes
+    // alive (about 160 MB) for nothing. Closing it for real frees them; the
+    // page rebuilds its whole state from the main process when reopened.
+    win.destroy();
   }
 }
 
@@ -719,7 +737,7 @@ function registerIpc() {
     return { ok: true, filePath };
   });
 
-  ipcMain.handle('config:preflight', () => preflight());
+  ipcMain.handle('config:preflight', (_e, force) => preflight(force !== false));
   ipcMain.handle('config:getEnv', () => getEnv());
   ipcMain.handle('config:saveEnv', (_e, payload) => saveEnv(payload));
   ipcMain.handle('config:getLive', () => getLive());
@@ -789,7 +807,7 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(async () => {
     loadPrefs();
     registerIpc();
-    createWindow();
+    if (!startHidden) createWindow();
     createTray();
     guiLog('INFO', `Twitch Radio ${app.getVersion()} - data folder: ${HOME}`);
     if (prefs.startBotOnLaunch) startBot();

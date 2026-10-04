@@ -2,7 +2,6 @@ twitchio==3.3.2
 aiohttp==3.14.3
 python-dotenv==1.2.3
 # Optional but recommended: CPU / memory numbers on the desktop dashboard.
-psutil>=6.0
 
 # yt-dlp, spelled out instead of `yt-dlp[default,curl-cffi]`: the `default`
 # extra also installs yt-dlp-ejs, whose JS solver scripts we deliberately do not

@@ -9,7 +9,6 @@
   const OAUTH_BOT = 'http://localhost:4343/oauth?scopes=user:read:chat+user:write:chat+user:bot&force_verify=true';
   const OAUTH_OWNER = 'http://localhost:4343/oauth?scopes=channel:bot&force_verify=true';
   const OAUTH_REDIRECT = 'http://localhost:4343/oauth/callback';
-  const HISTORY = 120;
   const LOG_CAP = 5000;
   const ROW = 22;
 
@@ -19,7 +18,6 @@
   let pre = null;
   let appInfo = {};
   let prefs = {};
-  const hist = { cpu: [], mem: [], lag: [] };
 
   // ------------------------------------------------------------ helpers ---
   function h(tag, attrs, ...children) {
@@ -170,13 +168,12 @@
     else add('Audio encoder', 'idle', 'Starts with the first song');
 
     if (!live) add('Web server', 'idle', 'Offline');
-    else if (s && s.http.up) add('Web server', s.http.exposed ? 'warn' : 'ok', s.http.exposed ? 'Reachable from network' : new URL(s.http.base).host);
+    else if (s && s.http.up) add('Web server', 'ok', `${new URL(s.http.base).host} (this PC only)`);
     else add('Web server', 'warn', 'Starting…');
 
     const w = s && s.workers;
     if (!live || !w) add('yt-dlp workers', 'idle', 'Offline');
-    else if (w.mode === 'thread') add('yt-dlp workers', 'ok', 'Thread mode');
-    else add('yt-dlp workers', w.alive >= w.size ? 'ok' : 'warn', `${w.alive} of ${w.size} ready`);
+    else add('yt-dlp workers', 'ok', w.alive ? `${w.alive} running (up to ${w.size})` : 'Start on demand');
 
     if (!pre) add('ffmpeg', 'idle', 'Checking…');
     else add('ffmpeg', pre.ffmpeg && pre.ffmpeg.path ? 'ok' : 'err', pre.ffmpeg && pre.ffmpeg.path ? 'Found' : 'Not found');
@@ -187,7 +184,7 @@
     }
     if (pre) add('YouTube JS solver', solverReady() ? 'ok' : 'idle', solverReady() ? 'Ready' : 'Not needed so far');
     if (live && s) {
-      const lag = s.proc.loop_lag_ms || 0;
+      const lag = (s.health && s.health.loop_lag_ms) || 0;
       add('Event-loop delay', lag < 60 ? 'ok' : lag < 250 ? 'warn' : 'err', `${Math.round(lag)} ms`);
     }
     return items;
@@ -323,15 +320,6 @@
       $('#urlSettings').textContent = s.http.settings;
     }
 
-    // resources
-    const p = live && s ? s.proc : null;
-    $('#procNote').textContent = p && p.available ? `${p.processes} processes · ${p.threads} threads` : live && s ? 'Install psutil for CPU/memory numbers' : '';
-    $('#cpuNow').textContent = p && p.available ? `${Math.round(p.cpu)}%` : '–';
-    $('#memNow').textContent = p && p.available ? `${Math.round(p.mem_mb)} MB` : '–';
-    $('#lagNow').textContent = p ? `${Math.round(p.loop_lag_ms)} ms` : '–';
-    drawSpark($('#sparkCpu'), hist.cpu, 10);
-    drawSpark($('#sparkMem'), hist.mem, 200);
-    drawSpark($('#sparkLag'), hist.lag, 100);
     renderSetup();
   }
 
@@ -355,52 +343,10 @@
     $('#nowBar').style.width = np.duration > 0 ? `${Math.min(100, (elapsed / np.duration) * 100).toFixed(1)}%` : '0%';
   }
   setInterval(() => {
+    if (document.hidden) return;
     if (currentTab === 'dashboard') tickProgress();
     if (status.restartAt) renderStatus();
-  }, 500);
-
-  function drawSpark(canvas, data, minMax) {
-    const dpr = window.devicePixelRatio || 1;
-    const width = canvas.clientWidth || 300;
-    const height = 54;
-    if (canvas.width !== Math.round(width * dpr)) {
-      canvas.width = Math.round(width * dpr);
-      canvas.height = Math.round(height * dpr);
-    }
-    const ctx = canvas.getContext('2d');
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-    ctx.clearRect(0, 0, width, height);
-    ctx.strokeStyle = 'rgba(255,255,255,.05)';
-    ctx.lineWidth = 1;
-    for (const y of [height * 0.25, height * 0.5, height * 0.75]) {
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(width, y);
-      ctx.stroke();
-    }
-    if (data.length < 2) return;
-    const max = Math.max(minMax, ...data) * 1.15;
-    const step = width / (HISTORY - 1);
-    const x0 = width - (data.length - 1) * step;
-    const point = (i) => [x0 + i * step, height - 4 - (data[i] / max) * (height - 10)];
-    ctx.beginPath();
-    data.forEach((_, i) => {
-      const [x, y] = point(i);
-      i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
-    });
-    ctx.strokeStyle = '#ae7bff';
-    ctx.lineWidth = 1.8;
-    ctx.lineJoin = 'round';
-    ctx.stroke();
-    ctx.lineTo(x0 + (data.length - 1) * step, height);
-    ctx.lineTo(x0, height);
-    ctx.closePath();
-    const gradient = ctx.createLinearGradient(0, 0, 0, height);
-    gradient.addColorStop(0, 'rgba(145,70,255,.35)');
-    gradient.addColorStop(1, 'rgba(145,70,255,0)');
-    ctx.fillStyle = gradient;
-    ctx.fill();
-  }
+  }, 1000);
 
   // ---------------------------------------------------------------- logs ---
   const logs = { all: [], view: [], levels: new Set(['DEBUG', 'INFO', 'WARNING', 'ERROR']), query: '', follow: true };
@@ -554,22 +500,23 @@
       title: 'Audio & playback',
       fields: [
         { key: 'AUDIO_BITRATE_KBPS', label: 'Audio bitrate (kbps)', type: 'number', min: 64, max: 256, placeholder: '160', hint: 'Opus quality of the stream sent to OBS.' },
+        { key: 'LOUDNESS_MODE', label: 'Volume levelling', type: 'select', options: ['static', 'dynamic', 'off'], def: 'static', hint: 'static: measure each song once and set a fixed gain (lightest on CPU and memory). dynamic: ffmpeg\'s loudnorm filter (about 10x the CPU). off: play songs as they are. Takes effect from the next song after a restart.' },
         { key: 'PAUSE_QUEUE_WHEN_NO_LISTENERS', label: 'Pause when nobody is listening', type: 'bool', def: false, hint: 'Holds the queue while OBS has no audio source connected.' },
       ],
     },
     {
       title: 'Network',
+      desc: 'The audio stream, OBS overlay and web settings page are served on this computer only (127.0.0.1); nothing is reachable from your network.',
       fields: [
-        { key: 'TWITCH_NOWPLAYING_HOST', label: 'Listen address', type: 'text', placeholder: '127.0.0.1', hint: 'Leave as 127.0.0.1 unless OBS runs on another computer. Anything else exposes the web page to your network; set a password if you do.' },
         { key: 'TWITCH_NOWPLAYING_PORT', label: 'Port', type: 'number', min: 1024, max: 65535, placeholder: '8098' },
-        { special: 'password' },
       ],
     },
     {
       title: 'YouTube (yt-dlp)',
       fields: [
         { special: 'cookies' },
-        { key: 'YTDLP_CONCURRENCY', label: 'Parallel lookups', type: 'number', min: 1, max: 8, placeholder: '2', hint: 'Each one uses roughly 100 MB of memory. Raise only if !sr gets busy.' },
+        { key: 'YTDLP_CONCURRENCY', label: 'Parallel lookups', type: 'number', min: 1, max: 8, placeholder: '2', hint: 'The most lookups that may run at once. Each runs in its own process (roughly 50-100 MB) that is started when needed and exits when idle.' },
+        { key: 'YTDLP_WORKER_IDLE_SECONDS', label: 'Lookup process idle exit (s)', type: 'number', min: 15, max: 3600, placeholder: '120', hint: 'How long an unused lookup process stays loaded before it frees its memory.' },
         { key: 'YTDLP_EXTRACT_TIMEOUT_SECONDS', label: 'Lookup timeout (s)', type: 'number', min: 10, max: 120, placeholder: '45' },
         { key: 'YTDLP_CACHE_TTL_SECONDS', label: 'Result cache (s)', type: 'number', min: 0, max: 3600, placeholder: '900', hint: '0 turns caching and next-song prefetching off.' },
       ],
@@ -582,12 +529,12 @@
       ],
     },
   ];
-  const form = { values: {}, orig: {}, passwordSet: false, secretSet: false, secretEditing: false, newPassword: '', clearPassword: false, envPath: '' };
+  const form = { values: {}, orig: {}, secretSet: false, secretEditing: false, envPath: '' };
   const fieldDefs = SECTIONS.flatMap((s) => s.fields).filter((f) => f.key);
   const storeValue = (f, raw) => (f.type === 'bool' ? (raw === '' ? String(f.def) : String(/^(1|true|yes|on)$/i.test(raw))) : f.type === 'select' ? raw.toUpperCase() || f.def : raw);
 
   function isDirty() {
-    return fieldDefs.some((f) => form.values[f.key] !== form.orig[f.key]) || !!form.newPassword || form.clearPassword;
+    return fieldDefs.some((f) => form.values[f.key] !== form.orig[f.key]);
   }
   function refreshSaveBar() {
     $('#saveBar').hidden = !isDirty();
@@ -650,31 +597,10 @@
     return holder;
   }
   function fieldRow(f) {
-    if (f.special === 'password') return passwordRow();
     if (f.special === 'cookies') return cookiesRow();
     return h('div', { class: 'field', 'data-key': f.key },
       h('label', { class: 'name', for: `f-${f.key}`, text: f.label }),
       h('div', { class: 'ctl' }, control(f), f.hint ? h('div', { class: 'hint', text: f.hint }) : null, h('div', { class: 'bad-msg', hidden: true })),
-    );
-  }
-  function passwordRow() {
-    const input = h('input', { class: 'input', type: 'password', placeholder: form.passwordSet ? 'Enter a new password to change it' : 'No password set', autocomplete: 'new-password', spellcheck: 'false' });
-    input.addEventListener('input', () => {
-      form.newPassword = input.value;
-      if (input.value) form.clearPassword = false;
-      refreshSaveBar();
-    });
-    const clear = h('button', { class: 'btn ghost sm', type: 'button', text: 'Remove password', onclick: () => {
-      form.clearPassword = true;
-      form.newPassword = '';
-      input.value = '';
-      clear.textContent = 'Will be removed on save';
-      refreshSaveBar();
-    } });
-    return h('div', { class: 'field' },
-      h('label', { class: 'name', text: 'Web settings password' }),
-      h('div', { class: 'ctl' }, h('div', { class: 'secret' }, input, form.passwordSet ? clear : null),
-        h('div', { class: 'hint', text: form.passwordSet ? 'A password is set. It protects the optional web settings page; it is stored hashed.' : 'Optional. Only matters if you open the web settings page or listen beyond this computer.' })),
     );
   }
   function cookiesRow() {
@@ -860,12 +786,9 @@
       const [env, liveData] = await Promise.all([api.getEnv(), api.getLive()]);
       const dirty = isDirty();
       if (!dirty) {
-        form.passwordSet = env.passwordSet;
         form.secretSet = !!env.secretSet;
         form.secretEditing = false;
         form.envPath = env.envPath;
-        form.newPassword = '';
-        form.clearPassword = false;
         for (const f of fieldDefs) form.values[f.key] = storeValue(f, env.values[f.key] || '');
         form.values.YTDLP_COOKIES_FILE = env.values.YTDLP_COOKIES_FILE || '';
         form.orig = { ...form.values };
@@ -914,8 +837,6 @@
   $('#btnDiscard').addEventListener('click', () => {
     if (saving) return;
     form.values = { ...form.orig };
-    form.newPassword = '';
-    form.clearPassword = false;
     form.secretEditing = false;
     loadSettings();
   });
@@ -929,7 +850,7 @@
     for (const f of fieldDefs) if (form.values[f.key] !== form.orig[f.key]) changed[f.key] = form.values[f.key];
     setSaving(true);
     try {
-      const result = await api.saveEnv({ values: changed, newPassword: form.newPassword, clearPassword: form.clearPassword });
+      const result = await api.saveEnv({ values: changed });
       if (!result.ok) {
         $('#saveError').textContent = result.error || "Couldn't save.";
         return;
@@ -937,8 +858,6 @@
       pre = result.preflight || pre;
       form.values.TWITCH_CLIENT_SECRET = '';
       form.orig = { ...form.values };
-      form.newPassword = '';
-      form.clearPassword = false;
       toast('Settings saved.', 'ok');
       $('#settingsRestart').hidden = !result.needsRestart;
       await loadSettings();
@@ -951,25 +870,14 @@
   });
 
   // ---------------------------------------------------------------- wiring ---
-  async function refreshPreflight() {
+  async function refreshPreflight(force = true) {
     try {
-      pre = await api.preflight();
+      pre = await api.preflight(force);
     } catch {
       /* the checklist just stays in its "checking" state */
     }
     renderDashboard();
     refreshUpdates();
-  }
-
-  function pushHistory(s) {
-    if (!s || !s.proc) return;
-    const p = s.proc;
-    if (p.available) {
-      hist.cpu.push(p.cpu);
-      hist.mem.push(p.mem_mb);
-    }
-    hist.lag.push(p.loop_lag_ms || 0);
-    for (const k of Object.keys(hist)) if (hist[k].length > HISTORY) hist[k].shift();
   }
 
   async function init() {
@@ -991,17 +899,23 @@
       if (next.phase === 'stopped' || next.phase === 'error') snap = null;
       renderStatus();
       renderDashboard();
-      if (next.phase !== lastPhase && (next.phase === 'stopped' || next.phase === 'running' || next.phase === 'error')) refreshPreflight();
+      if (next.phase !== lastPhase && (next.phase === 'stopped' || next.phase === 'running' || next.phase === 'error')) refreshPreflight(true);
       lastPhase = next.phase;
     });
     api.onState((next) => {
       snap = next;
       snapAt = Date.now();
-      pushHistory(next);
       renderDashboard();
     });
     api.onLogs(addLogs);
-    refreshPreflight();
+    // Nothing polls. The report is refreshed when something changed (start/stop, a save)
+    // and when the window regains focus (say, after installing ffmpeg); the main process
+    // answers from its cache when the last check is under two minutes old, so this costs
+    // one short check per two minutes of active use and nothing while idle.
+    refreshPreflight(false);
+    window.addEventListener('focus', () => {
+      if (!running()) refreshPreflight(false);
+    });
     api.onAppUpdate((result) => {
       upd.app = result;
       refreshUpdates();
@@ -1013,9 +927,6 @@
     api.lastAppUpdate().then((result) => {
       if (result) upd.app = result;
     });
-    setInterval(() => {
-      if (!running()) refreshPreflight();
-    }, 30000);
   }
   init().catch((error) => toast(`Startup problem: ${error.message}`, 'err'));
 })();

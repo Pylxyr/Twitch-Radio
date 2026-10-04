@@ -24,7 +24,7 @@ Users of the finished installer need **nothing** installed.
    ```
 
 3. Wait (the first build takes several minutes and downloads a few hundred MB).
-4. The installer appears at `dist\app\Twitch Radio Setup 1.0.0.exe`. An unpacked copy you can
+4. The installer appears at `dist\app\Twitch Radio Setup <version>.exe`. An unpacked copy you can
    run without installing is produced by `cd gui && npm run dist:dir` (`dist\app\win-unpacked\`).
 
 If a step fails the script stops and says which one. Re-running resumes quickly: the Python
