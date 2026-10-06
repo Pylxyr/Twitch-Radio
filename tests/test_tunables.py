@@ -26,12 +26,9 @@ def test_out_of_range_values_are_clamped(name: str) -> None:
 
 
 def test_garbage_falls_back_per_field() -> None:
-    result = TwitchTunables.from_dict(
-        {"queue_cap": "lots", "vote_skip_threshold": None, "request_cooldown_seconds": "30"}
-    )
+    result = TwitchTunables.from_dict({"queue_cap": "lots", "request_cooldown_seconds": "30"})
     defaults = TwitchTunables()
     assert result.queue_cap == defaults.queue_cap
-    assert result.vote_skip_threshold == defaults.vote_skip_threshold
     assert result.request_cooldown_seconds == 30
 
 

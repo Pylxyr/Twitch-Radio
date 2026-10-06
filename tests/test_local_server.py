@@ -13,6 +13,7 @@ import pytest
 
 from twitch_radio.admin import security
 from twitch_radio.admin.app import BIND_HOST, run_admin_server
+from twitch_radio.admin.context import CTX_KEY
 from twitch_radio.player import RadioPlayer
 from twitch_radio.store import JsonStore
 
@@ -88,6 +89,42 @@ def test_requests_for_other_hostnames_are_refused(tmp_path: Path) -> None:
                     f"http://127.0.0.1:{port}/healthz", headers={"Host": f"localhost:{port}"}
                 ) as resp:
                     assert resp.status == 200
+        finally:
+            await runner.cleanup()
+
+    run(scenario())
+
+
+def test_stream_and_socket_refuse_cross_site_pages(tmp_path: Path) -> None:
+    """A web page open in the streamer's browser must not be able to start the
+    encoder or read the queue; OBS (no Origin header) and the overlay page
+    itself (same origin) must keep working."""
+
+    async def scenario() -> None:
+        runner, port = await serve(tmp_path)
+        base = f"http://127.0.0.1:{port}"
+        try:
+            async with aiohttp.ClientSession() as http:
+                for path in ("/stream.opus", "/ws/nowplaying"):
+                    for headers in (
+                        {"Origin": "https://evil.example"},
+                        {"Sec-Fetch-Site": "cross-site"},
+                        {"Referer": "https://evil.example/page"},
+                    ):
+                        async with http.get(f"{base}{path}", headers=headers) as resp:
+                            assert resp.status == 403, (path, headers)
+                assert runner.app is not None
+                player = runner.app[CTX_KEY].player
+                assert player.listener_count == 0, "a refused request must not subscribe a listener"
+
+                # The overlay's own socket: same origin, as a browser labels it.
+                async with http.ws_connect(
+                    f"{base}/ws/nowplaying", headers={"Origin": base, "Sec-Fetch-Site": "same-origin"}
+                ) as ws:
+                    assert (await ws.receive_json())["playing"] is False
+                # No Origin at all (what OBS's media source sends): still allowed.
+                async with http.ws_connect(f"{base}/ws/nowplaying") as ws:
+                    assert (await ws.receive_json())["playing"] is False
         finally:
             await runner.cleanup()
 

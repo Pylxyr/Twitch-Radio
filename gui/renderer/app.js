@@ -500,7 +500,6 @@
       title: 'Audio & playback',
       fields: [
         { key: 'AUDIO_BITRATE_KBPS', label: 'Audio bitrate (kbps)', type: 'number', min: 64, max: 256, placeholder: '160', hint: 'Opus quality of the stream sent to OBS.' },
-        { key: 'LOUDNESS_MODE', label: 'Volume levelling', type: 'select', options: ['static', 'dynamic', 'off'], def: 'static', hint: 'static: measure each song once and set a fixed gain (lightest on CPU and memory). dynamic: ffmpeg\'s loudnorm filter (about 10x the CPU). off: play songs as they are. Takes effect from the next song after a restart.' },
         { key: 'PAUSE_QUEUE_WHEN_NO_LISTENERS', label: 'Pause when nobody is listening', type: 'bool', def: false, hint: 'Holds the queue while OBS has no audio source connected.' },
       ],
     },
@@ -642,7 +641,6 @@
       ['request_cooldown_seconds', 'Request cooldown (s)', '0 disables the cooldown.'],
       ['queue_cap', 'Queue cap', 'Total requests before !sr turns people away.'],
       ['max_request_duration_seconds', 'Max track length (s)', 'Longer songs are refused.'],
-      ['vote_skip_threshold', 'Vote-skip threshold', 'Unique !voteskip voters needed.'],
     ];
     defs.forEach(([key, label, hint]) => {
       const [lo, hi] = d.bounds[key];

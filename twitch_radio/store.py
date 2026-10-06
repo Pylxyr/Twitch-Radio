@@ -22,7 +22,7 @@ class JsonStore:
 
     Reads are served from an in-memory copy, revalidated against the
     file's (mtime_ns, size) on every call — tunables/toggles get read on
-    most chat commands (!sr, !voteskip, !radio, ...), so this avoids a
+    most chat commands (!sr, !skip, ...), so this avoids a
     lock acquisition, a thread-pool dispatch and a json.load() on every
     one of those just to answer "what's the current queue cap?". A
     stat() is cheap enough to do inline, and unlike a time-based cache it

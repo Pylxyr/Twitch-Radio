@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import re
 import shutil
 import time
 from collections.abc import Awaitable, Callable, Coroutine
@@ -39,21 +38,6 @@ _IDLE_TICK_SECONDS = 2.0
 # difference nobody can hear at 160 kbps.
 _OPUS_COMPLEXITY = 5
 
-# -- loudness ---------------------------------------------------------------
-_DYNAMIC_LOUDNESS_FILTER = "loudnorm=I=-16:TP=-1.5:LRA=11"
-_LOUDNESS_TARGET_LUFS = -16.0
-# Where in the track to measure, and for how long. A window at 40% beat the
-# first seconds (which are often a quieter intro) in testing: within 0.8 dB of
-# the whole-track figure on every track tried.
-_LOUDNESS_WINDOW_FRACTION = 0.40
-_LOUDNESS_WINDOW_SECONDS = 20.0
-_LOUDNESS_WHOLE_TRACK_MAX_SECONDS = 60.0
-_LOUDNESS_MIN_GAIN_DB = -15.0
-_LOUDNESS_MAX_GAIN_DB = 12.0
-_LOUDNESS_TIMEOUT_SECONDS = 20.0
-# Below this the window was silence (or the measurement is meaningless).
-_LOUDNESS_FLOOR_LUFS = -60.0
-_LUFS_RE = re.compile(r"I:\s+(-?\d+(?:\.\d+)?)\s+LUFS")
 # How far behind real time a listener typically hears /stream.opus (client
 # buffering) — the overlay's title change is held back by this much so it
 # doesn't jump ahead of what's actually audible. Tune to taste.
@@ -132,13 +116,17 @@ async def _spawn(*args: str, **kwargs: Any) -> asyncio.subprocess.Process:
     return await asyncio.create_subprocess_exec(*args, **hidden_subprocess_kwargs(), **kwargs)  # type: ignore[misc]
 
 
-def _decoder_cmd(stream_url: str, audio_filter: str | None) -> list[str]:
+def _decoder_cmd(stream_url: str) -> list[str]:
     cmd = [
         # fatal, not error: a mid-pull TLS reset is exactly what -reconnect
         # below recovers from on its own — logging it at "error" was just
         # noise on every transient CDN hiccup.
         _ffmpeg(),
         "-hide_banner",
+        # The core's own stdin is the desktop app's control pipe, and a child
+        # inherits it. Without this ffmpeg would read that pipe for its
+        # interactive keys (and answer a stray line with a help prompt).
+        "-nostdin",
         "-loglevel",
         "fatal",
         # Reconnect flags recover from a dropped/hiccuping CDN connection
@@ -164,8 +152,7 @@ def _decoder_cmd(stream_url: str, audio_filter: str | None) -> list[str]:
         "-i",
         stream_url,
     ]
-    if audio_filter:
-        cmd += ["-af", audio_filter]
+    # Songs play at their own volume: no -af chain, just PCM at the stream's rate and layout.
     return cmd + [
         "-f",
         "s16le",
@@ -177,68 +164,38 @@ def _decoder_cmd(stream_url: str, audio_filter: str | None) -> list[str]:
     ]
 
 
-async def _measure_lufs(stream_url: str, start: float, length: float) -> float | None:
-    """Integrated loudness (LUFS) of `length` seconds of the stream from
-    `start`, or None if it couldn't be measured. A cheap, short-lived ffmpeg
-    (about a fifth of a CPU-second for 20 s of audio)."""
-    cmd = [
+def _encoder_cmd(audio_bitrate_kbps: int) -> list[str]:
+    """The Opus-in-Ogg encoder: raw PCM in on stdin, an Ogg stream out on stdout."""
+    return [
         _ffmpeg(),
         "-hide_banner",
-        "-nostdin",
-        "-nostats",
-        "-vn",
-        "-ss",
-        f"{start:.2f}",
-        "-t",
-        f"{length:.2f}",
-        "-i",
-        stream_url,
-        "-af",
-        "ebur128",
+        "-loglevel",
+        "error",
         "-f",
-        "null",
+        "s16le",
+        "-ar",
+        str(AUDIO_RATE),
+        "-ac",
+        str(AUDIO_CHANNELS),
+        "-i",
+        "-",
+        # Opus over Ogg: Opus beats MP3 at the same bitrate (transparent
+        # well under half MP3's bitrate — see AUDIO_BITRATE_KBPS in
+        # .env), and Ogg is natively built for exactly this — an
+        # unbounded live stream muxed page-by-page — where MP3 only
+        # ever worked by omitting the tags/duration header it expects.
+        "-c:a",
+        "libopus",
+        "-b:a",
+        f"{audio_bitrate_kbps}k",
+        "-vbr",
+        "on",
+        "-compression_level",
+        str(_OPUS_COMPLEXITY),
+        "-f",
+        "ogg",
         "-",
     ]
-    proc: asyncio.subprocess.Process | None = None
-    try:
-        proc = await _spawn(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=_LOUDNESS_TIMEOUT_SECONDS)
-    except asyncio.CancelledError:
-        raise
-    except Exception:
-        log.debug("Loudness measurement failed.", exc_info=True)
-        return None
-    finally:
-        if proc is not None and proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.kill()
-            with contextlib.suppress(Exception):
-                await proc.wait()
-    matches = _LUFS_RE.findall(stderr.decode("utf-8", "replace"))
-    return float(matches[-1]) if matches else None
-
-
-async def _static_gain_db(stream_url: str, duration: int) -> float | None:
-    """The fixed gain that brings this track to the target loudness, from one
-    short measurement; None when it can't be worked out (unknown length,
-    silent window, ffmpeg trouble), which makes the caller fall back to the
-    dynamic filter for that track."""
-    if duration <= 0:
-        return None
-    if duration <= _LOUDNESS_WHOLE_TRACK_MAX_SECONDS:
-        start, length = 0.0, float(duration)
-    else:
-        start = duration * _LOUDNESS_WINDOW_FRACTION
-        length = min(_LOUDNESS_WINDOW_SECONDS, duration - start)
-    lufs = await _measure_lufs(stream_url, start, length)
-    if lufs is None or lufs < _LOUDNESS_FLOOR_LUFS:
-        return None
-    return max(_LOUDNESS_MIN_GAIN_DB, min(_LOUDNESS_MAX_GAIN_DB, _LOUDNESS_TARGET_LUFS - lufs))
-
-
-def _static_filter(gain_db: float) -> str:
-    # The limiter (ceiling about -1.5 dBFS) is what makes a fixed boost safe.
-    return f"volume={gain_db:.2f}dB,alimiter=limit=0.84:level=disabled"
 
 
 class TrackResolver(Protocol):
@@ -269,7 +226,7 @@ class QueuedRequest:
     on_start: Callable[[], None] | None = field(default=None, repr=False)
     # Only ever True on the resumed-track entry pause() builds — lets
     # _feed_loop start it immediately even if _pause_when_no_listeners
-    # would otherwise defer, so an explicit !resume unambiguously resumes
+    # would otherwise defer, so an explicit resume unambiguously resumes
     # rather than silently staying paused because nobody's connected yet.
     bypass_listener_pause: bool = False
 
@@ -326,13 +283,11 @@ class RadioPlayer:
         *,
         resolver: TrackResolver,
         audio_bitrate_kbps: int,
-        loudness_mode: str = "static",
         pause_when_no_listeners: bool = False,
         prefetch_enabled: bool = True,
     ) -> None:
         self._resolver = resolver
         self._audio_bitrate_kbps = audio_bitrate_kbps
-        self._loudness_mode = loudness_mode
         self._pause_when_no_listeners = pause_when_no_listeners
         # Pointless when Resolver's cache is disabled
         # (YTDLP_CACHE_TTL_SECONDS=0) — the prefetch's result would just be
@@ -341,7 +296,7 @@ class RadioPlayer:
         self._prefetch_task: asyncio.Task[None] | None = None
 
         # The one structure representing the queue's play order — also
-        # what !queue, !position and the overlay read directly. (Used to
+        # what !sq and the overlay read directly. (Used to
         # be split across this list plus a separate asyncio.Queue kept in
         # sync by convention; collapsing them removes a real class of bugs
         # from the two staying out of sync, and lets enqueue() reorder a
@@ -382,9 +337,6 @@ class RadioPlayer:
         self._subs_changed = asyncio.Event()
         # Set by anything the idle feed loop should react to at once.
         self._wake = asyncio.Event()
-        # Cleared every time a new request becomes active (see _play_one),
-        # so votes never carry over from one song to the next.
-        self._skip_votes: set[int] = set()
         # Pub-sub for "something about now-playing/queue changed" — carries
         # no payload; consumers (the admin server's /ws/nowplaying) re-fetch
         # full current state themselves.
@@ -408,7 +360,7 @@ class RadioPlayer:
         # call snaps it to now.
         self._silence_deadline: float = 0.0
 
-        # Manual mod pause (!pause/!resume) — separate from
+        # Manual pause (the desktop app's Pause/Resume) — separate from
         # _pause_when_no_listeners above, which is automatic and driven by
         # subscriber count. Only ever set by an explicit chat command.
         self._paused = False
@@ -451,7 +403,7 @@ class RadioPlayer:
         return None
 
     def queue_size(self) -> int:
-        """Requests still waiting to play — what !queue, !position and the
+        """Requests still waiting to play — what !sq and the
         overlay already read directly from the same list."""
         return len(self._pending)
 
@@ -473,12 +425,6 @@ class RadioPlayer:
         """How many times ffmpeg's encoder has been launched this run; more
         than one means it died and was restarted."""
         return self._encoder_starts
-
-    def positions_for(self, requester_id: int) -> list[int]:
-        """1-indexed queue positions, in play order, for every one of
-        requester_id's requests still waiting — empty if they have none
-        waiting (check active_requester_id for the "up now" case)."""
-        return [i + 1 for i, r in enumerate(self._pending) if r.requester_id == requester_id]
 
     def set_queue_store(self, store: JsonStore | None) -> None:
         """Persists the real (non-radio-filler) queue to disk on every
@@ -639,28 +585,10 @@ class RadioPlayer:
         await asyncio.sleep(delay)
         self._notify_state_changed()
 
-    def cancel_pending_for(self, requester_id: int) -> QueuedRequest | None:
-        for request in reversed(self._pending):
-            if request.requester_id == requester_id and not request.cancelled:
-                request.cancelled = True
-                with contextlib.suppress(ValueError):
-                    self._pending.remove(request)
-                if self._prepared is not None and self._prepared.request is request:
-                    self._discard_prepared()
-                if request.on_start is not None:
-                    with contextlib.suppress(Exception):
-                        request.on_start()
-                    request.on_start = None
-                self._notify_state_changed()
-                self._fire_and_forget(self._persist_queue(), name="persist-queue")
-                return request
-        return None
-
     def purge_pending(self, predicate: Callable[[QueuedRequest], bool]) -> list[QueuedRequest]:
         """Removes every not-yet-playing request matching predicate.
         Doesn't touch whatever's currently playing/resolving. Used by
-        !block (see components/song_requests.py) to strip a newly-blocked
-        video out of the queue immediately."""
+        the desktop app's "clear queue" command (see service.py)."""
         removed = []
         for request in list(self._pending):
             if not predicate(request):
@@ -693,11 +621,11 @@ class RadioPlayer:
         return False
 
     def pause(self) -> bool:
-        """Mod-only manual pause. Returns False if already paused.
+        """Manual pause (desktop app). Returns False if already paused.
 
         Interrupts playback/resolving immediately — deliberately doesn't
         wait for a track boundary like _pause_when_no_listeners does, since
-        a mod reaching for !pause usually means "stop it right now", not
+        pressing Pause usually means "stop it right now", not
         "in four minutes when this song ends". The interrupted request (if
         any) is preserved and replayed from the top on resume(): inserted
         straight into _pending[0], the same place any other "play this
@@ -734,23 +662,6 @@ class RadioPlayer:
         self._paused = False
         self._notify_state_changed()
         return True
-
-    def register_skip_vote(self, voter_id: int, threshold: int) -> tuple[bool, int, bool] | None:
-        """Registers one vote to skip whatever's currently active. Returns
-        (skipped, vote_count, is_new_vote), or None if nothing's active to
-        vote on. `skipped` is True if this vote reached `threshold` (votes
-        are cleared immediately in that case). `is_new_vote` is False if
-        this voter already voted for this same track."""
-        if self.active_requester_id is None:
-            return None
-        is_new = voter_id not in self._skip_votes
-        self._skip_votes.add(voter_id)
-        count = len(self._skip_votes)
-        if count >= threshold:
-            self.skip_current()
-            self._skip_votes.clear()
-            return True, count, is_new
-        return False, count, is_new
 
     async def _notify(self, message: str) -> None:
         if self._notify_failure is None:
@@ -959,36 +870,7 @@ class RadioPlayer:
         log.info("Audio encoder stopped (nobody is listening).")
 
     async def _spawn_encoder(self) -> None:
-        cmd = [
-            _ffmpeg(),
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-f",
-            "s16le",
-            "-ar",
-            str(AUDIO_RATE),
-            "-ac",
-            str(AUDIO_CHANNELS),
-            "-i",
-            "-",
-            # Opus over Ogg: Opus beats MP3 at the same bitrate (transparent
-            # well under half MP3's bitrate — see AUDIO_BITRATE_KBPS in
-            # .env), and Ogg is natively built for exactly this — an
-            # unbounded live stream muxed page-by-page — where MP3 only
-            # ever worked by omitting the tags/duration header it expects.
-            "-c:a",
-            "libopus",
-            "-b:a",
-            f"{self._audio_bitrate_kbps}k",
-            "-vbr",
-            "on",
-            "-compression_level",
-            str(_OPUS_COMPLEXITY),
-            "-f",
-            "ogg",
-            "-",
-        ]
+        cmd = _encoder_cmd(self._audio_bitrate_kbps)
         self._reset_ogg_state()
         self._encoder = await _spawn(*cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
         self._encoder_starts += 1
@@ -1144,7 +1026,6 @@ class RadioPlayer:
 
     async def _play_one(self, request: QueuedRequest) -> None:
         self._active_request = request
-        self._skip_votes.clear()
         self._notify_state_changed()
         try:
             await self._play_one_inner(request)
@@ -1207,9 +1088,6 @@ class RadioPlayer:
         track = await self._resolve_ahead(candidate)
         if track is None:
             return
-        # Measured now, in the long lead-up, so the decoder spawn at the end
-        # of it stays as quick as it always was.
-        audio_filter = await self._audio_filter_for(track)
 
         decoder_at = started_at + max(0.0, current_duration - _DECODER_PREP_LEAD_SECONDS)
         remaining = decoder_at - time.monotonic()
@@ -1217,10 +1095,10 @@ class RadioPlayer:
             await asyncio.sleep(remaining)
         # Re-check before spawning: a real request can jump ahead of
         # radio-mix filler (enqueue()) at any point while the above was
-        # sleeping/awaiting, and !remove can cancel `candidate` outright.
+        # sleeping/awaiting, and a clear-queue can cancel `candidate` outright.
         if not self._pending or self._pending[0] is not candidate or candidate.cancelled:
             return
-        prepared = await self._spawn_ahead(candidate, track, audio_filter)
+        prepared = await self._spawn_ahead(candidate, track)
         if prepared is None:
             return
         # One more re-check: the spawn itself just awaited too.
@@ -1254,31 +1132,15 @@ class RadioPlayer:
             return None
         return track
 
-    async def _audio_filter_for(self, track: Track) -> str | None:
-        """The ffmpeg -af chain that evens out this track's loudness, per
-        LOUDNESS_MODE. "static" measures a short window once and applies a
-        fixed gain (about a tenth of the CPU and memory of "dynamic"), and
-        falls back to the dynamic filter for a track it can't measure."""
-        mode = self._loudness_mode
-        if mode == "off":
-            return None
-        if mode == "static":
-            gain = await _static_gain_db(track.stream_url, track.duration)
-            if gain is not None:
-                log.debug("Loudness gain for %r: %+.1f dB", track.title, gain)
-                return _static_filter(gain)
-            log.info("Couldn't measure the loudness of %r - using dynamic normalisation for it.", track.title)
-        return _DYNAMIC_LOUDNESS_FILTER
-
-    async def _spawn_ahead(
-        self, request: QueuedRequest, track: Track, audio_filter: str | None
-    ) -> _PreparedNext | None:
+    async def _spawn_ahead(self, request: QueuedRequest, track: Track) -> _PreparedNext | None:
         """The decoder-spawn+first-chunk half — see _resolve_ahead."""
         decoder: asyncio.subprocess.Process | None = None
         try:
             try:
                 decoder = await _spawn(
-                    *_decoder_cmd(track.stream_url, audio_filter), stdout=asyncio.subprocess.PIPE
+                    *_decoder_cmd(track.stream_url),
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
                 )
             except asyncio.CancelledError:
                 raise
@@ -1422,13 +1284,10 @@ class RadioPlayer:
                 log.info("Skipped %s before it started playing (mid-resolve skip).", track.title)
                 return
 
-            audio_filter = await self._audio_filter_for(track)
-            if self._skip_pending:
-                self._skip_pending = False
-                log.info("Skipped %s while its loudness was being measured.", track.title)
-                return
             decoder = await _spawn(
-                *_decoder_cmd(track.stream_url, audio_filter), stdout=asyncio.subprocess.PIPE
+                *_decoder_cmd(track.stream_url),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
             )
             self._current_decoder = decoder
             if self._skip_pending:

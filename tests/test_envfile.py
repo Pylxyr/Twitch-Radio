@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import pytest
@@ -123,3 +124,17 @@ def test_bom_is_tolerated(tmp_path: Path) -> None:
     path.write_bytes(b"\xef\xbb\xbfA=1\n")
     envfile.update_values(path, {"B": "2"})
     assert envfile.read_values(path) == {"A": "1", "B": "2"}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_env_backup_and_file_are_owner_only(tmp_path: Path) -> None:
+    path = tmp_path / ".env"
+    envfile.update_values(path, {"TWITCH_CLIENT_SECRET": "s3cret"})
+    # A backup left world-readable by an older version is tightened too.
+    backup = tmp_path / ".env.bak"
+    backup.write_text("old", encoding="utf-8")
+    backup.chmod(0o644)
+    envfile.update_values(path, {"TWITCH_CLIENT_SECRET": "other"})
+    assert "TWITCH_CLIENT_SECRET=s3cret" in backup.read_text(encoding="utf-8")
+    assert oct(backup.stat().st_mode & 0o777) == "0o600"
+    assert oct(path.stat().st_mode & 0o777) == "0o600"

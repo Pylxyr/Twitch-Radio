@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -71,6 +72,9 @@ def ensure_home() -> None:
     template = env_template_path()
     if not ENV_PATH.exists() and template.is_file():
         shutil.copyfile(template, ENV_PATH)
+        # It will hold the Twitch client secret: owner-only where the OS has modes.
+        with contextlib.suppress(OSError):
+            ENV_PATH.chmod(0o600)
 
 
 reload_env()
@@ -205,13 +209,6 @@ class Settings:
     # regardless of listeners); opt in via PAUSE_QUEUE_WHEN_NO_LISTENERS=true.
     pause_when_no_listeners: bool
 
-    # How loudness is evened out between tracks:
-    #   "static"  (default) measure ~20 s of the track once, apply a fixed gain
-    #             plus a limiter - about a tenth of dynamic's CPU and memory;
-    #   "dynamic" ffmpeg's loudnorm filter on the whole stream (the old behaviour);
-    #   "off"     play tracks as they are.
-    loudness_mode: str
-
     # Local HTTP surface (127.0.0.1 only) - /stream.opus, /overlay, /nowplaying.json, /settings
     nowplaying_port: int
 
@@ -219,7 +216,6 @@ class Settings:
     token_path: Path
     tunables_path: Path
     toggles_path: Path
-    blocklist_path: Path
     queue_state_path: Path
 
     # yt-dlp
@@ -240,8 +236,6 @@ class Settings:
     log_to_file: bool
     log_dir: Path
 
-
-LOUDNESS_MODES = ("static", "dynamic", "off")
 
 HOST_JS_ENV = "TWITCH_RADIO_HOST_JS_EXE"
 
@@ -311,13 +305,6 @@ def load_settings() -> Settings:
     ytdlp_player_client = tuple(c.strip() for c in player_client_raw.split(",") if c.strip())
     _check_player_clients(ytdlp_player_client, cookies_configured=cookies_path is not None)
 
-    loudness_mode = os.getenv("LOUDNESS_MODE", "static").strip().lower() or "static"
-    if loudness_mode not in LOUDNESS_MODES:
-        _warn(
-            f"WARNING: LOUDNESS_MODE={loudness_mode!r} is not one of {', '.join(LOUDNESS_MODES)} - using 'static'."
-        )
-        loudness_mode = "static"
-
     return Settings(
         client_id=client_id,
         client_secret=client_secret,
@@ -327,12 +314,10 @@ def load_settings() -> Settings:
         prefix="!",
         audio_bitrate_kbps=_clamped_int_env("AUDIO_BITRATE_KBPS", 160, 64, 256),
         pause_when_no_listeners=_bool_env("PAUSE_QUEUE_WHEN_NO_LISTENERS", False),
-        loudness_mode=loudness_mode,
         nowplaying_port=_clamped_int_env("TWITCH_NOWPLAYING_PORT", 8098, 1024, 65535),
         token_path=DATA_DIR / os.getenv("TWITCH_TOKEN_FILE", "twitch_tokens.json").strip(),
         tunables_path=DATA_DIR / os.getenv("TWITCH_TUNABLES_FILE", "tunables.json").strip(),
         toggles_path=DATA_DIR / os.getenv("TWITCH_TOGGLES_FILE", "toggles.json").strip(),
-        blocklist_path=DATA_DIR / os.getenv("TWITCH_BLOCKLIST_FILE", "blocklist.json").strip(),
         queue_state_path=DATA_DIR / os.getenv("TWITCH_QUEUE_STATE_FILE", "queue_state.json").strip(),
         ytdlp_cookies_file=cookies_path,
         ytdlp_js_runtime_path=js_runtime_path,

@@ -14,7 +14,6 @@ TUNABLE_BOUNDS: dict[str, tuple[int, int]] = {
     "request_cooldown_seconds": (0, 3600),
     "queue_cap": (1, 200),
     "max_request_duration_seconds": (30, 3600),
-    "vote_skip_threshold": (2, 20),
 }
 
 
@@ -39,23 +38,18 @@ TUNABLE_LABELS: dict[str, tuple[str, str]] = {
         "Max track length",
         "Seconds. Anything longer is refused at request time and skipped if it grows past this later.",
     ),
-    "vote_skip_threshold": (
-        "Vote-skip threshold",
-        "Unique !voteskip voters needed to skip the current track.",
-    ),
 }
 
 
 @dataclass(slots=True)
 class TwitchTunables:
     """Request-limit knobs adjustable at runtime from the /settings page or
-    chat mod commands, without restarting the service."""
+    the desktop app, without restarting the service."""
 
     max_pending_per_chatter: int = 2
     request_cooldown_seconds: int = 0
     queue_cap: int = 50
     max_request_duration_seconds: int = 600
-    vote_skip_threshold: int = 3
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "TwitchTunables":
@@ -94,7 +88,6 @@ class TwitchTunables:
             max_request_duration_seconds=_field(
                 "max_request_duration_seconds", defaults.max_request_duration_seconds
             ),
-            vote_skip_threshold=_field("vote_skip_threshold", defaults.vote_skip_threshold),
         )
 
     def to_dict(self) -> dict[str, int]:
@@ -103,5 +96,4 @@ class TwitchTunables:
             "request_cooldown_seconds": self.request_cooldown_seconds,
             "queue_cap": self.queue_cap,
             "max_request_duration_seconds": self.max_request_duration_seconds,
-            "vote_skip_threshold": self.vote_skip_threshold,
         }

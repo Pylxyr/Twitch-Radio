@@ -12,18 +12,20 @@ software, it is included in the installed app folder or at the link given.
 Bundled programs
 ----------------
 
-ffmpeg - GNU GPL (v3 or later)
-    The "essentials" Windows build from gyan.dev, configured with --enable-gpl
-    and --enable-version3. It runs as a separate program (ffmpeg.exe) that the
-    bot starts to decode audio and encode Opus. Licence text: FFMPEG-LICENSE.txt
-    in the bin folder next to it. Source code and details: https://ffmpeg.org/
-    and https://www.gyan.dev/ffmpeg/builds/ - the exact source for a build is
-    available from those sites on request. https://ffmpeg.org/legal.html
-    The Linux builds bundle a static GPL v3 ffmpeg (version 7.0.2) from
-    johnvansickle.com/ffmpeg, redistributed through
-    https://github.com/eugeneware/ffmpeg-static (tag b6.1.1), also with
-    --enable-gpl and --enable-version3; its licence is FFMPEG-LICENSE.txt next
-    to it.
+ffmpeg - GNU LGPL (v2.1 or later on Windows, v3 or later on Linux)
+    A small ffmpeg built for this app from the unmodified FFmpeg 9.0.2 source
+    (https://ffmpeg.org/, tag n9.0.2), with only what the app uses: it decodes
+    the audio YouTube serves and encodes Opus in Ogg. It is not a GPL build:
+    no GPL or non-free components are included. It runs as a separate program
+    (ffmpeg.exe, or ffmpeg on Linux) that the bot starts, so it can be replaced
+    with any other ffmpeg that has libopus. Licence text: FFMPEG-LICENSE.txt in
+    the bin folder next to it. The complete, exact recipe (source URLs and
+    SHA-256 checksums, configure options, build script) is in this project:
+    packaging/tools.lock.json and packaging/ffmpeg/build.sh. https://ffmpeg.org/legal.html
+    Built in: libopus 1.6.1 (BSD-3-Clause, https://opus-codec.org/); on Windows
+    TLS comes from the operating system (Schannel); on Linux OpenSSL
+    (Apache-2.0, https://www.openssl.org/) is linked in statically, which is why
+    that build is LGPL v3.
 
 Python application core (frozen with PyInstaller)
 -------------------------------------------------
@@ -35,16 +37,12 @@ yt-dlp - Unlicense                         https://github.com/yt-dlp/yt-dlp
 twitchio - MIT                             https://github.com/PythonistaGuild/TwitchIO
 aiohttp - Apache-2.0                       https://github.com/aio-libs/aiohttp
 python-dotenv - BSD-3-Clause               https://github.com/theskumar/python-dotenv
-curl_cffi - MIT                            https://github.com/lexiforest/curl_cffi
-Brotli - MIT                               https://github.com/google/brotli
 certifi - MPL-2.0                          https://github.com/certifi/python-certifi
-mutagen - GPL-2.0-or-later                 https://github.com/quodlibet/mutagen
-pycryptodomex - BSD-2-Clause / public domain   https://github.com/Legrandin/pycryptodome
 requests - Apache-2.0                      https://github.com/psf/requests
 urllib3 - MIT                              https://github.com/urllib3/urllib3
-websockets - BSD-3-Clause                  https://github.com/python-websockets/websockets
-Their own dependencies (for example aiohttp's and curl_cffi's) are installed
-with them and carry their own licences.
+Their own dependencies (for example aiohttp's) are installed with them and carry
+their own licences. yt-dlp's optional extras (curl_cffi, Brotli, mutagen,
+pycryptodomex, websockets) are not part of this app.
 
 Desktop shell
 -------------

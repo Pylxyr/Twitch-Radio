@@ -95,16 +95,13 @@ The port can be changed in **Settings > Network** if `8098` is taken.
 
 | Command | Who | What it does |
 |---|---|---|
-| `!sr <song or link>` (`!songrequest`) | Everyone | Queue a YouTube song or search by name |
-| `!queue` | Everyone | Show what's coming up |
-| `!position` (`!pos`) | Everyone | Where your own request is in the queue |
-| `!remove` (`!cancel`, `!unqueue`) | Everyone | Remove your own queued request |
-| `!nowplaying` (`!np`) | Everyone | What's playing now |
-| `!voteskip` (`!vs`) | Everyone | Vote to skip; needs a few unique voters |
-| `!skip` | Mods, or whoever requested the current song | Skip the current song |
-| `!radio` | Everyone to check, mods to change (`!radio on` / `!radio off`) | Auto-radio: when the queue runs dry, queue a related song instead of going quiet |
-| `!pause`, `!resume` | Mods | Pause or resume playback |
-| `!block`, `!unblock`, `!blocklist` | Mods | Keep a video out of the radio |
+| `!sr <song or link>` | Everyone | Queue a YouTube song or search by name |
+| `!sq` (`!songqueue`) | Everyone | Show what's coming up. It is not `!queue`, so it doesn't clash with another bot that uses that name |
+| `!skip` | Mods, the broadcaster, or whoever requested the current song | Skip the current song |
+| `!radio` | Everyone to check; only the broadcaster can change it (`!radio on` / `!radio off`) | Auto-radio: when the queue runs dry, queue a related song instead of going quiet |
+
+Nothing else is registered, so other bots in your channel keep every other `!command`. Pausing,
+resuming and clearing the queue are buttons in the desktop app.
 
 ---
 
@@ -116,14 +113,13 @@ option is documented in [`.env.example`](.env.example)) or use the web page at
 
 **Limits that apply immediately, with no restart** (Settings > Live limits, or the web page):
 maximum pending requests per viewer, request cooldown, queue size cap, maximum track length,
-vote-skip threshold, and auto-radio on/off.
+and auto-radio on/off.
 
 **Settings that need a restart**
 
 | Setting | Default | What it does |
 |---|---|---|
 | Audio bitrate | `160` kbps | Opus quality of the stream sent to OBS. 160 is already transparent for nearly everything. |
-| Volume levelling (`LOUDNESS_MODE`) | `static` | `static`: each song is measured once and given a fixed gain plus a limiter (lightest on CPU and memory, typically within 1 dB of dynamic). `dynamic`: ffmpeg's `loudnorm` filter on the whole stream (most exact, about ten times the CPU). `off`: songs play at their own volume. A song that can't be measured falls back to dynamic. |
 | Pause when nobody is listening | off | Hold the queue while OBS isn't connected, so songs don't quietly play through while you're offline. |
 | Port | `8098` | The local web server's port. |
 | Parallel lookups | `2` | The most YouTube lookups that may run at once. |
@@ -187,12 +183,12 @@ To build the installer yourself, see [BUILD.md](BUILD.md).
 | | Desktop app | From source |
 |---|---|---|
 | Settings (`.env`) | `%APPDATA%\TwitchRadio\.env` | `.env` in the project folder |
-| Tokens, queue, limits, block list, yt-dlp cache | `%APPDATA%\TwitchRadio\data\` | `data\` in the project folder |
+| Tokens, queue, limits, yt-dlp cache | `%APPDATA%\TwitchRadio\data\` | `data\` in the project folder |
 | Logs | `%APPDATA%\TwitchRadio\logs\` | `logs\` in the project folder |
 | Window preferences | `%APPDATA%\TwitchRadio\gui\` | same |
 
-Settings > This app has buttons that open the data and log folders and show the `.env` file. Uninstalling the app leaves them in place
-so a reinstall keeps your setup; delete the folder to remove everything. The Twitch tokens in
+Settings > This app has buttons that open the data and log folders and show the `.env` file. Uninstalling the app leaves them in place by default, so a reinstall keeps your setup; the
+uninstaller asks whether to delete them too (default: no). The Twitch tokens in
 `data\twitch_tokens.json` grant access to your bot account, so treat that file like a password.
 
 ---
@@ -248,7 +244,7 @@ The player tests run the real pipeline against a local HTTP server and need `ffm
 (they are skipped without it).
 
 `scripts/probe.py` measures a running install (CPU and memory of the whole process tree, ffmpeg
-cost on your machine, yt-dlp timings, loudness accuracy) without changing anything. It needs
+cost on your machine, yt-dlp timings) without changing anything. It needs
 `pip install psutil` (the bot itself does not): `python scripts/probe.py --help`.
 
 See [BUILD.md](BUILD.md) for building the installer, the CI workflows, cutting a release, and how

@@ -186,23 +186,13 @@ def test_solver_hint_is_silent_when_the_solver_is_ready(
     assert not caplog.records
 
 
-def test_loudness_mode_defaults_to_static(settings: config.Settings) -> None:
-    assert settings.loudness_mode == "static"
-
-
-@pytest.mark.parametrize("raw,expected", [("dynamic", "dynamic"), (" OFF ", "off"), ("Static", "static")])
-def test_loudness_mode_accepts_the_three_modes(
-    monkeypatch: pytest.MonkeyPatch, settings: config.Settings, raw: str, expected: str
-) -> None:
-    monkeypatch.setenv("LOUDNESS_MODE", raw)
-    assert config.load_settings().loudness_mode == expected
-
-
-def test_unknown_loudness_mode_falls_back_to_static(
+def test_old_loudness_setting_in_the_environment_is_ignored(
     monkeypatch: pytest.MonkeyPatch, settings: config.Settings
 ) -> None:
-    monkeypatch.setenv("LOUDNESS_MODE", "loud")
-    assert config.load_settings().loudness_mode == "static"
+    """Loudness levelling is gone; an .env that still has LOUDNESS_MODE must load fine."""
+    monkeypatch.setenv("LOUDNESS_MODE", "dynamic")
+    loaded = config.load_settings()
+    assert not hasattr(loaded, "loudness_mode")
 
 
 def test_worker_idle_seconds_default_and_clamp(

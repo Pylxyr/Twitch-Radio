@@ -50,7 +50,6 @@ from twitchio import eventsub
 from twitchio.exceptions import TwitchioException
 from twitchio.ext import commands
 
-from twitch_radio.blocklist import BlockList
 from twitch_radio.components.song_requests import SongRequestComponent
 from twitch_radio.components.song_requests import USAGE as _USAGE
 from twitch_radio.player import RadioPlayer
@@ -75,7 +74,7 @@ _DEDUP_SUFFIXES = (" \U0001f3b5", " \U0001f3b6", " \U0001f3a7", " \U0001f50a")
 # Twitch's hard limit on a single chat message. PartialUser.send_message
 # raises a plain ValueError above it — not a TwitchioException, so it sails
 # past safe_reply's delivery-failure handling unless caught explicitly.
-# Reachable without trying: a long !queue reply with several long titles.
+# Reachable without trying: a long !sq reply with several long titles.
 _MAX_CHAT_MESSAGE_LENGTH = 500
 
 
@@ -92,7 +91,6 @@ class TwitchChatBot(commands.Bot):
         player: RadioPlayer,
         tunables_store: JsonStore,
         toggles_store: JsonStore,
-        blocklist: BlockList,
         token_storage_path: Path,
     ) -> None:
         super().__init__(
@@ -106,7 +104,6 @@ class TwitchChatBot(commands.Bot):
         self.player = player
         self.tunables_store = tunables_store
         self.toggles_store = toggles_store
-        self.blocklist = blocklist
         self.prefix = prefix
         self._owner_id = owner_id
         self._bot_id = bot_id

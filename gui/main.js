@@ -12,7 +12,7 @@ const path = require('path');
 const fs = require('fs');
 const readline = require('readline');
 const { spawn, execFile } = require('child_process');
-const { checkForAppUpdate, shouldAutoCheck } = require('./updates');
+const { checkForAppUpdate, shouldAutoCheck, shouldAutoCheckYtdlp } = require('./updates');
 
 const IS_WIN = process.platform === 'win32';
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -35,8 +35,9 @@ const DEFAULT_PREFS = {
   checkAppUpdates: true, // at most once a day
   checkYtdlpOnStartup: true,
   lastUpdateCheck: 0, // set by the app itself, not by the page
+  lastYtdlpCheck: 0, // likewise
 };
-const PAGE_PREFS = new Set(Object.keys(DEFAULT_PREFS).filter((key) => key !== 'lastUpdateCheck'));
+const PAGE_PREFS = new Set(Object.keys(DEFAULT_PREFS).filter((key) => key !== 'lastUpdateCheck' && key !== 'lastYtdlpCheck'));
 const prefsFile = () => path.join(app.getPath('userData'), 'gui-settings.json');
 let prefs = { ...DEFAULT_PREFS };
 function loadPrefs() {
@@ -381,7 +382,7 @@ function updateWatching(force = false) {
 // ------------------------------------------------------- configuration ---
 const ENV_KEYS = new Set([
   'TWITCH_CLIENT_ID', 'TWITCH_CLIENT_SECRET', 'TWITCH_BOT_ID', 'TWITCH_OWNER_ID',
-  'AUDIO_BITRATE_KBPS', 'LOUDNESS_MODE', 'PAUSE_QUEUE_WHEN_NO_LISTENERS', 'TWITCH_NOWPLAYING_PORT',
+  'AUDIO_BITRATE_KBPS', 'PAUSE_QUEUE_WHEN_NO_LISTENERS', 'TWITCH_NOWPLAYING_PORT',
   'YTDLP_COOKIES_FILE', 'YTDLP_CONCURRENCY', 'YTDLP_WORKER_IDLE_SECONDS', 'YTDLP_EXTRACT_TIMEOUT_SECONDS',
   'YTDLP_CACHE_TTL_SECONDS',
   'LOG_LEVEL', 'LOG_TO_FILE',
@@ -559,7 +560,10 @@ function scheduleStartupChecks() {
       savePrefs();
       await checkAppUpdateNow();
     }
-    if (prefs.checkYtdlpOnStartup) {
+    // Like the app check, at most once a day: every check starts a core process and asks GitHub.
+    if (shouldAutoCheckYtdlp(prefs)) {
+      prefs.lastYtdlpCheck = Date.now();
+      savePrefs();
       const report = await ytdlpCheck();
       if (report.ok && report.update_available) guiLog('INFO', `A newer yt-dlp (${report.latest}) is available. Settings > App can install it.`);
     }
@@ -791,7 +795,10 @@ function registerIpc() {
     });
     if (canceled || !filePaths.length) return null;
     fs.mkdirSync(path.join(HOME, 'data'), { recursive: true });
-    fs.copyFileSync(filePaths[0], path.join(HOME, 'data', 'cookies.txt'));
+    const cookiesFile = path.join(HOME, 'data', 'cookies.txt');
+    fs.copyFileSync(filePaths[0], cookiesFile);
+    // Session cookies are as good as a password: owner-only where the OS has file modes.
+    if (!IS_WIN) fs.chmodSync(cookiesFile, 0o600);
     guiLog('INFO', 'Imported cookies.txt into the data folder.');
     return 'data/cookies.txt';
   });

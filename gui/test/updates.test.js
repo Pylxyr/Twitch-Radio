@@ -1,7 +1,7 @@
 'use strict';
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { compareVersions, shouldAutoCheck, checkForAppUpdate, DAY_MS } = require('../updates');
+const { compareVersions, shouldAutoCheck, shouldAutoCheckYtdlp, checkForAppUpdate, DAY_MS } = require('../updates');
 
 test('compareVersions orders releases and pre-releases', () => {
   assert.equal(compareVersions('v1.1.0', '1.0.9'), 1);
@@ -20,6 +20,16 @@ test('shouldAutoCheck allows one check per day and honours the pref', () => {
   assert.equal(shouldAutoCheck({ checkAppUpdates: true, lastUpdateCheck: now - 1000 }, now), false);
   assert.equal(shouldAutoCheck({ checkAppUpdates: true, lastUpdateCheck: now - DAY_MS }, now), true);
   assert.equal(shouldAutoCheck({ checkAppUpdates: true, lastUpdateCheck: now + 5000 }, now), true);
+});
+
+test('shouldAutoCheckYtdlp is also at most daily and honours its own pref', () => {
+  const now = 10 * DAY_MS;
+  assert.equal(shouldAutoCheckYtdlp({ checkYtdlpOnStartup: false, lastYtdlpCheck: 0 }, now), false);
+  assert.equal(shouldAutoCheckYtdlp({ checkYtdlpOnStartup: true, lastYtdlpCheck: 0 }, now), true);
+  assert.equal(shouldAutoCheckYtdlp({ checkYtdlpOnStartup: true, lastYtdlpCheck: now - 1000 }, now), false);
+  assert.equal(shouldAutoCheckYtdlp({ checkYtdlpOnStartup: true, lastYtdlpCheck: now - DAY_MS }, now), true);
+  // The two daily checks do not share a clock.
+  assert.equal(shouldAutoCheckYtdlp({ checkYtdlpOnStartup: true, lastUpdateCheck: now, lastYtdlpCheck: 0 }, now), true);
 });
 
 const reply = (status, body) => async () => ({ status, ok: status >= 200 && status < 300, json: async () => body });

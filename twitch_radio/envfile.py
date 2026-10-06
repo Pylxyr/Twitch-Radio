@@ -56,6 +56,18 @@ def _atomic_write(path: Path, text: str) -> None:
         raise
 
 
+def _write_private(path: Path, text: str) -> None:
+    """Writes `text` to a file only the owner can read (the .env holds the Twitch
+    client secret, and so does its backup). The mode applies when the file is
+    created, so it is also set explicitly for a backup left by an older version.
+    Windows ignores POSIX modes; there the user profile's own ACLs apply."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+        handle.write(text)
+    with contextlib.suppress(OSError):
+        os.chmod(path, 0o600)
+
+
 def update_values(path: Path, updates: dict[str, str]) -> None:
     """Sets each key, in place if the file already assigns it, else appended.
 
@@ -106,5 +118,5 @@ def update_values(path: Path, updates: dict[str, str]) -> None:
     text = newline.join(lines) + newline
     if path.is_file():
         with contextlib.suppress(OSError):
-            path.with_name(path.name + ".bak").write_text(original, encoding="utf-8", newline="")
+            _write_private(path.with_name(path.name + ".bak"), original)
     _atomic_write(path, text)

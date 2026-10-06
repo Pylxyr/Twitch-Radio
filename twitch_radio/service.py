@@ -28,7 +28,6 @@ from typing import Any
 import aiohttp
 
 from twitch_radio.admin.app import run_admin_server
-from twitch_radio.blocklist import BlockList
 from twitch_radio.chatbot import TwitchChatBot
 from twitch_radio.config import Settings, token_status
 from twitch_radio.extraction import Resolver
@@ -220,16 +219,14 @@ class BotRuntime:
         self._resolver = Resolver(s)
         self._tunables_store = JsonStore(s.tunables_path)
         self._toggles_store = JsonStore(s.toggles_path)
-        blocklist = BlockList(JsonStore(s.blocklist_path))
 
         player = self._player = RadioPlayer(
             resolver=self._resolver.resolve,
             audio_bitrate_kbps=s.audio_bitrate_kbps,
-            loudness_mode=s.loudness_mode,
             pause_when_no_listeners=s.pause_when_no_listeners,
             prefetch_enabled=s.ytdlp_cache_ttl_seconds > 0,
         )
-        suggester = RadioSuggester(self._resolver, blocklist)
+        suggester = RadioSuggester(self._resolver)
         player.set_radio_suggester(suggester.suggest)
         player.set_radio_played_notifier(suggester.note_played)
 
@@ -299,7 +296,6 @@ class BotRuntime:
             player=player,
             tunables_store=tunables_store,
             toggles_store=toggles_store,
-            blocklist=blocklist,
             token_storage_path=s.token_path,
         )
         bot.on_ready_callback = self._on_bot_ready

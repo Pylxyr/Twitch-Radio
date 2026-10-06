@@ -91,9 +91,44 @@ def bundled_tool_path(name: str) -> Path | None:
     return None
 
 
+# Where Linux distributions keep the system's trusted root certificates (one PEM bundle).
+_SYSTEM_CA_BUNDLES = (
+    "/etc/ssl/certs/ca-certificates.crt",  # Debian, Ubuntu, Arch, Alpine, Gentoo
+    "/etc/pki/tls/certs/ca-bundle.crt",  # Fedora, RHEL
+    "/etc/ssl/ca-bundle.pem",  # openSUSE
+    "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",  # Fedora, RHEL (extracted)
+    "/etc/ssl/cert.pem",  # Alpine, macOS-style
+)
+
+
+def point_tls_at_system_certificates() -> str | None:
+    """Linux only: tells the bundled ffmpeg where this machine's trusted root
+    certificates are, through SSL_CERT_FILE, and returns the file used.
+
+    The bundled ffmpeg has OpenSSL linked in and checks the certificate of every
+    HTTPS stream it opens. OpenSSL looks for roots in a folder fixed when it was
+    built (the build machine's, /usr/lib/ssl), which does not exist on every
+    distribution - on Arch, say, every stream would fail to verify. Setting
+    SSL_CERT_FILE (which OpenSSL honours) fixes that without turning checking
+    off. Left alone when the user already set SSL_CERT_FILE or SSL_CERT_DIR, and a
+    no-op off Linux (Windows' ffmpeg uses the Windows certificate store)."""
+    if not sys.platform.startswith("linux"):
+        return None
+    if os.environ.get("SSL_CERT_FILE") or os.environ.get("SSL_CERT_DIR"):
+        return None
+    for candidate in _SYSTEM_CA_BUNDLES:
+        if os.path.isfile(candidate):
+            os.environ["SSL_CERT_FILE"] = candidate
+            return candidate
+    return None
+
+
 def prepend_bundled_bins_to_path() -> list[Path]:
-    """Puts bundled tool folders at the front of PATH for this process and
-    every child it spawns (ffmpeg, yt-dlp's deno lookup). Idempotent."""
+    """Prepares the environment for the bundled tools: puts their folders at the
+    front of PATH for this process and every child it spawns (ffmpeg, yt-dlp's
+    deno lookup), and on Linux points TLS at the system certificates (see
+    point_tls_at_system_certificates). Idempotent."""
+    point_tls_at_system_certificates()
     dirs = bin_dirs()
     if not dirs:
         return []

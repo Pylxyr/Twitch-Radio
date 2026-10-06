@@ -15,6 +15,7 @@ from aiohttp import web
 
 from twitch_radio.admin.assets import preload_static, read_logo
 from twitch_radio.admin.context import CTX_KEY, AdminContext
+from twitch_radio.admin.handlers.auth import origin_ok
 from twitch_radio.admin.handlers import live, media
 from twitch_radio.admin.handlers import settings as settings_handlers
 from twitch_radio.admin.security import host_allowed
@@ -29,6 +30,13 @@ _SHUTDOWN_GRACE_SECONDS = 2.0
 
 # The only address the server ever listens on.
 BIND_HOST = "127.0.0.1"
+
+# Routes a web page open in the streamer's browser could otherwise use from
+# another site: the live-state socket (queue and requester names) and the audio
+# stream (a connection starts the Opus encoder, which costs CPU). OBS and curl
+# send no Origin / Sec-Fetch-Site, so they pass; a browser always labels a
+# cross-site request, and origin_ok() refuses it.
+_SAME_ORIGIN_ONLY = frozenset({"/ws/nowplaying", "/stream.opus"})
 
 _ROUTES: tuple[tuple[str, str, _Handler], ...] = (
     ("GET", "/nowplaying.json", live.handle_nowplaying),
@@ -50,6 +58,8 @@ def _host_guard(port: int) -> Callable[..., Awaitable[web.StreamResponse]]:
             # 421 Misdirected Request: the request reached us under a name we
             # don't serve. A browser tab on another site (DNS rebinding) lands here.
             return web.Response(status=421, text="This server only answers on 127.0.0.1 / localhost.")
+        if request.path in _SAME_ORIGIN_ONLY and not origin_ok(request):
+            return web.Response(status=403, text="Cross-site requests are not allowed here.")
         response = await handler(request)
         response.headers.setdefault("X-Content-Type-Options", "nosniff")
         return response

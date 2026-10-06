@@ -308,7 +308,6 @@ def _check_config() -> int:
         f"  Audio: {settings.audio_bitrate_kbps} kbps, pause_when_no_listeners={settings.pause_when_no_listeners}"
     )
     print(f"  Local server: http://127.0.0.1:{settings.nowplaying_port} (this PC only)")
-    print(f"  Loudness: {settings.loudness_mode}")
     token_status = "found" if settings.token_path.exists() else "missing - run OAuth setup before starting"
     print(f"  Token file: {settings.token_path} ({token_status})")
     print(

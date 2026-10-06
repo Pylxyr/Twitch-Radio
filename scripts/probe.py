@@ -10,7 +10,6 @@ Run from the repo root, for example:
     python scripts/probe.py tree --match "bot.py" --seconds 180
     python scripts/probe.py tree --match "Twitch Radio" --seconds 180   # the desktop app
     python scripts/probe.py resolve --url URL --query "artist song"
-    python scripts/probe.py loudness URL1 URL2 URL3
 """
 
 from __future__ import annotations
@@ -103,15 +102,7 @@ def cmd_env(a) -> None:
     print("ffmpeg       :", shutil.which("ffmpeg"), "|", first_line(["ffmpeg", "-version"]))
     if shutil.which("ffmpeg"):
         enc = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
-        flt = subprocess.run(["ffmpeg", "-hide_banner", "-filters"], capture_output=True, text=True).stdout
-        print(
-            "  libopus    :",
-            "libopus" in enc,
-            "| loudnorm:",
-            "loudnorm" in flt,
-            "| alimiter:",
-            "alimiter" in flt,
-        )
+        print("  libopus    :", "libopus" in enc)
     for tool in ("deno", "node", "git"):
         print(
             f"{tool:13s}:",
@@ -285,16 +276,8 @@ def cmd_audio(a) -> None:
             ]
 
         rows = [
-            ("DECODE loudnorm (current)", dec("loudnorm=I=-16:TP=-1.5:LRA=11"), None),
-            ("DECODE loudnorm + -threads 1", dec("loudnorm=I=-16:TP=-1.5:LRA=11", True), None),
-            ("DECODE no filter", dec(""), None),
-            ("DECODE volume=-3dB", dec("volume=-3dB"), None),
-            ("DECODE volume + alimiter", dec("volume=-3dB,alimiter=limit=0.84:level=disabled"), None),
-            (
-                "DECODE volume + alimiter + -threads 1",
-                dec("volume=-3dB,alimiter=limit=0.84:level=disabled", True),
-                None,
-            ),
+            ("DECODE (what the app does)", dec(""), None),
+            ("DECODE + -threads 1", dec("", True), None),
             ("ENCODE music   160k (current, level 10)", enc([]), music),
             ("ENCODE silence 160k (idle, 24/7)", enc([]), silence),
             ("ENCODE music   160k level 5", enc(["-compression_level", "5"]), music),
@@ -529,145 +512,6 @@ def cmd_resolve(a) -> None:
     shutil.rmtree(cache, ignore_errors=True)
 
 
-# --------------------------------------------------------------------------- loudness
-LUFS_RE = re.compile(r"I:\s+(-?\d+(?:\.\d+)?)\s+LUFS")
-
-
-def lufs(src: str, ss=None, t=None, timeout=90):
-    """Integrated loudness of src (or a window of it). Returns (LUFS or None, wall seconds)."""
-    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-nostats", "-vn"]
-    if ss is not None:
-        cmd += ["-ss", f"{ss:.2f}"]
-    if t is not None:
-        cmd += ["-t", f"{t:.2f}"]
-    cmd += ["-i", src, "-af", "ebur128", "-f", "null", "-"]
-    t0 = time.perf_counter()
-    try:
-        r = subprocess.run(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-        )
-        err = r.stderr or ""
-    except subprocess.TimeoutExpired:
-        return None, time.perf_counter() - t0
-    m = LUFS_RE.findall(err)
-    return (float(m[-1]) if m else None), time.perf_counter() - t0
-
-
-def resolve_media(arg: str):
-    if not re.match(r"https?://(www\.|m\.)?(youtube\.com|youtu\.be)", arg):
-        return arg, None, arg
-    import yt_dlp  # noqa: PLC0415
-
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "format": "bestaudio/best",
-        "allowed_extractors": ["youtube(:.*)?"],
-        "js_runtimes": {"quickjs": {}},
-        "extractor_args": {"youtube": {"player_client": ["visionos"]}},
-        "cachedir": tempfile.gettempdir() + "/trprobe_yt",
-    }
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(arg, download=False)
-    except Exception:  # noqa: BLE001  fall back to default clients + JS
-        opts.pop("extractor_args")
-        opts["js_runtimes"] = {"deno": {}}
-        opts["remote_components"] = ["ejs:github"]
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(arg, download=False)
-    if info.get("is_live"):
-        raise RuntimeError("live stream, skipped")
-    return info["url"], info.get("duration"), info.get("title") or arg
-
-
-def power_mean(vals):
-    vals = [v for v in vals if v is not None]
-    if not vals:
-        return None
-    import math
-
-    return 10 * math.log10(sum(10 ** (v / 10) for v in vals) / len(vals))
-
-
-def cmd_loudness(a) -> None:
-    need_ffmpeg()
-    print(
-        "Compares loudness of a SHORT window vs the WHOLE track (error = window - full; +/- dB is the gain mistake a static gain would make)"
-    )
-    print(
-        f"Tracks longer than {a.max_minutes} min or shorter than 60 s are skipped; each ffmpeg call times out after {a.timeout}s.\n"
-    )
-    print(
-        f"{'track':34s} {'dur':>5s} {'FULL LUFS':>9s} | {'mid 20s':>8s} {'err':>5s} {'wall':>5s} | {'25%+60% x15s':>12s} {'err':>5s} | {'first 25s':>9s} {'err':>5s}"
-    )
-    errs = {"mid": [], "two": [], "start": []}
-    for target in a.targets:
-        is_url = re.match(r"https?://", target) is not None
-        if not is_url and not os.path.exists(target):
-            print(
-                f"{target[:34]:34s} SKIPPED: not a URL and not an existing file (did you paste the real link?)"
-            )
-            continue
-        try:
-            media, dur, title = resolve_media(target)
-        except Exception as exc:  # noqa: BLE001
-            print(f"{target[-34:]:34s} SKIPPED: {re.sub(chr(10), ' ', str(exc))[:90]}")
-            continue
-        if dur is None:
-            r = subprocess.run(
-                ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", media],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            try:
-                dur = float(r.stdout.strip())
-            except ValueError:
-                print(f"{str(title)[:34]:34s} SKIPPED: could not read duration")
-                continue
-        if dur < 60 or dur > a.max_minutes * 60:
-            print(
-                f"{str(title)[:34]:34s} {dur:5.0f} SKIPPED: length outside the 1 to {a.max_minutes} minute test range"
-            )
-            continue
-        full, _ = lufs(media, timeout=a.timeout)
-        if full is None:
-            print(f"{str(title)[:34]:34s} {dur:5.0f} SKIPPED: full-track measurement failed or timed out")
-            continue
-        mid, wall = lufs(media, dur * 0.40, 20, a.timeout)
-        w1, _ = lufs(media, dur * 0.25, 15, a.timeout)
-        w2, _ = lufs(media, dur * 0.60, 15, a.timeout)
-        two = power_mean([w1, w2])
-        st, _ = lufs(media, 0, 25, a.timeout)
-
-        def e(v):
-            return None if v is None else v - full
-
-        def f(v, w=8):
-            return f"{v:{w}.1f}" if v is not None else " " * (w - 3) + "n/a"
-
-        for k, v in (("mid", e(mid)), ("two", e(two)), ("start", e(st))):
-            if v is not None:
-                errs[k].append(v)
-        print(
-            f"{str(title)[:34]:34s} {dur:5.0f} {f(full, 9)} | {f(mid)} {f(e(mid), 5)} {wall:5.1f} | {f(two, 12)} {f(e(two), 5)} | {f(st, 9)} {f(e(st), 5)}",
-            flush=True,
-        )
-    print()
-    for k, label in (("mid", "mid 20s window"), ("two", "two 15s windows"), ("start", "first 25s")):
-        if errs[k]:
-            print(
-                f"{label:16s}: mean abs error {statistics.mean(abs(x) for x in errs[k]):.2f} dB, worst {max(errs[k], key=abs):+.2f} dB over {len(errs[k])} tracks"
-            )
-
-
 # --------------------------------------------------------------------------- main
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -697,14 +541,6 @@ def main() -> None:
     s.add_argument("--runs", type=int, default=2)
     s.add_argument("--js-runtime", default="deno")
     s.set_defaults(fn=cmd_resolve)
-
-    s = sub.add_parser(
-        "loudness", help="validate the short-window loudness idea on real tracks (needs internet)"
-    )
-    s.add_argument("targets", nargs="+", help="YouTube URLs or local audio files")
-    s.add_argument("--timeout", type=int, default=90, help="seconds allowed per ffmpeg call")
-    s.add_argument("--max-minutes", type=int, default=12, help="skip tracks longer than this")
-    s.set_defaults(fn=cmd_loudness)
 
     args = ap.parse_args()
     args.fn(args)

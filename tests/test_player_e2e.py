@@ -8,6 +8,7 @@ inputs). Skipped when ffmpeg isn't installed.
 from __future__ import annotations
 
 import asyncio
+import os
 import shutil
 import subprocess
 from collections.abc import Awaitable, Callable
@@ -25,10 +26,16 @@ from twitch_radio.player import QueuedRequest, RadioPlayer
 pytestmark = pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
 
 
+# Test audio is made with a full ffmpeg (lavfi sources, amix); the player under test can be run against
+# the small shipped build instead by putting that build first on PATH and pointing this at the full one:
+#   FIXTURE_FFMPEG=/usr/bin/ffmpeg PATH=packaging/bin:$PATH pytest tests/test_player_e2e.py
+FIXTURE_FFMPEG = os.environ.get("FIXTURE_FFMPEG", "ffmpeg")
+
+
 def make_audio(path: Path, seconds: float, volume_db: float = 0.0) -> None:
     subprocess.run(
         [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-nostdin",
+            FIXTURE_FFMPEG, "-hide_banner", "-loglevel", "error", "-y", "-nostdin",
             "-f", "lavfi", "-i", f"sine=f=440:d={seconds}:r=48000",
             "-f", "lavfi", "-i", f"anoisesrc=d={seconds}:c=pink:r=48000:a=0.1",
             "-filter_complex", f"[0][1]amix=inputs=2:normalize=0,volume={volume_db}dB,aformat=channel_layouts=stereo",
@@ -96,7 +103,7 @@ def test_queue_advances_and_encoder_stays_off_with_nobody_listening(tmp_path: Pa
     async def scenario() -> None:
         async with Env(tmp_path) as env:
             tracks = {"a.webm": env.track("a.webm", 2), "b.webm": env.track("b.webm", 2)}
-            player = env.player(tracks, loudness_mode="off")
+            player = env.player(tracks)
             player.start()
             try:
                 player.enqueue(request("a.webm"))
@@ -118,7 +125,7 @@ def test_listener_starts_encoder_and_gets_a_decodable_stream(tmp_path: Path) -> 
 
     async def scenario() -> None:
         async with Env(tmp_path) as env:
-            player = env.player({"a.webm": env.track("a.webm", 6)}, loudness_mode="off")
+            player = env.player({"a.webm": env.track("a.webm", 6)})
             player.start()
             try:
                 queue = player.subscribe()
@@ -143,7 +150,7 @@ def test_listener_starts_encoder_and_gets_a_decodable_stream(tmp_path: Path) -> 
             finally:
                 await player.stop()
             decode = subprocess.run(
-                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-i", "pipe:0", "-f", "null", "-"],
+                [FIXTURE_FFMPEG, "-hide_banner", "-loglevel", "error", "-nostdin", "-i", "pipe:0", "-f", "null", "-"],
                 input=bytes(received), capture_output=True,
             )  # fmt: skip
             assert decode.returncode == 0, decode.stderr.decode(errors="replace")
@@ -158,7 +165,7 @@ def test_listener_joining_during_header_capture_still_sees_the_first_byte(tmp_pa
 
     async def scenario() -> None:
         async with Env(tmp_path) as env:
-            player = env.player({"a.webm": env.track("a.webm", 4)}, loudness_mode="off")
+            player = env.player({"a.webm": env.track("a.webm", 4)})
             player.start()
             try:
                 first = player.subscribe()
@@ -187,7 +194,7 @@ def test_encoder_stops_after_the_last_listener_leaves(
 
     async def scenario() -> None:
         async with Env(tmp_path) as env:
-            player = env.player({}, loudness_mode="off")
+            player = env.player({})
             player.start()
             try:
                 queue = player.subscribe()
@@ -206,69 +213,9 @@ def test_encoder_stops_after_the_last_listener_leaves(
     run(scenario())
 
 
-def test_static_loudness_brings_quiet_and_loud_tracks_close(tmp_path: Path) -> None:
-    make_audio(tmp_path / "quiet.webm", 30, volume_db=-24)
-    make_audio(tmp_path / "loud.webm", 30, volume_db=3)
-
-    async def scenario() -> tuple[float, float]:
-        async with Env(tmp_path) as env:
-            gains = []
-            for name in ("quiet.webm", "loud.webm"):
-                gain = await player_mod._static_gain_db(env.url(name), 30)
-                assert gain is not None
-                gains.append(gain)
-            return gains[0], gains[1]
-
-    quiet_gain, loud_gain = run(scenario())
-    # 27 dB apart at the source: the quiet one is boosted as far as the clamp
-    # allows, the loud one barely touched.
-    assert quiet_gain == pytest.approx(player_mod._LOUDNESS_MAX_GAIN_DB)
-    assert quiet_gain - loud_gain > 8
-    assert player_mod._LOUDNESS_MIN_GAIN_DB <= loud_gain < player_mod._LOUDNESS_MAX_GAIN_DB
-
-
-def test_unmeasurable_tracks_fall_back_to_dynamic_loudness(tmp_path: Path) -> None:
-    async def scenario() -> None:
-        async with Env(tmp_path) as env:
-            player = env.player({}, loudness_mode="static")
-            unknown_length = Track(
-                title="x", webpage_url="u", stream_url=env.url("missing.webm"), uploader="", duration=0, requester_id=1
-            )  # fmt: skip
-            assert await player._audio_filter_for(unknown_length) == player_mod._DYNAMIC_LOUDNESS_FILTER
-            broken = Track(
-                title="x", webpage_url="u", stream_url=env.url("missing.webm"), uploader="", duration=120, requester_id=1
-            )  # fmt: skip
-            assert await player._audio_filter_for(broken) == player_mod._DYNAMIC_LOUDNESS_FILTER
-            assert await env.player({}, loudness_mode="off")._audio_filter_for(broken) is None
-            assert await env.player({}, loudness_mode="dynamic")._audio_filter_for(broken) == (
-                player_mod._DYNAMIC_LOUDNESS_FILTER
-            )
-
-    run(scenario())
-
-
-def test_static_gain_window_selection() -> None:
-    calls: list[tuple[float, float]] = []
-
-    async def fake_measure(url: str, start: float, length: float) -> float | None:
-        calls.append((start, length))
-        return -20.0
-
-    original = player_mod._measure_lufs
-    player_mod._measure_lufs = fake_measure  # type: ignore[assignment]
-    try:
-        assert run(player_mod._static_gain_db("u", 200)) == pytest.approx(4.0)
-        assert run(player_mod._static_gain_db("u", 45)) == pytest.approx(4.0)
-        assert run(player_mod._static_gain_db("u", 0)) is None
-    finally:
-        player_mod._measure_lufs = original  # type: ignore[assignment]
-    assert calls[0] == (pytest.approx(80.0), pytest.approx(20.0))  # 40% into a 200 s track, 20 s long
-    assert calls[1] == (0.0, 45.0)  # short tracks are measured whole
-
-
-def test_static_loudness_and_gapless_prefetch_play_two_tracks_in_a_row(tmp_path: Path) -> None:
-    """The production configuration: static gain filter, look-ahead decoder,
-    one listener connected the whole time."""
+def test_gapless_prefetch_plays_two_tracks_in_a_row(tmp_path: Path) -> None:
+    """The production configuration: look-ahead decoder, one listener connected
+    the whole time."""
     make_audio(tmp_path / "a.webm", 8, volume_db=-10)
     make_audio(tmp_path / "b.webm", 8, volume_db=-2)
 
@@ -279,9 +226,7 @@ def test_static_loudness_and_gapless_prefetch_play_two_tracks_in_a_row(tmp_path:
             async def resolver(query: str, requester_id: int) -> Track | None:
                 return tracks.get(query.rsplit("/", 1)[-1])
 
-            player = RadioPlayer(
-                resolver=resolver, audio_bitrate_kbps=96, loudness_mode="static", prefetch_enabled=True
-            )
+            player = RadioPlayer(resolver=resolver, audio_bitrate_kbps=96, prefetch_enabled=True)
             player.start()
             try:
                 queue = player.subscribe()
@@ -308,3 +253,20 @@ def test_static_loudness_and_gapless_prefetch_play_two_tracks_in_a_row(tmp_path:
                 await player.stop()
 
     run(scenario())
+
+
+def test_decoder_never_reads_the_parent_control_pipe() -> None:
+    """The core's stdin is the desktop app's control channel; a decoder that
+    inherited it would read it for ffmpeg's interactive keys."""
+    from twitch_radio.player import _decoder_cmd
+
+    cmd = _decoder_cmd("http://127.0.0.1/x")
+    assert "-nostdin" in cmd
+    assert cmd.index("-nostdin") < cmd.index("-i")
+
+
+def test_songs_play_at_their_own_volume() -> None:
+    """No loudness normalisation: the decoder applies no audio filter at all."""
+    cmd = player_mod._decoder_cmd("http://127.0.0.1/x.webm")
+    assert "-af" not in cmd and "-filter:a" not in cmd and "-filter_complex" not in cmd
+    assert not hasattr(player_mod, "_DYNAMIC_LOUDNESS_FILTER")

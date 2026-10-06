@@ -46,7 +46,7 @@ Source installs need a JavaScript runtime for YouTube (the installed app brings 
 | Item | Location |
 |---|---|
 | Program | `%LOCALAPPDATA%\Programs\Twitch Radio\` |
-| Your settings, tokens, queue | `%APPDATA%\TwitchRadio\` (`.env`, `data\`, `logs\`) - kept on uninstall |
+| Your settings, tokens, queue | `%APPDATA%\TwitchRadio\` (`.env`, `data\`, `logs\`) - kept on uninstall unless you tick the box the uninstaller offers (default: keep) |
 | App window preferences | `%APPDATA%\TwitchRadio\gui\` |
 | Updated yt-dlp (if you installed one) | `%APPDATA%\TwitchRadio\yt-dlp\` (`current\`, `previous\`, `state.json`) |
 | Downloaded JS solver scripts | `%APPDATA%\TwitchRadio\data\yt-dlp-cache\challenge-solver\` |
@@ -55,14 +55,29 @@ To move an existing install: copy your old `.env` and `data\` folder into `%APPD
 
 ## Pinned tools
 
-`packaging\tools.lock.json` pins ffmpeg (version, URL, SHA-256). `packaging\fetch-tools.ps1`
-verifies every download against it and fails the build on a mismatch (the bad file is deleted).
-To bump a tool: change `version` and `url`, download the file once, put its SHA-256 in `sha256`
-(`Get-FileHash <file>`).
+### ffmpeg
 
-`build-windows.bat` still reuses an `ffmpeg` found on your PATH instead of downloading, which
-bypasses the pin. For a reproducible build, delete `packaging\bin` and remove it from PATH, or
-run `powershell -File packaging\fetch-tools.ps1 -Force`. The release workflow always uses the pins.
+The installer and AppImage do not ship a downloaded ffmpeg. They ship a small one (under 10 MB, against
+80 to 105 MB for the general-purpose builds) that `packaging/ffmpeg/build.sh` compiles from the FFmpeg and
+libopus source tarballs pinned, with SHA-256, in `packaging/tools.lock.json`. It contains only what the app
+uses (decode what YouTube serves, encode Opus in Ogg; songs are not otherwise processed), and it is LGPL,
+not GPL. CI builds it for both platforms on every release (`.github/workflows/ffmpeg.yml`) and on any pull
+request that touches `packaging/`, and runs `scripts/check_ffmpeg.py` on the result: that script is the
+list of what the app needs from ffmpeg, and it runs the app's own command lines against every container
+YouTube serves (WebM/Opus, M4A/AAC, HLS with and without video, encrypted HLS) over local HTTP and HTTPS.
+
+* **Release / CI:** nothing to do; the jobs build, check and package it.
+* **Linux, locally:** `scripts/build-linux.sh` builds it into `packaging/bin` (needs a C toolchain, `nasm`,
+  `cmake` and OpenSSL development files; the first build takes a few minutes).
+* **Windows, locally:** the Windows ffmpeg is cross-compiled with mingw-w64, so `build-windows.bat` needs
+  `packaging\bin\ffmpeg.exe` to exist and never bundles one found on PATH. Either download the
+  `ffmpeg-windows-x64` artifact from a CI run, or run `bash packaging/ffmpeg/build.sh windows packaging/bin`
+  in WSL (`sudo apt install build-essential nasm cmake pkg-config curl mingw-w64`).
+* **Bumping ffmpeg or libopus:** change the version, URL and SHA-256 in `tools.lock.json` (the build refuses
+  a file whose hash does not match), and let CI run. **Adding something the app needs** (a new codec,
+  filter or protocol): add it to `build.sh` and to `REQUIRED` in `scripts/check_ffmpeg.py` together.
+* **Run the player tests against the shipped build:**
+  `FIXTURE_FFMPEG=$(which ffmpeg) PATH="$PWD/packaging/bin:$PATH" pytest tests/test_player_e2e.py`.
 
 `THIRD_PARTY_NOTICES.txt` (repo root) is copied into the installer. Keep it current when you add
 a dependency or change a tool.
@@ -120,10 +135,9 @@ scripts/build-linux.sh
 ```
 
 This runs the same four steps as `build-windows.bat` and leaves the AppImage and tarball in
-`dist/app/`. `packaging/fetch-tools.sh` always downloads the pinned static ffmpeg from the
-`linux` section of `packaging/tools.lock.json` and verifies its SHA-256 (a system ffmpeg is
-dynamically linked and would not run on other distributions). Bump them the same way as the Windows
-pins.
+`dist/app/`. Step 2 builds the small ffmpeg described above from pinned source (and skips it when
+`packaging/bin/ffmpeg` already exists). It links OpenSSL and libopus statically and needs only glibc,
+libm and the kernel, so it runs wherever the bot's frozen core does.
 
 **Not supported on Linux:** "Open Twitch Radio when I sign in" (Electron cannot set login items
 there; the toggle is hidden). Use your desktop's autostart instead. Install and update from the app
@@ -169,7 +183,7 @@ version: it builds everything and uploads the files as a workflow artifact witho
   * `python`: Python 3.11 and 3.12 - `ruff check`, `mypy`, `pytest`.
   * `electron`: Node 22 on Windows - `npm ci`, lint, syntax check, unit tests, build-config check.
   * `windows-build-smoke`: only on pull requests that touch `twitch_radio/`, `packaging/`, `gui/` or
-    `requirements*.txt`. Builds the core with PyInstaller and runs `scripts/smoke_core.py`. The last
+    `requirements*`. Builds the core with PyInstaller and runs `scripts/smoke_core.py`. The last
     step (real YouTube resolve, needs the network) may fail without failing the PR.
 * **cut-release.yml** is the one-click release button (see "Cutting a release"). It bumps, commits
   and tags on `main`, then calls release.yml, because a tag pushed with the built-in token does not
@@ -240,5 +254,7 @@ turned off in the same card.
   PyInstaller executables are sometimes flagged by antivirus. Both are normal for unsigned apps; a
   code-signing certificate fixes SmartScreen. Add the install folder to your antivirus exclusions if
   it quarantines `TwitchRadioCore.exe`.
-* **ffmpeg licence.** The pinned ffmpeg is a GPL v3 build. If you distribute the installer, keep
-  `bin\FFMPEG-LICENSE.txt` and `THIRD_PARTY_NOTICES.txt` in it and see https://ffmpeg.org/legal.html.
+* **ffmpeg licence.** The shipped ffmpeg is an LGPL build (v2.1 on Windows, v3 on Linux), with no GPL
+  or non-free parts. If you distribute the installer, keep `bin\FFMPEG-LICENSE.txt` and
+  `THIRD_PARTY_NOTICES.txt` in it, and keep `packaging/ffmpeg/build.sh` and the lock file public: they
+  are the source offer. See https://ffmpeg.org/legal.html.

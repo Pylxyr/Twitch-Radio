@@ -34,6 +34,7 @@ def _first_line(command: list[str]) -> str | None:
     try:
         completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
             command,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=8,
@@ -118,7 +119,6 @@ def build_report() -> dict[str, Any]:
         report["files"] = {
             "tunables": _data_file("TWITCH_TUNABLES_FILE", "tunables.json"),
             "toggles": _data_file("TWITCH_TOGGLES_FILE", "toggles.json"),
-            "blocklist": _data_file("TWITCH_BLOCKLIST_FILE", "blocklist.json"),
         }
         # The one definition of the live limits' ranges and defaults, so the desktop
         # app doesn't keep its own copy that can drift.

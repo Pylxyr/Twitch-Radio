@@ -3,7 +3,6 @@ from __future__ import annotations
 import logging
 from collections import deque
 
-from twitch_radio.blocklist import BlockList
 from twitch_radio.extraction import Resolver
 from twitch_radio.player import QueuedRequest
 from twitch_radio.youtube import youtube_video_id
@@ -22,9 +21,8 @@ class RadioSuggester:
     the same related-music ranking YouTube Music's autoplay uses — rather
     than building a recommendation engine here."""
 
-    def __init__(self, resolver: Resolver, blocklist: BlockList) -> None:
+    def __init__(self, resolver: Resolver) -> None:
         self._resolver = resolver
-        self._blocklist = blocklist
         self._recent: deque[str] = deque(maxlen=_RECENT_HISTORY)
 
     def note_played(self, webpage_url: str) -> None:
@@ -54,8 +52,6 @@ class RadioSuggester:
             if not vid or vid == video_id or vid in self._recent:
                 continue
             entry_url = entry.get("url") or f"https://www.youtube.com/watch?v={vid}"
-            if await self._blocklist.is_blocked(entry_url):
-                continue
             uploader = entry.get("uploader") or entry.get("channel") or ""
             self._recent.append(vid)
             return QueuedRequest(

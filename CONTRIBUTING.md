@@ -27,7 +27,14 @@ CI runs the same commands. Please also run them before opening a pull request.
   (`connect-src 'none'`), no `innerHTML`, and a preload that exposes named functions only. All
   network access happens in the main process or in the core, never in the page.
 * Pins are exact in `requirements*.txt` and `gui/package.json`. When you bump yt-dlp, re-read its
-  `pin` / `pin-curl-cffi` extras (`pip show yt-dlp`, its `pyproject.toml`) and update the companion
-  pins in `requirements.txt` to match. Do not add the `yt-dlp-ejs` package.
+  `pin` extra (`pip show yt-dlp`, its `pyproject.toml`) and update the companion pins in
+  `requirements.txt` to match. Do not add the `yt-dlp-ejs` package, or yt-dlp's optional extras
+  (`curl-cffi`, `mutagen`, `pycryptodomex`, ...): the app doesn't use them and they roughly double
+  the frozen core.
+* Release builds install from `requirements-build.lock` with `--require-hashes`. After changing
+  `requirements.txt` or `requirements-build.txt`, regenerate it with the command in its header; the
+  `build-lock` CI job fails if it is out of date.
+* Electron fuses are set in `gui/package.json` (`build.electronFuses`) and checked on the built app
+  by `gui/scripts/check-fuses.js`. `runAsNode` must stay on (yt-dlp runs the app as Node).
 * Version numbers: use `python scripts/bump-version.py X.Y.Z`; never edit the three places by hand.
 * Comments: only for a non-obvious "why".

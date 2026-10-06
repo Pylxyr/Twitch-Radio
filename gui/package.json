@@ -12,6 +12,7 @@
     "lint": "eslint .",
     "check": "node scripts/check-syntax.js",
     "check:build": "node scripts/check-build-config.js",
+    "check:fuses": "node scripts/check-fuses.js",
     "dist": "electron-builder --win nsis --x64",
     "dist:dir": "electron-builder --win dir --x64",
     "test": "node --test \"test/*.test.js\"",
@@ -61,6 +62,11 @@
       }
     ],
     "asar": true,
+    "electronFuses": {
+      "runAsNode": true,
+      "enableNodeCliInspectArguments": false,
+      "onlyLoadAppFromAsar": true
+    },
     "electronLanguages": [
       "en-US"
     ],
@@ -81,7 +87,9 @@
       "allowToChangeInstallationDirectory": true,
       "deleteAppDataOnUninstall": false,
       "shortcutName": "Twitch Radio",
-      "artifactName": "${productName} Setup ${version}.${ext}"
+      "artifactName": "${productName} Setup ${version}.${ext}",
+      "license": "../THIRD_PARTY_NOTICES.txt",
+      "include": "build/installer.nsh"
     },
     "linux": {
       "target": [

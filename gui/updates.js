@@ -44,11 +44,22 @@ function compareVersions(a, b) {
   return comparePrerelease(left.pre, right.pre);
 }
 
-/** One automatic check per day, and only if the user hasn't turned it off. */
+/** True when `lastCheck` (ms since epoch, 0 = never) is a day or more ago; a clock that went backwards counts as due. */
+function dailyCheckDue(lastCheck, now = Date.now()) {
+  const last = Number(lastCheck) || 0;
+  return last > now || now - last >= DAY_MS;
+}
+
+/** One automatic app-update check per day, and only if the user hasn't turned it off. */
 function shouldAutoCheck(prefs, now = Date.now()) {
   if (!prefs.checkAppUpdates) return false;
-  const last = Number(prefs.lastUpdateCheck) || 0;
-  return last > now || now - last >= DAY_MS;
+  return dailyCheckDue(prefs.lastUpdateCheck, now);
+}
+
+/** One automatic yt-dlp check per day, and only if the user hasn't turned it off. */
+function shouldAutoCheckYtdlp(prefs, now = Date.now()) {
+  if (!prefs.checkYtdlpOnStartup) return false;
+  return dailyCheckDue(prefs.lastYtdlpCheck, now);
 }
 
 // GitHub turns spaces in asset names into dots, so both spellings are accepted.
@@ -86,4 +97,4 @@ async function checkForAppUpdate({ current, fetchImpl = fetch, repo = UPDATE_REP
   return result;
 }
 
-module.exports = { UPDATE_REPO, DAY_MS, parseVersion, compareVersions, shouldAutoCheck, checkForAppUpdate };
+module.exports = { UPDATE_REPO, DAY_MS, parseVersion, compareVersions, dailyCheckDue, shouldAutoCheck, shouldAutoCheckYtdlp, checkForAppUpdate };

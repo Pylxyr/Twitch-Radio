@@ -13,19 +13,17 @@ from twitch_radio.player import QueuedRequest
 from twitch_radio.telemetry import counters
 from twitch_radio.toggles import FeatureToggles
 from twitch_radio.tunables import TwitchTunables
-from twitch_radio.youtube import youtube_video_id
 
 if TYPE_CHECKING:
     from twitch_radio.chatbot import TwitchChatBot
 
 log = logging.getLogger(__name__)
 
-# Keyed by canonical command name (ctx.command.name resolves aliases to
-# this), for event_command_error's MissingRequiredArgument handler in
-# chatbot.py.
+# Keyed by command name, for event_command_error's MissingRequiredArgument
+# handler in chatbot.py.
 USAGE = {
     "sr": "Usage: !sr <song name or URL>",
-    "unblock": "Usage: !unblock <song name or URL>",
+    "radio": "Usage: !radio [on|off]",
 }
 
 # How much of a chatter's query the "Looking up ..." acknowledgement repeats.
@@ -36,7 +34,7 @@ class SongRequestComponent(commands.Component):
     def __init__(self, bot: TwitchChatBot) -> None:
         self.bot = bot
 
-    @commands.command(name="sr", aliases=["songrequest"])
+    @commands.command(name="sr")
     async def song_request(self, ctx: commands.Context, *, query: str) -> None:
         query = query.strip()
         if not query:
@@ -140,10 +138,6 @@ class SongRequestComponent(commands.Component):
                 await self.bot.safe_reply(ctx, "Can't queue a livestream — sorry!")
                 return
 
-            if await self.bot.blocklist.is_blocked(track.webpage_url):
-                await self.bot.safe_reply(ctx, f"{track.title} has been blocked by a mod.")
-                return
-
             # Re-read rather than reuse whatever song_request() read before
             # resolving — a mod could easily adjust /settings during a
             # multi-second resolve.
@@ -210,13 +204,13 @@ class SongRequestComponent(commands.Component):
                 self.bot.inflight_query_by_chatter.pop(chatter_key, None)
 
     @commands.command(name="skip")
-    # No @commands.is_moderator() guard — mods/broadcaster can always skip
-    # (checked manually below), but a chatter can also skip their own
-    # currently-playing request without mod status.
+    # No @commands.is_moderator() guard: mods and the broadcaster can always
+    # skip (checked manually below), and anyone can skip the request of
+    # theirs that is currently playing or loading, without mod status.
     async def skip(self, ctx: commands.Context) -> None:
         chatter = ctx.chatter
-        # ctx.chatter is Chatter | PartialUser; only Chatter has .moderator.
-        is_mod = isinstance(chatter, Chatter) and chatter.moderator
+        # ctx.chatter is Chatter | PartialUser; only Chatter has the role flags.
+        is_mod = isinstance(chatter, Chatter) and (chatter.moderator or chatter.broadcaster)
         if not is_mod:
             # active_requester_id (not now_playing) so a chatter can skip
             # their own song during the resolve/load window too — that can
@@ -237,96 +231,8 @@ class SongRequestComponent(commands.Component):
         else:
             await self.bot.safe_reply(ctx, "Nothing's playing right now.")
 
-    @commands.command(name="pause")
-    @commands.is_moderator()
-    async def pause(self, ctx: commands.Context) -> None:
-        """Stops whatever's playing (or resolving) and holds the queue at
-        silence — for an ad break or announcement where the mod wants the
-        music gone immediately, not once the current track ends. Replays
-        from the top on !resume; no seek support anywhere in this pipeline."""
-        if self.bot.player.pause():
-            await self.bot.safe_reply(ctx, "Paused. !resume to pick it back up.")
-        else:
-            await self.bot.safe_reply(ctx, "Already paused.")
-
-    @commands.command(name="resume", aliases=["unpause"])
-    @commands.is_moderator()
-    async def resume(self, ctx: commands.Context) -> None:
-        if self.bot.player.resume():
-            await self.bot.safe_reply(ctx, "Resumed.")
-        else:
-            await self.bot.safe_reply(ctx, "Not paused right now.")
-
-    @commands.command(name="voteskip", aliases=["vs"])
-    async def vote_skip(self, ctx: commands.Context) -> None:
-        """Anyone can vote to skip what's playing (or loading) — once
-        enough unique chatters vote (vote_skip_threshold, adjustable from
-        /settings), it's skipped automatically. Votes don't carry over
-        between tracks."""
-        if self.bot.player.active_requester_id is None:
-            await self.bot.safe_reply(ctx, "Nothing's playing right now.")
-            return
-        try:
-            voter_id = int(ctx.chatter.id)
-        except (TypeError, ValueError):
-            await self.bot.safe_reply(ctx, "Couldn't identify you — try again.")
-            return
-        tunables = TwitchTunables.from_dict(await self.bot.tunables_store.read())
-        result = self.bot.player.register_skip_vote(voter_id, tunables.vote_skip_threshold)
-        if result is None:
-            await self.bot.safe_reply(ctx, "Nothing's playing right now.")
-            return
-        skipped, count, is_new = result
-        if skipped:
-            await self.bot.safe_reply(ctx, "Vote-skipped!")
-        elif not is_new:
-            await self.bot.safe_reply(
-                ctx, f"You've already voted to skip this one ({count}/{tunables.vote_skip_threshold})."
-            )
-        else:
-            needed = tunables.vote_skip_threshold - count
-            await self.bot.safe_reply(
-                ctx, f"Skip vote registered ({count}/{tunables.vote_skip_threshold}) — {needed} more needed."
-            )
-
-    @commands.command(name="remove", aliases=["cancel", "unqueue"])
-    async def remove(self, ctx: commands.Context) -> None:
-        """Lets a chatter pull their own most-recently-queued request back
-        out of the queue — not the one currently playing (!skip is for that)."""
-        try:
-            requester_id = int(ctx.chatter.id)
-        except (TypeError, ValueError):
-            await self.bot.safe_reply(ctx, "Couldn't identify you — try again.")
-            return
-        removed = self.bot.player.cancel_pending_for(requester_id)
-        if removed is None:
-            await self.bot.safe_reply(ctx, "You don't have anything waiting in the queue.")
-            return
-        title = removed.title or "your request"
-        await self.bot.safe_reply(ctx, f"Removed: {title}")
-
-    @commands.command(name="position", aliases=["pos"])
-    async def position(self, ctx: commands.Context) -> None:
-        """Shows where the chatter's own request(s) sit in the queue."""
-        try:
-            requester_id = int(ctx.chatter.id)
-        except (TypeError, ValueError):
-            await self.bot.safe_reply(ctx, "Couldn't identify you — try again.")
-            return
-        positions = self.bot.player.positions_for(requester_id)
-        if not positions:
-            if self.bot.player.active_requester_id == requester_id:
-                await self.bot.safe_reply(ctx, "Your song is up now!")
-            else:
-                await self.bot.safe_reply(ctx, "You don't have anything queued.")
-            return
-        if len(positions) == 1:
-            await self.bot.safe_reply(ctx, f"You're #{positions[0]} in the queue.")
-        else:
-            spots = ", ".join(f"#{p}" for p in positions)
-            await self.bot.safe_reply(ctx, f"You're at {spots} in the queue.")
-
-    @commands.command(name="queue")
+    # Deliberately not "queue": another bot in the channel already answers !queue.
+    @commands.command(name="sq", aliases=["songqueue"])
     async def queue_cmd(self, ctx: commands.Context) -> None:
         items = self.bot.player.queued_items()
         if not items:
@@ -336,22 +242,12 @@ class SongRequestComponent(commands.Component):
         more = f" (+{len(items) - 3} more)" if len(items) > 3 else ""
         await self.bot.safe_reply(ctx, f"{len(items)} queued: {upcoming}{more}")
 
-    @commands.command(name="nowplaying", aliases=["np"])
-    async def now_playing(self, ctx: commands.Context) -> None:
-        np = self.bot.player.now_playing
-        if np is None:
-            await self.bot.safe_reply(ctx, "Nothing's playing right now.")
-            return
-        elapsed = max(0, int(time.monotonic() - np.started_at))
-        await self.bot.safe_reply(
-            ctx, f"Now playing: {np.title} — requested by {np.requester_name} ({elapsed}s in)"
-        )
-
     @commands.command(name="radio")
     async def radio_toggle(self, ctx: commands.Context, *, arg: str = "") -> None:
-        """!radio alone reports status; !radio on/off (mod-only) flips it.
-        When on, an empty queue auto-fills with a track related to whatever
-        just finished (YouTube's own "Mix" playlist) instead of going quiet."""
+        """!radio alone reports whether auto-radio is on (anyone can ask);
+        !radio on / !radio off is the broadcaster's alone. When on, an empty
+        queue auto-fills with a track related to whatever just finished
+        (YouTube's own "Mix" playlist) instead of going quiet."""
         arg = arg.strip().lower()
         if not arg:
             toggles = FeatureToggles.from_dict(await self.bot.toggles_store.read())
@@ -359,13 +255,13 @@ class SongRequestComponent(commands.Component):
             await self.bot.safe_reply(ctx, f"Radio autoplay is {state}.")
             return
         chatter = ctx.chatter
-        if not (isinstance(chatter, Chatter) and chatter.moderator):
+        if not (isinstance(chatter, Chatter) and chatter.broadcaster):
             await self.bot.safe_reply(
-                ctx, "Only mods can change that — try !radio with no argument to check status."
+                ctx, "Only the broadcaster can change that - try !radio with no argument to check status."
             )
             return
         if arg not in ("on", "off"):
-            await self.bot.safe_reply(ctx, "Usage: !radio [on|off]")
+            await self.bot.safe_reply(ctx, USAGE["radio"])
             return
 
         def _mutate(current: dict[str, Any]) -> dict[str, Any]:
@@ -375,62 +271,3 @@ class SongRequestComponent(commands.Component):
 
         await self.bot.toggles_store.update(_mutate)
         await self.bot.safe_reply(ctx, f"Radio autoplay is now {arg}.")
-
-    @commands.command(name="block")
-    @commands.is_moderator()
-    async def block(self, ctx: commands.Context) -> None:
-        """Blocks whatever's currently playing so it can never be requested
-        or radio-suggested again, strips any already-queued copies of it,
-        and skips it right now — one action, like Cloudbot's !blacklist."""
-        np = self.bot.player.now_playing
-        if np is None:
-            await self.bot.safe_reply(ctx, "Nothing's playing right now.")
-            return
-        blocked_by = ctx.chatter.display_name or ctx.chatter.name or "a mod"
-        ok = await self.bot.blocklist.block(
-            np.webpage_url, title=np.title, uploader=np.uploader, blocked_by=blocked_by
-        )
-        if not ok:
-            await self.bot.safe_reply(ctx, "Couldn't identify that as a YouTube video to block.")
-            return
-        video_id = youtube_video_id(np.webpage_url)
-        self.bot.player.purge_pending(lambda r: youtube_video_id(r.webpage_url) == video_id)
-        self.bot.player.skip_current()
-        await self.bot.safe_reply(ctx, f"Blocked and skipped: {np.title}")
-
-    @commands.command(name="unblock")
-    @commands.is_moderator()
-    async def unblock(self, ctx: commands.Context, *, query: str) -> None:
-        """Looks query up the same way !sr does, then removes the match
-        from the blocklist — doesn't queue it, just lifts the block."""
-        query = query.strip()
-        if not query:
-            await self.bot.safe_reply(ctx, USAGE["unblock"])
-            return
-        try:
-            track = await self.bot.resolver(query, 0)
-        except UnsupportedSourceError as exc:
-            await self.bot.safe_reply(ctx, str(exc))
-            return
-        except Exception:
-            log.exception("Failed to resolve Twitch !unblock query: %s", query)
-            await self.bot.safe_reply(ctx, "Couldn't look that up — try a different search or link.")
-            return
-        if track is None:
-            await self.bot.safe_reply(ctx, "No results for that.")
-            return
-        removed = await self.bot.blocklist.unblock(track.webpage_url)
-        if removed:
-            await self.bot.safe_reply(ctx, f"Unblocked: {track.title}")
-        else:
-            await self.bot.safe_reply(ctx, f"{track.title} wasn't blocked.")
-
-    @commands.command(name="blocklist", aliases=["banlist"])
-    async def blocklist_cmd(self, ctx: commands.Context) -> None:
-        entries = await self.bot.blocklist.list_blocked()
-        if not entries:
-            await self.bot.safe_reply(ctx, "Nothing's blocked right now.")
-            return
-        shown = ", ".join(e.title or e.video_id for e in entries[:5])
-        more = f" (+{len(entries) - 5} more)" if len(entries) > 5 else ""
-        await self.bot.safe_reply(ctx, f"{len(entries)} blocked: {shown}{more}")

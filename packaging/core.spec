@@ -18,10 +18,11 @@ datas = [
 binaries = []
 hiddenimports = collect_submodules("twitch_radio") + ["dotenv"]
 
-# yt-dlp loads extractors/plugins dynamically; curl_cffi ships native
-# browser-impersonation libraries. yt_dlp_ejs is deliberately NOT collected:
-# yt-dlp downloads the matching JS solver scripts at runtime.
-for package in ("yt_dlp", "curl_cffi", "twitchio", "aiohttp", "certifi"):
+# yt-dlp loads extractors/plugins dynamically. yt_dlp_ejs is deliberately NOT
+# collected: yt-dlp downloads the matching JS solver scripts at runtime. curl_cffi
+# (native browser-impersonation libraries, about a third of the frozen core) and the
+# other optional yt-dlp extras are not installed at all, see requirements.txt.
+for package in ("yt_dlp", "twitchio", "aiohttp", "certifi"):
     try:
         pkg_datas, pkg_binaries, pkg_hidden = collect_all(package)
     except Exception as exc:  # a missing optional package must not stop the build

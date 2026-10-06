@@ -9,9 +9,9 @@ _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "music.yout
 
 def youtube_video_id(url: str) -> str | None:
     """Extracts the 11-character video ID from a YouTube watch/shorts/
-    youtu.be URL, or None if it isn't one. Shared by radio.py (mix dedup)
-    and blocklist.py (block/unblock keying) — one canonical ID per video
-    regardless of which URL shape it was requested with."""
+    youtu.be URL, or None if it isn't one. Used by radio.py (mix dedup) so
+    there is one canonical ID per video regardless of which URL shape it was
+    requested with."""
     try:
         parts = urlsplit(url.strip())
     except ValueError:
