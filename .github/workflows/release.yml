@@ -49,8 +49,15 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
-  build:
+  # The trimmed ffmpeg for both platforms, built from pinned source (see ffmpeg.yml).
+  ffmpeg:
     needs: version-guard
+    uses: ./.github/workflows/ffmpeg.yml
+    with:
+      ref: ${{ inputs.tag }}
+
+  build:
+    needs: [version-guard, ffmpeg]
     runs-on: windows-latest
     outputs:
       signed: ${{ steps.sign.outputs.signed }}
@@ -64,16 +71,23 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: requirements*.txt
+          cache-dependency-path: requirements*
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: gui/package-lock.json
-      - run: pip install -r requirements-build.txt
-      - name: Fetch ffmpeg (pinned, checksum-verified)
-        shell: pwsh
-        run: ./packaging/fetch-tools.ps1
+      - run: pip install --require-hashes -r requirements-build.lock
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ffmpeg-windows-x64
+          path: packaging/bin
+      # Same check as the Linux build gets in ffmpeg.yml, here on real Windows: Schannel, the Windows
+      # certificate store, and the app's own command lines against every container YouTube serves.
+      - name: Check the trimmed ffmpeg
+        run: |
+          pip install trustme==1.2.1
+          python scripts/check_ffmpeg.py packaging/bin/ffmpeg.exe --require-tls --https-url "https://raw.githubusercontent.com/${{ github.repository }}/${{ github.sha }}/tests/fixtures/audio/tone.webm"
       - name: Build the core with PyInstaller
         run: pyinstaller packaging/core.spec --noconfirm --distpath dist/core --workpath build/pyinstaller
       - name: Smoke test the frozen core
@@ -135,6 +149,9 @@ jobs:
       # This proves the built app can do that (and that Electron's runAsNode fuse is still on).
       - name: Packaged app works as the JavaScript runtime
         run: python scripts/check_host_runtime.py "dist/app/win-unpacked/Twitch Radio.exe"
+      - name: Electron fuses match the build config
+        working-directory: gui
+        run: node scripts/check-fuses.js "../dist/app/win-unpacked/Twitch Radio.exe"
       - name: Collect release files
         shell: pwsh
         run: |
@@ -150,7 +167,7 @@ jobs:
           if-no-files-found: error
 
   build-linux:
-    needs: version-guard
+    needs: [version-guard, ffmpeg]
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.version-guard.outputs.version }}
@@ -162,15 +179,18 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: requirements*.txt
+          cache-dependency-path: requirements*
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: gui/package-lock.json
-      - run: pip install -r requirements-build.txt
-      - name: Fetch ffmpeg (pinned, checksum-verified)
-        run: bash packaging/fetch-tools.sh
+      - run: pip install --require-hashes -r requirements-build.lock
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ffmpeg-linux-x64
+          path: packaging/bin
+      - run: chmod +x packaging/bin/ffmpeg
       - name: Build the core with PyInstaller
         run: pyinstaller packaging/core.spec --noconfirm --distpath dist/core --workpath build/pyinstaller
       - name: Smoke test the frozen core
@@ -195,6 +215,9 @@ jobs:
         run: npm run dist:linux
       - name: Packaged app works as the JavaScript runtime
         run: python scripts/check_host_runtime.py dist/app/linux-unpacked/twitch-radio
+      - name: Electron fuses match the build config
+        working-directory: gui
+        run: node scripts/check-fuses.js ../dist/app/linux-unpacked/twitch-radio
       - name: Collect release files
         run: |
           mkdir -p release

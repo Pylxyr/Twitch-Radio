@@ -13,7 +13,7 @@ updates:
     groups:
       # yt-dlp's pinned companions move together; check them against `pip show yt-dlp` before merging.
       yt-dlp:
-        patterns: [yt-dlp, brotli, certifi, mutagen, pycryptodomex, requests, urllib3, websockets, curl-cffi]
+        patterns: [yt-dlp, certifi, requests, urllib3]
   - package-ecosystem: npm
     directory: /gui
     schedule:

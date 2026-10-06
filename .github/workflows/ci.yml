@@ -69,12 +69,30 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           cache: pip
-          cache-dependency-path: requirements*.txt
+          cache-dependency-path: requirements*
       - run: pip install -r requirements-dev.txt -r requirements.txt
       - run: ruff check .
       - run: ruff format --check .
       - run: mypy twitch_radio bot.py
       - run: pytest -q
+
+  # The release builds install from requirements-build.lock with hash checking. This fails
+  # when requirements*.txt changed without the lock being regenerated (command in the lock's header).
+  build-lock:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - run: pip install uv==0.12.23
+      - name: Lock is up to date
+        run: |
+          cp requirements-build.lock /tmp/before.lock
+          uv pip compile requirements-build.txt --universal --python-version 3.11 --generate-hashes --no-header -o /tmp/after.lock
+          # Compare everything except the comment header.
+          diff <(grep -v '^#' /tmp/before.lock) <(grep -v '^#' /tmp/after.lock) \
+            || { echo "::error::requirements-build.lock is out of date. Regenerate it (see its header)."; exit 1; }
 
   electron:
     runs-on: windows-latest
@@ -109,14 +127,19 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
-          if git diff --name-only "origin/${BASE_REF}...HEAD" | grep -Eq '^(twitch_radio/|packaging/|gui/|requirements[^/]*\.txt$|scripts/smoke_core\.py$|\.github/workflows/ci\.yml$)'; then
+          if git diff --name-only "origin/${BASE_REF}...HEAD" | grep -Eq '^(twitch_radio/|packaging/|gui/|requirements[^/]*\.txt$|scripts/smoke_core\.py$|scripts/check_ffmpeg\.py$|tests/fixtures/audio/|\.github/workflows/ci\.yml$)'; then
             echo "build=true" >> "$GITHUB_OUTPUT"
           else
             echo "build=false" >> "$GITHUB_OUTPUT"
           fi
 
-  windows-build-smoke:
+  ffmpeg:
     needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.build == 'true'
+    uses: ./.github/workflows/ffmpeg.yml
+
+  windows-build-smoke:
+    needs: [changes, ffmpeg]
     if: github.event_name == 'pull_request' && needs.changes.outputs.build == 'true'
     runs-on: windows-latest
     steps:
@@ -125,11 +148,18 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: requirements*.txt
-      - run: pip install -r requirements-build.txt
-      - name: Fetch ffmpeg (pinned, checksum-verified)
-        shell: pwsh
-        run: ./packaging/fetch-tools.ps1
+          cache-dependency-path: requirements*
+      - run: pip install --require-hashes -r requirements-build.lock
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ffmpeg-windows-x64
+          path: packaging/bin
+      - name: Check the trimmed ffmpeg with Schannel and the Windows certificate store
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          pip install trustme==1.2.1
+          python scripts/check_ffmpeg.py packaging/bin/ffmpeg.exe --require-tls --https-url "https://raw.githubusercontent.com/${{ github.repository }}/$env:SHA/tests/fixtures/audio/tone.webm"
       - name: Build the core with PyInstaller
         run: pyinstaller packaging/core.spec --noconfirm --distpath dist/core --workpath build/pyinstaller
       - name: Smoke test the frozen core
@@ -143,7 +173,7 @@ jobs:
           python scripts/smoke_core.py --exe dist/core/TwitchRadioCore/TwitchRadioCore.exe --bin packaging/bin --resolve-only --host-js $node
 
   linux-build-smoke:
-    needs: changes
+    needs: [changes, ffmpeg]
     if: github.event_name == 'pull_request' && needs.changes.outputs.build == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -152,10 +182,13 @@ jobs:
         with:
           python-version: "3.12"
           cache: pip
-          cache-dependency-path: requirements*.txt
-      - run: pip install -r requirements-build.txt
-      - name: Fetch ffmpeg (pinned, checksum-verified)
-        run: bash packaging/fetch-tools.sh
+          cache-dependency-path: requirements*
+      - run: pip install --require-hashes -r requirements-build.lock
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ffmpeg-linux-x64
+          path: packaging/bin
+      - run: chmod +x packaging/bin/ffmpeg
       - name: Build the core with PyInstaller
         run: pyinstaller packaging/core.spec --noconfirm --distpath dist/core --workpath build/pyinstaller
       - name: Smoke test the frozen core

@@ -1,0 +1,61 @@
+name: Build ffmpeg
+
+# Builds the small ffmpeg that ships in the installer and the AppImage, from the pinned source in
+# packaging/tools.lock.json (recipe: packaging/ffmpeg/build.sh). Called by ci.yml and release.yml;
+# the result is two artifacts, ffmpeg-windows-x64 and ffmpeg-linux-x64, each an ffmpeg executable
+# plus its licence text, which the build jobs download into packaging/bin.
+#
+# Nothing is downloaded prebuilt: the only network inputs are the two source tarballs (checksum
+# verified) and the Ubuntu packages for the toolchain.
+
+on:
+  workflow_call:
+    inputs:
+      ref:
+        description: "Git ref to build, as in actions/checkout (empty = the triggering ref)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        target: [windows, linux]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - name: Toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential nasm pkg-config cmake make curl xz-utils python3 \
+            ${{ matrix.target == 'windows' && 'mingw-w64' || 'libssl-dev' }}
+      - name: Build ffmpeg (${{ matrix.target }})
+        run: bash packaging/ffmpeg/build.sh ${{ matrix.target }} "$RUNNER_TEMP/ffmpeg-out"
+      # A Windows executable can't run on this runner; the Windows build jobs run the same check
+      # on it (with Schannel and the real Windows certificate store) before anything is packaged.
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: matrix.target == 'linux'
+        with:
+          python-version: "3.12"
+      - name: Check the Linux build against what the app needs
+        if: matrix.target == 'linux'
+        env:
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          pip install --require-hashes -r requirements-build.lock
+          pip install trustme==1.2.1
+          python scripts/check_ffmpeg.py "$RUNNER_TEMP/ffmpeg-out/ffmpeg" --require-tls \
+            --https-url "https://raw.githubusercontent.com/${{ github.repository }}/${SHA}/tests/fixtures/audio/tone.webm"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ffmpeg-${{ matrix.target }}-x64
+          path: ${{ runner.temp }}/ffmpeg-out/*
+          if-no-files-found: error
+          retention-days: 14
