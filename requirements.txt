@@ -16,4 +16,4 @@ pycryptodomex==3.23.0
 requests==2.34.2
 urllib3==2.7.0
 websockets==17.0.1
-curl-cffi==0.16.0
+curl-cffi==0.16.3
