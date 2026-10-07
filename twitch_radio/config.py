@@ -216,6 +216,7 @@ class Settings:
     token_path: Path
     tunables_path: Path
     toggles_path: Path
+    lookahead_path: Path
     queue_state_path: Path
 
     # yt-dlp
@@ -318,6 +319,7 @@ def load_settings() -> Settings:
         token_path=DATA_DIR / os.getenv("TWITCH_TOKEN_FILE", "twitch_tokens.json").strip(),
         tunables_path=DATA_DIR / os.getenv("TWITCH_TUNABLES_FILE", "tunables.json").strip(),
         toggles_path=DATA_DIR / os.getenv("TWITCH_TOGGLES_FILE", "toggles.json").strip(),
+        lookahead_path=DATA_DIR / "radio_lookahead.json",
         queue_state_path=DATA_DIR / os.getenv("TWITCH_QUEUE_STATE_FILE", "queue_state.json").strip(),
         ytdlp_cookies_file=cookies_path,
         ytdlp_js_runtime_path=js_runtime_path,

@@ -5,7 +5,7 @@ import contextlib
 import logging
 import shutil
 import time
-from collections.abc import Awaitable, Callable, Coroutine
+from collections.abc import Awaitable, Callable, Collection, Coroutine
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Protocol
@@ -14,6 +14,7 @@ from twitch_radio.models import Track
 from twitch_radio.paths import hidden_subprocess_kwargs
 from twitch_radio.store import JsonStore
 from twitch_radio.telemetry import counters
+from twitch_radio.youtube import youtube_video_id
 
 log = logging.getLogger(__name__)
 
@@ -198,12 +199,30 @@ def _encoder_cmd(audio_bitrate_kbps: int) -> list[str]:
     ]
 
 
+def _same_video(a: str | None, b: str | None) -> bool:
+    """Same song, whichever URL shape each was written in (watch?v=, youtu.be/, music.youtube.com)."""
+    if not a or not b:
+        return False
+    if a == b:
+        return True
+    first, second = youtube_video_id(a), youtube_video_id(b)
+    return first is not None and first == second
+
+
 class TrackResolver(Protocol):
     async def __call__(self, query: str, requester_id: int) -> Track | None: ...
 
 
 class RadioSuggestFn(Protocol):
     async def __call__(self, seed_webpage_url: str) -> "QueuedRequest | None": ...
+
+
+class RadioSuggestManyFn(Protocol):
+    """Up to `count` radio-mix tracks that follow the seed, skipping `exclude_ids`."""
+
+    async def __call__(
+        self, seed_webpage_url: str, count: int, exclude_ids: Collection[str]
+    ) -> "list[QueuedRequest]": ...
 
 
 # "Don't hammer a broken/empty radio mix" guard — a fast-failing
@@ -348,6 +367,14 @@ class RadioPlayer:
         self._radio_played_notifier: Callable[[str], None] | None = None
         self._last_played_webpage_url: str | None = None
         self._radio_fill_task: asyncio.Task[None] | None = None
+        # Radio-mix lookahead (see request_radio_lookahead()): keeps the next few radio-mix
+        # songs queued behind whatever was requested. Only the queue entries exist ahead of
+        # time; the resolve and decode prefetch still covers just the one song that is next.
+        self._radio_suggest_many: RadioSuggestManyFn | None = None
+        self._lookahead_getter: Callable[[], Awaitable[tuple[bool, int]]] | None = None
+        self._lookahead_task: asyncio.Task[None] | None = None
+        self._lookahead_again = False
+        self._lookahead_failed_at: float = float("-inf")
         # -inf, not 0.0: "no failure yet" must never look like "failed
         # right at boot" — time.monotonic() is seconds-since-boot on
         # Linux, so a literal 0.0 here would wrongly block the very first
@@ -406,6 +433,19 @@ class RadioPlayer:
         """Requests still waiting to play — what !sq and the
         overlay already read directly from the same list."""
         return len(self._pending)
+
+    def is_already_requested(self, webpage_url: str) -> bool:
+        """True when this song is playing (or loading) right now, or is waiting in the queue as
+        someone's request. A radio-mix song with the same URL does not count: asking for it
+        simply takes its place (see enqueue())."""
+        if _same_video(self.active_webpage_url, webpage_url):
+            return True
+        return any(r.requester_id != 0 and _same_video(r.webpage_url, webpage_url) for r in self._pending)
+
+    def real_queue_size(self) -> int:
+        """Requests someone actually made, without the radio-mix filler - what the queue cap and
+        the "N in queue" a viewer is told count, so autoplay can never crowd out a request."""
+        return sum(1 for request in self._pending if request.requester_id != 0)
 
     def queued_items(self) -> list[QueuedRequest]:
         return list(self._pending)
@@ -493,12 +533,114 @@ class RadioPlayer:
         # to wait behind autoplay filler nobody actually asked for, but
         # two listeners' requests still play in the order they arrived.
         if request.requester_id != 0:
+            # If the radio mix had already lined this song up, the request replaces that entry.
+            for filler in [
+                r
+                for r in self._pending
+                if r.requester_id == 0 and _same_video(r.webpage_url, request.webpage_url)
+            ]:
+                filler.cancelled = True
+                self._pending.remove(filler)
+                if self._prepared is not None and self._prepared.request is filler:
+                    self._discard_prepared()
             index = next((i for i, r in enumerate(self._pending) if r.requester_id == 0), len(self._pending))
             self._pending.insert(index, request)
         else:
             self._pending.append(request)
         self._notify_state_changed()
         self._fire_and_forget(self._persist_queue(), name="persist-queue")
+        if request.requester_id != 0:
+            # Someone asked for a song: line up what the radio would play after it.
+            self.request_radio_lookahead()
+
+    # -- radio-mix lookahead ------------------------------------------------
+
+    def request_radio_lookahead(self) -> None:
+        """Asks for the radio-mix queue to be topped up, soon and in the background. Safe to call
+        from anywhere on the event loop and as often as you like: calls made while a top-up is
+        running collapse into one more pass afterwards."""
+        if self._radio_suggest_many is None or self._lookahead_getter is None or self._stopping:
+            return
+        if self._lookahead_task is not None and not self._lookahead_task.done():
+            self._lookahead_again = True
+            return
+        self._lookahead_task = asyncio.create_task(self._run_radio_lookahead(), name="radio-lookahead")
+
+    async def apply_radio_lookahead(self) -> None:
+        """The lookahead setting or the auto-radio switch changed: drop radio filler that is no
+        longer wanted (all of it when either was turned off, the far end when the count went
+        down), then top up."""
+        if self._lookahead_getter is None:
+            return
+        try:
+            enabled, count = await self._lookahead_getter()
+            if enabled and self._radio_enabled_getter is not None:
+                enabled = await self._radio_enabled_getter()
+        except Exception:
+            log.debug("Reading the radio lookahead setting failed.", exc_info=True)
+            return
+        self._lookahead_failed_at = float("-inf")
+        radio_items = [r for r in self._pending if r.requester_id == 0]
+        keep = count if enabled else 0
+        surplus = radio_items[keep:]
+        if surplus:
+            self.purge_pending(lambda request: any(request is item for item in surplus))
+            log.info("Radio lookahead: removed %d queued radio-mix song(s).", len(surplus))
+        if enabled:
+            self.request_radio_lookahead()
+
+    async def _run_radio_lookahead(self) -> None:
+        try:
+            while True:
+                self._lookahead_again = False
+                await self._top_up_radio_lookahead()
+                if not self._lookahead_again:
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("Radio lookahead failed (non-fatal).", exc_info=True)
+
+    async def _top_up_radio_lookahead(self) -> None:
+        assert self._lookahead_getter is not None and self._radio_suggest_many is not None
+        if self._paused:
+            return
+        if time.monotonic() - self._lookahead_failed_at < _RADIO_RETRY_BACKOFF_SECONDS:
+            return
+        enabled, count = await self._lookahead_getter()
+        if not enabled:
+            return
+        # Lookahead builds on auto-radio: with that switched off, no radio song is queued at all.
+        if self._radio_enabled_getter is not None and not await self._radio_enabled_getter():
+            return
+        need = count - sum(1 for r in self._pending if r.requester_id == 0)
+        if need <= 0:
+            return
+        # Follow the end of the queue; with an empty queue, follow what is playing or just played.
+        seed = (
+            self._pending[-1].webpage_url
+            if self._pending
+            else self.active_webpage_url or self._last_played_webpage_url
+        )
+        if seed is None:
+            return
+        taken = {youtube_video_id(r.webpage_url) for r in self._pending}
+        taken.add(youtube_video_id(self.active_webpage_url or ""))
+        picks = await self._radio_suggest_many(seed, need, {v for v in taken if v})
+        if not picks:
+            self._lookahead_failed_at = time.monotonic()
+            return
+        # The queue may have changed during the lookup (a request arrived, a song started):
+        # work out again how many are still wanted before adding anything.
+        need = count - sum(1 for r in self._pending if r.requester_id == 0)
+        added = 0
+        for pick in picks[: max(0, need)]:
+            if self._paused or self._stopping:
+                break
+            self.enqueue(pick)
+            added += 1
+        if added:
+            log.info("Radio lookahead: queued %d song(s), next: %s", added, picks[0].title)
 
     def set_track_failure_notifier(self, notifier: Callable[[str], Awaitable[None]] | None) -> None:
         # Also used for the "Now Playing: ..." announcement on a
@@ -512,6 +654,16 @@ class RadioPlayer:
 
     def set_radio_suggester(self, suggester: RadioSuggestFn | None) -> None:
         self._radio_suggest = suggester
+
+    def set_radio_lookahead(
+        self,
+        suggest_many: RadioSuggestManyFn | None,
+        getter: Callable[[], Awaitable[tuple[bool, int]]] | None,
+    ) -> None:
+        """`getter` returns (enabled, count) and is read fresh every time, so the dashboard's
+        setting takes effect without a restart."""
+        self._radio_suggest_many = suggest_many
+        self._lookahead_getter = getter
 
     def set_radio_played_notifier(self, notifier: Callable[[str], None] | None) -> None:
         self._radio_played_notifier = notifier
@@ -732,6 +884,11 @@ class RadioPlayer:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._radio_fill_task
             self._radio_fill_task = None
+        if self._lookahead_task is not None:
+            self._lookahead_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._lookahead_task
+            self._lookahead_task = None
         for task in list(self._background_tasks):
             task.cancel()
         if self._background_tasks:
@@ -947,6 +1104,8 @@ class RadioPlayer:
             ):
                 request = self._pending.pop(0)
                 self._fire_and_forget(self._persist_queue(), name="persist-queue")
+                # One slot freed: let the lookahead refill the radio queue behind it.
+                self.request_radio_lookahead()
             else:
                 if not self._pending:
                     # Catches what the prefetch-timer hook doesn't: a skip

@@ -32,6 +32,10 @@
     for (const child of children.flat()) if (child != null) node.append(child);
     return node;
   }
+  /** replaceChildren() that skips null/false children. The DOM turns a null argument into the text "null". */
+  function replaceKids(parent, ...nodes) {
+    parent.replaceChildren(...nodes.flat().filter((node) => node != null && node !== false));
+  }
   const pad = (n, w = 2) => String(n).padStart(w, '0');
   function fmtDur(seconds) {
     seconds = Math.max(0, Math.floor(seconds || 0));
@@ -246,6 +250,106 @@
     );
   }
 
+  /** "2 requested · 5 from the radio mix", or why the queue is not moving. */
+  function queueSummary(s) {
+    if (s.player.paused) return 'Playback paused';
+    const radio = Math.max(0, s.queue_size - (s.queue_requests ?? s.queue_size));
+    const requested = s.queue_size - radio;
+    if (s.radio_autoplay === false) return `${requested} requested · auto-radio off`;
+    return `${requested} requested · ${radio} from radio`;
+  }
+
+  // ------------------------------------------- add a song from the dashboard ---
+  let requesting = false;
+  let requestStatusTimer = 0;
+  function setRequestStatus(message, kind = '') {
+    const line = $('#requestStatus');
+    line.textContent = message;
+    line.className = `search-status ${kind}`.trim();
+    clearTimeout(requestStatusTimer);
+    if (message && kind) requestStatusTimer = setTimeout(() => setRequestStatus(''), 9000);
+  }
+  function renderRequestForm() {
+    const live = running();
+    $('#requestInput').disabled = !live || requesting;
+    $('#btnRequest').disabled = !live || requesting;
+    $('#btnRequest').textContent = requesting ? 'Looking…' : 'Add to queue';
+    $('#requestInput').title = live ? '' : 'Start the bot first';
+  }
+  $('#requestForm').addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const input = $('#requestInput');
+    const text = input.value.trim();
+    if (!text || requesting || !running()) return;
+    requesting = true;
+    setRequestStatus('Looking that up…');
+    renderRequestForm();
+    try {
+      const result = await api.requestSong(text);
+      if (result && result.ok) {
+        input.value = '';
+        setRequestStatus(`Added: ${result.title} (#${result.position} in the queue)`, 'ok');
+      } else {
+        setRequestStatus((result && result.error) || 'Could not add that song.', 'err');
+      }
+    } catch {
+      setRequestStatus('Could not reach the bot.', 'err');
+    } finally {
+      requesting = false;
+      renderRequestForm();
+      input.focus();
+    }
+  });
+
+  // ----------------------------------------------------- radio-mix lookahead ---
+  // Keeps the next N songs of the radio mix queued behind whatever was requested. It lives here and
+  // nowhere else: not in chat commands, not in the browser settings page.
+  let lookahead = { enabled: true, count: 5 };
+  let lookaheadTimer = 0;
+  let lookaheadHoldUntil = 0; // after the user changes it, ignore snapshots that may predate the change
+  function renderLookahead() {
+    const live = running();
+    // While the bot runs, what it reports is the truth; the user's own edit wins while they are typing
+    // and for a moment after, until the bot has had time to pick the change up.
+    if (live && snap && snap.radio_lookahead && !lookaheadTimer && Date.now() >= lookaheadHoldUntil) lookahead = snap.radio_lookahead;
+    const on = $('#lookaheadOn');
+    const count = $('#lookaheadCount');
+    on.checked = lookahead.enabled;
+    if (document.activeElement !== count) count.value = String(lookahead.count);
+    count.disabled = !lookahead.enabled;
+    const radioOff = live && snap && snap.radio_autoplay === false;
+    $('#lookaheadHint').textContent = radioOff
+      ? 'Auto-radio is off (Settings, or !radio on), so no radio songs are queued.'
+      : lookahead.enabled
+        ? `Keeps the next ${lookahead.count} song${lookahead.count === 1 ? '' : 's'} of the radio mix queued, like YouTube Music.`
+        : 'Off: a radio song is added only when the queue runs dry.';
+  }
+  async function saveLookahead(patch) {
+    lookahead = { ...lookahead, ...patch };
+    lookaheadHoldUntil = Date.now() + 3000;
+    renderLookahead();
+    try {
+      lookahead = await api.setLookahead(lookahead);
+    } catch (error) {
+      toast(`Could not save the radio lookahead: ${error.message}`, 'err');
+    }
+    renderLookahead();
+  }
+  $('#lookaheadOn').addEventListener('change', (event) => saveLookahead({ enabled: event.target.checked }));
+  $('#lookaheadCount').addEventListener('input', (event) => {
+    const n = Number.parseInt(event.target.value, 10);
+    if (!Number.isFinite(n)) return;
+    clearTimeout(lookaheadTimer);
+    lookaheadTimer = setTimeout(() => {
+      lookaheadTimer = 0;
+      saveLookahead({ count: Math.max(1, Math.min(15, n)) });
+    }, 400);
+  });
+  $('#lookaheadCount').addEventListener('blur', (event) => {
+    const n = Number.parseInt(event.target.value, 10);
+    event.target.value = String(Number.isFinite(n) ? Math.max(1, Math.min(15, n)) : lookahead.count);
+  });
+
   let lastThumb = '';
   function renderDashboard() {
     if (currentTab !== 'dashboard') return;
@@ -253,7 +357,7 @@
     const s = snap;
     $('#kpiListeners').textContent = live && s ? String(s.player.listeners) : '–';
     $('#kpiQueue').textContent = live && s ? String(s.queue_size) : '–';
-    $('#kpiQueueSub').textContent = live && s ? (s.player.paused ? 'Playback paused' : s.radio_autoplay === false ? 'Auto-radio is off' : s.radio_autoplay ? 'Auto-radio is on' : '\u00a0') : '\u00a0';
+    $('#kpiQueueSub').textContent = live && s ? queueSummary(s) : '\u00a0';
     $('#kpiPlayed').textContent = live && s ? String(s.counters.tracks_played) : '–';
     $('#kpiPlayedSub').textContent = live && s ? `${s.counters.skips} skipped · ${s.counters.tracks_failed} failed` : '\u00a0';
     $('#kpiUptimeSub').textContent = live && status.startedAt ? `Since ${new Date(status.startedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}` : 'Not running';
@@ -261,7 +365,7 @@
     // now playing
     const np = live && s ? s.now : null;
     $('#nowTitle').textContent = np ? np.title : live ? 'Waiting for a request…' : 'Nothing playing';
-    $('#nowSub').textContent = np ? np.uploader || '' : live ? 'Type !sr <song or link> in your chat.' : 'Start the bot, then use !sr in chat.';
+    $('#nowSub').textContent = np ? np.uploader || '' : live ? 'Add a song above, or type !sr <song or link> in your chat.' : 'Start the bot, then add a song above or use !sr in chat.';
     const tags = $('#nowTags');
     tags.replaceChildren();
     if (np) {
@@ -291,10 +395,12 @@
     const list = $('#queueList');
     const items = live && s ? s.queue : [];
     list.replaceChildren(
-      ...items.map((item) => h('li', {}, h('span', { class: 'q-title', text: item.title }), h('span', { class: 'q-by', text: item.radio ? 'auto radio' : item.requester }))),
+      ...items.map((item) => h('li', { class: item.radio ? 'radio' : '' }, h('span', { class: 'q-title', text: item.title }), h('span', { class: 'q-by', text: item.radio ? 'radio mix' : item.requester }))),
     );
     if (live && s && s.queue_size > items.length) list.append(h('li', {}, h('span', { class: 'q-title muted', text: `…and ${s.queue_size - items.length} more` })));
     $('#queueEmpty').hidden = items.length > 0;
+    renderRequestForm();
+    renderLookahead();
 
     // health
     $('#healthList').replaceChildren(
@@ -585,7 +691,7 @@
         );
         return;
       }
-      holder.replaceChildren(input, toggle, form.secretSet ? h('button', { class: 'btn ghost sm', type: 'button', text: 'Cancel', onclick: () => {
+      replaceKids(holder, input, toggle, form.secretSet ? h('button', { class: 'btn ghost sm', type: 'button', text: 'Cancel', onclick: () => {
         form.secretEditing = false;
         input.value = '';
         set('');
@@ -674,6 +780,13 @@
       ['launchAtLogin', 'Open Twitch Radio when I sign in to Windows', 'Starts minimized to the tray.'],
     ].filter(([key]) => key !== 'launchAtLogin' || appInfo.platform !== 'linux'); // Electron can't set login items on Linux
     const card = h('div', { class: 'card' }, h('div', { class: 'card-head' }, h('h2', { text: 'This app' })));
+    const theme = h('select', { class: 'input', id: 'p-theme' },
+      ...[['system', 'Match my system'], ['light', 'Light'], ['dark', 'Dark']].map(([value, label]) => h('option', { value, text: label })));
+    theme.value = prefs.theme || 'system';
+    theme.addEventListener('change', async () => {
+      prefs = await api.setPrefs({ theme: theme.value });
+    });
+    card.append(h('div', { class: 'field' }, h('label', { class: 'name', for: 'p-theme', text: 'Appearance' }), h('div', { class: 'ctl' }, theme, h('div', { class: 'hint', text: 'Light or dark, or follow Windows / your desktop.' }))));
     toggles.forEach(([key, label, hint]) => {
       const box = h('input', { type: 'checkbox', id: `p-${key}` });
       box.checked = !!prefs[key];
@@ -721,7 +834,7 @@
     ytButtons.push(h('button', { class: 'btn primary sm', type: 'button', disabled: busy || !y.available, text: upd.busy === 'install' ? 'Updating…' : 'Update', onclick: () => changeYtdlp('install') }));
     if (y.previous) ytButtons.push(h('button', { class: 'btn ghost sm', type: 'button', disabled: busy, text: `Roll back to ${y.previous}`, onclick: () => changeYtdlp('rollback') }));
     const solver = pre && pre.js_solver;
-    card.replaceChildren(
+    replaceKids(card,
       h('div', { class: 'card-head' }, h('h2', { text: 'Updates' })),
       updateRow('This app', h('span', { class: 'muted', text: appStatus }), appButtons, 'Only checks and links to the installer; nothing is installed for you.'),
       prefToggle('checkAppUpdates', 'Check for app updates automatically (once a day)'),
@@ -880,6 +993,10 @@
 
   async function init() {
     [appInfo, prefs] = await Promise.all([api.appInfo(), api.getPrefs()]);
+    api.getLookahead().then((saved) => {
+      lookahead = saved;
+      renderLookahead();
+    }).catch(() => {});
     $('#sideVersion').textContent = `v${appInfo.version}`;
     const current = await api.getStatus();
     status = current.status;

@@ -18,6 +18,9 @@ contextBridge.exposeInMainWorld('api', {
   stop: invoke('bot:stop'),
   restart: invoke('bot:restart'),
   command: invoke('bot:command'),
+  requestSong: invoke('bot:requestSong'),
+  getLookahead: invoke('radio:getLookahead'),
+  setLookahead: invoke('radio:setLookahead'),
   onStatus: subscribe('bot:status'),
   onState: subscribe('bot:state'),
   // logs

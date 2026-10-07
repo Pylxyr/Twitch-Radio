@@ -7,12 +7,14 @@
  * twitch_radio/headless.py), and the config files the Settings tab edits.
  * All UI lives in renderer/; it only sees the functions in preload.js.
  */
-const { app, BrowserWindow, Tray, Menu, ipcMain, shell, dialog, nativeImage } = require('electron');
+const { app, BrowserWindow, Tray, Menu, ipcMain, shell, dialog, nativeImage, nativeTheme } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const readline = require('readline');
 const { spawn, execFile } = require('child_process');
 const { checkForAppUpdate, shouldAutoCheck, shouldAutoCheckYtdlp } = require('./updates');
+const { cleanQuery, normalizeLookahead, isTheme } = require('./validate');
+const { WINDOW_COLORS, resolveTheme } = require('./theme');
 
 const IS_WIN = process.platform === 'win32';
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -31,6 +33,7 @@ const DEFAULT_PREFS = {
   closeAction: 'tray', // remembered answer when askOnClose is off: 'tray' | 'quit'
   autoRestart: true, // restart after a crash (never after a config error)
   startBotOnLaunch: false,
+  theme: 'system', // 'system' | 'light' | 'dark'
   launchAtLogin: false,
   checkAppUpdates: true, // at most once a day
   checkYtdlpOnStartup: true,
@@ -43,6 +46,7 @@ let prefs = { ...DEFAULT_PREFS };
 function loadPrefs() {
   try {
     prefs = { ...DEFAULT_PREFS, ...JSON.parse(fs.readFileSync(prefsFile(), 'utf8')) };
+    if (!isTheme(prefs.theme)) prefs.theme = DEFAULT_PREFS.theme;
   } catch {
     prefs = { ...DEFAULT_PREFS };
   }
@@ -339,20 +343,21 @@ async function restartBot() {
   await stopBot();
   return startBot();
 }
-function sendCommand(name) {
+/** Sends one command to the running bot and resolves with its answer. `extra` fields ride along (e.g. a song query); a lookup can take a while, hence the timeout argument. */
+function sendCommand(name, extra = {}, timeoutMs = 4000) {
   if (!core.child) return Promise.resolve({ ok: false, error: 'The bot is not running.' });
   return new Promise((resolve) => {
     const id = ++core.ackId;
     const timer = setTimeout(() => {
       core.pendingAcks.delete(id);
       resolve({ ok: false, error: 'No answer from the bot.' });
-    }, 4000);
+    }, timeoutMs);
     core.pendingAcks.set(id, (ack) => {
       clearTimeout(timer);
       resolve(ack);
     });
     try {
-      core.child.stdin.write(JSON.stringify({ cmd: name, id }) + '\n');
+      core.child.stdin.write(JSON.stringify({ ...extra, cmd: name, id }) + '\n');
     } catch {
       clearTimeout(timer);
       core.pendingAcks.delete(id);
@@ -417,6 +422,7 @@ async function liveFiles() {
   return {
     tunables: files.tunables || path.join(HOME, 'data', 'tunables.json'),
     toggles: files.toggles || path.join(HOME, 'data', 'toggles.json'),
+    lookahead: files.radio_lookahead || path.join(HOME, 'data', 'radio_lookahead.json'),
   };
 }
 function readJson(file) {
@@ -489,11 +495,31 @@ async function saveLive(payload) {
   atomicWrite(files.tunables, JSON.stringify(current, null, 2));
   if (typeof payload?.radio_autoplay_enabled === 'boolean') {
     const toggles = readJson(files.toggles);
+    const changed = toggles.radio_autoplay_enabled !== payload.radio_autoplay_enabled;
     toggles.radio_autoplay_enabled = payload.radio_autoplay_enabled;
     atomicWrite(files.toggles, JSON.stringify(toggles, null, 2));
+    // Auto-radio decides whether radio-mix songs may sit in the queue: tell a running bot now.
+    if (changed && core.child) await sendCommand('radio_lookahead');
   }
   guiLog('INFO', 'Live limits saved.');
   return getLive();
+}
+
+// ------------------------------------------------------- radio lookahead ---
+// Keep the next N songs of the radio mix queued (1 to 15). Changed from the dashboard only: the file
+// is written here and read by the bot, never by chat commands or the browser settings page.
+async function getLookahead() {
+  const files = await liveFiles();
+  return normalizeLookahead(readJson(files.lookahead));
+}
+async function setLookahead(value) {
+  const files = await liveFiles();
+  const next = normalizeLookahead({ ...(await getLookahead()), ...(value && typeof value === 'object' ? value : {}) });
+  fs.mkdirSync(path.dirname(files.lookahead), { recursive: true });
+  atomicWrite(files.lookahead, JSON.stringify(next, null, 2));
+  if (core.child) await sendCommand('radio_lookahead'); // trims or tops up the queue right away
+  guiLog('INFO', next.enabled ? `Radio lookahead on: ${next.count} song(s).` : 'Radio lookahead off.');
+  return next;
 }
 
 // -------------------------------------------------------------- updates ---
@@ -581,6 +607,27 @@ function send(channel, payload) {
   if (win && !win.isDestroyed() && !win.webContents.isDestroyed()) win.webContents.send(channel, payload);
 }
 
+// ----------------------------------------------------------------- theme ---
+function currentWindowColors() {
+  return WINDOW_COLORS[resolveTheme(prefs.theme, nativeTheme.shouldUseDarkColors)];
+}
+/**
+ * Applies the Appearance setting. nativeTheme.themeSource makes the page's prefers-color-scheme
+ * follow it (the stylesheet has a dark and a light palette and nothing else), and the window's own
+ * background and Windows caption buttons are set to match.
+ */
+function applyTheme() {
+  nativeTheme.themeSource = isTheme(prefs.theme) ? prefs.theme : 'system';
+  syncWindowColors();
+}
+/** Window chrome follows whatever the page is now showing (also when the OS flips under "System"). */
+function syncWindowColors() {
+  if (!win || win.isDestroyed()) return;
+  const colors = currentWindowColors();
+  win.setBackgroundColor(colors.background);
+  if (IS_WIN) win.setTitleBarOverlay({ color: colors.background, symbolColor: colors.symbols, height: 44 });
+}
+
 function createWindow() {
   win = new BrowserWindow({
     width: 1220,
@@ -588,11 +635,11 @@ function createWindow() {
     minWidth: 980,
     minHeight: 640,
     show: false,
-    backgroundColor: '#0b0b10',
+    backgroundColor: currentWindowColors().background,
     title: 'Twitch Radio',
     icon: path.join(__dirname, 'renderer', 'icon.png'),
     ...(IS_WIN
-      ? { titleBarStyle: 'hidden', titleBarOverlay: { color: '#0b0b10', symbolColor: '#c9c9d9', height: 44 } }
+      ? { titleBarStyle: 'hidden', titleBarOverlay: { color: currentWindowColors().background, symbolColor: currentWindowColors().symbols, height: 44 } }
       : {}),
     webPreferences: {
       preload: path.join(__dirname, 'preload.js'),
@@ -720,6 +767,15 @@ function registerIpc() {
     return sendCommand(name);
   });
 
+  // A song typed into the dashboard's search bar: queued for the streamer, answered when found.
+  ipcMain.handle('bot:requestSong', (_e, text) => {
+    const query = cleanQuery(text);
+    if (!query) return { ok: false, error: 'Type a song name or paste a link.' };
+    return sendCommand('request', { query }, 90000);
+  });
+  ipcMain.handle('radio:getLookahead', () => getLookahead());
+  ipcMain.handle('radio:setLookahead', (_e, value) => setLookahead(value));
+
   ipcMain.handle('logs:get', () => logBuffer);
   ipcMain.handle('logs:clear', () => {
     logBuffer.length = 0;
@@ -752,7 +808,9 @@ function registerIpc() {
     for (const key of PAGE_PREFS) {
       if (patch && key in patch && typeof patch[key] === typeof DEFAULT_PREFS[key]) prefs[key] = patch[key];
     }
+    if (!isTheme(prefs.theme)) prefs.theme = DEFAULT_PREFS.theme;
     savePrefs();
+    applyTheme();
     if (app.isPackaged && (IS_WIN || process.platform === 'darwin')) app.setLoginItemSettings({ openAtLogin: !!prefs.launchAtLogin, args: ['--hidden'] });
     return prefs;
   });
@@ -813,6 +871,8 @@ if (!app.requestSingleInstanceLock()) {
 
   app.whenReady().then(async () => {
     loadPrefs();
+    applyTheme();
+    nativeTheme.on('updated', syncWindowColors);
     registerIpc();
     if (!startHidden) createWindow();
     createTray();

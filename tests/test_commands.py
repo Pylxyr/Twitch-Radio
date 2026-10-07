@@ -34,6 +34,7 @@ def _make(tmp_path: Path, *, active_requester_id: int | None = None, queued: lis
     player.active_requester_id = active_requester_id
     player.skip_current.return_value = active_requester_id is not None
     player.queued_items.return_value = queued or []
+    player.apply_radio_lookahead = AsyncMock()
     bot = SimpleNamespace(
         player=player,
         safe_reply=AsyncMock(),

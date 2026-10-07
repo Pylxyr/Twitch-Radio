@@ -71,7 +71,7 @@ class SongRequestComponent(commands.Component):
             )
             return
 
-        if self.bot.player.queue_size() >= tunables.queue_cap:
+        if self.bot.player.real_queue_size() >= tunables.queue_cap:
             await self.bot.safe_reply(ctx, "Queue's full right now — try again in a bit.")
             return
 
@@ -148,17 +148,14 @@ class SongRequestComponent(commands.Component):
                 await self.bot.safe_reply(ctx, f"That's too long to queue — max is {minutes} minute(s).")
                 return
 
-            already_queued = track.webpage_url == self.bot.player.active_webpage_url or any(
-                item.webpage_url == track.webpage_url for item in self.bot.player.queued_items()
-            )
-            if already_queued:
+            if self.bot.player.is_already_requested(track.webpage_url):
                 await self.bot.safe_reply(ctx, f"{track.title} is already queued.")
                 return
 
             # Re-check the cap right before enqueuing (no await between this
             # check and enqueue() below) — the resolve above may have taken
             # long enough for the queue to have filled up meanwhile.
-            if self.bot.player.queue_size() >= tunables.queue_cap:
+            if self.bot.player.real_queue_size() >= tunables.queue_cap:
                 await self.bot.safe_reply(ctx, "Queue's full right now — try again in a bit.")
                 return
 
@@ -182,7 +179,7 @@ class SongRequestComponent(commands.Component):
             reserved = False  # ownership of the reservation now belongs to on_start's eventual decrement
             counters.record("requests_queued")
             await self.bot.safe_reply(
-                ctx, f"Queued: {track.title} (#{self.bot.player.queue_size()} in queue)"
+                ctx, f"Queued: {track.title} (#{self.bot.player.real_queue_size()} in queue)"
             )
         except Exception:
             # Catch-all so a bug here can't silently eat the chatter's
@@ -270,4 +267,6 @@ class SongRequestComponent(commands.Component):
             return toggles.to_dict()
 
         await self.bot.toggles_store.update(_mutate)
+        # Turning it off also clears any radio-mix songs already lined up; turning it on refills.
+        await self.bot.player.apply_radio_lookahead()
         await self.bot.safe_reply(ctx, f"Radio autoplay is now {arg}.")

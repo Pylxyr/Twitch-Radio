@@ -30,8 +30,9 @@ import aiohttp
 from twitch_radio.admin.app import run_admin_server
 from twitch_radio.chatbot import TwitchChatBot
 from twitch_radio.config import Settings, token_status
-from twitch_radio.extraction import Resolver
-from twitch_radio.player import RadioPlayer
+from twitch_radio.extraction import Resolver, UnsupportedSourceError
+from twitch_radio.lookahead import RadioLookahead
+from twitch_radio.player import QueuedRequest, RadioPlayer
 from twitch_radio.radio import RadioSuggester
 from twitch_radio.store import JsonStore
 from twitch_radio.telemetry import counters
@@ -107,6 +108,11 @@ def describe_failure(exc: BaseException) -> tuple[str, str, int]:
     return f"{type(exc).__name__}: {exc}", "See the Logs tab for the full traceback.", EXIT_RUNTIME
 
 
+# Longest dashboard search text accepted, and the name songs queued from the dashboard show up under.
+_MAX_DASHBOARD_QUERY = 300
+_DASHBOARD_REQUESTER = "Streamer"
+
+
 class BotRuntime:
     def __init__(self, settings: Settings, emit: EmitFn | None = None) -> None:
         self.settings = settings
@@ -121,6 +127,7 @@ class BotRuntime:
         self._player: RadioPlayer | None = None
         self._tunables_store: JsonStore | None = None
         self._toggles_store: JsonStore | None = None
+        self._lookahead_store: JsonStore | None = None
         self._admin: aiohttp.web.AppRunner | None = None
         self._bot: TwitchChatBot | None = None
         self._monitor: asyncio.Task[None] | None = None
@@ -130,6 +137,7 @@ class BotRuntime:
         self._tokens: dict[str, object] = {}
         self._tokens_at = 0.0
         self._radio_autoplay: bool | None = None
+        self._radio_lookahead: RadioLookahead | None = None
         self._bg: set[asyncio.Task[Any]] = set()
 
     # -- public ----------------------------------------------------------
@@ -164,6 +172,58 @@ class BotRuntime:
         if on and self._changes is not None:
             with contextlib.suppress(asyncio.QueueFull):
                 self._changes.put_nowait(None)
+
+    async def apply_radio_lookahead(self) -> None:
+        """The dashboard changed the radio-mix lookahead (or auto-radio): re-read it and trim or
+        top up the queue right away."""
+        if self._player is not None:
+            await self._player.apply_radio_lookahead()
+        if self._changes is not None:
+            with contextlib.suppress(asyncio.QueueFull):
+                self._changes.put_nowait(None)
+
+    async def request_song(self, query: str) -> dict[str, Any]:
+        """Queues a song for the streamer straight from the dashboard - what !sr does for a
+        viewer, minus the chat chatter and the per-viewer limits (cooldown, pending count, length
+        and queue caps), which exist to keep viewers from flooding the stream, not the streamer.
+        Returns {"ok": True, "title", "position"} or {"ok": False, "error"}."""
+        query = " ".join(str(query).split())
+        if not query:
+            return {"ok": False, "error": "Type a song name or paste a link."}
+        if len(query) > _MAX_DASHBOARD_QUERY:
+            return {"ok": False, "error": "That is too long for a song request."}
+        player, resolver = self._player, self._resolver
+        if player is None or resolver is None:
+            return {"ok": False, "error": "The bot is still starting."}
+        try:
+            requester_id = int(self.settings.owner_id)
+        except ValueError:
+            requester_id = 1  # never 0: that marks radio-mix filler
+        try:
+            track = await resolver.resolve(query, requester_id)
+        except UnsupportedSourceError as exc:
+            return {"ok": False, "error": str(exc)}
+        except Exception:
+            log.exception("Dashboard song request failed to resolve: %s", query)
+            return {"ok": False, "error": "Couldn't fetch that. Try a different search or link."}
+        if track is None:
+            return {"ok": False, "error": "No results for that."}
+        if track.is_live:
+            return {"ok": False, "error": "Can't queue a livestream."}
+        if player.is_already_requested(track.webpage_url):
+            return {"ok": False, "error": f"{track.title} is already queued."}
+        player.enqueue(
+            QueuedRequest(
+                webpage_url=track.webpage_url,
+                requester_id=requester_id,
+                requester_name=_DASHBOARD_REQUESTER,
+                title=track.title,
+                uploader=track.uploader,
+            )
+        )
+        counters.record("requests_queued")
+        log.info("Queued from the dashboard: %s", track.title)
+        return {"ok": True, "title": track.title, "position": player.real_queue_size()}
 
     def clear_queue(self) -> int:
         if self._player is None:
@@ -219,6 +279,7 @@ class BotRuntime:
         self._resolver = Resolver(s)
         self._tunables_store = JsonStore(s.tunables_path)
         self._toggles_store = JsonStore(s.toggles_path)
+        self._lookahead_store = JsonStore(s.lookahead_path)
 
         player = self._player = RadioPlayer(
             resolver=self._resolver.resolve,
@@ -232,6 +293,13 @@ class BotRuntime:
 
         toggles_store = self._toggles_store
         tunables_store = self._tunables_store
+        lookahead_store = self._lookahead_store
+
+        async def _lookahead() -> tuple[bool, int]:
+            setting = RadioLookahead.from_dict(await lookahead_store.read())
+            return setting.enabled, setting.count
+
+        player.set_radio_lookahead(suggester.suggest_many, _lookahead)
 
         async def _radio_enabled() -> bool:
             return FeatureToggles.from_dict(await toggles_store.read()).radio_autoplay_enabled
@@ -457,6 +525,9 @@ class BotRuntime:
                 self._radio_autoplay = FeatureToggles.from_dict(
                     await self._toggles_store.read()
                 ).radio_autoplay_enabled
+        if self._lookahead_store is not None:
+            with contextlib.suppress(Exception):
+                self._radio_lookahead = RadioLookahead.from_dict(await self._lookahead_store.read())
 
     def _emit_snapshot(self, lag_ms: float) -> None:
         if self._emit is not None:
@@ -469,6 +540,7 @@ class BotRuntime:
         now: dict[str, Any] | None = None
         queue: list[dict[str, Any]] = []
         queue_size = 0
+        queue_requests = 0
         player_info: dict[str, Any] = {"state": "idle", "paused": False, "listeners": 0}
         if player is not None:
             np = player.now_playing
@@ -485,6 +557,7 @@ class BotRuntime:
                 }
             items = player.queued_items()
             queue_size = len(items)
+            queue_requests = player.real_queue_size()
             queue = [
                 {
                     "title": item.title or "Unknown title",
@@ -510,7 +583,9 @@ class BotRuntime:
             "now": now,
             "queue": queue,
             "queue_size": queue_size,
+            "queue_requests": queue_requests,
             "radio_autoplay": self._radio_autoplay,
+            "radio_lookahead": self._radio_lookahead.to_dict() if self._radio_lookahead else None,
             "chat": {
                 "ready": bool(bot and bot.ready),
                 "subscribed": bool(bot and bot.chat_subscribed),

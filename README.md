@@ -98,10 +98,30 @@ The port can be changed in **Settings > Network** if `8098` is taken.
 | `!sr <song or link>` | Everyone | Queue a YouTube song or search by name |
 | `!sq` (`!songqueue`) | Everyone | Show what's coming up. It is not `!queue`, so it doesn't clash with another bot that uses that name |
 | `!skip` | Mods, the broadcaster, or whoever requested the current song | Skip the current song |
-| `!radio` | Everyone to check; only the broadcaster can change it (`!radio on` / `!radio off`) | Auto-radio: when the queue runs dry, queue a related song instead of going quiet |
+| `!radio` | Everyone to check; only the broadcaster can change it (`!radio on` / `!radio off`) | Auto-radio: when the queue runs dry, queue a related song instead of going quiet. Turning it off also clears radio songs already queued |
 
 Nothing else is registered, so other bots in your channel keep every other `!command`. Pausing,
 resuming and clearing the queue are buttons in the desktop app.
+
+## The dashboard
+
+**Add a song without chat.** The search bar at the top of the Dashboard queues a song for you, the
+same way `!sr` does for a viewer: type a name or paste a YouTube link and press Enter. It shows what
+it found (or why it couldn't). Because it is you, it skips the viewer limits (cooldown, pending
+count, track length, queue cap) but still refuses live streams and a song that is already queued.
+It needs the bot to be running.
+
+**Radio lookahead.** Under the queue is the *Radio lookahead* switch with a number from 1 to 15. When
+it is on, the app keeps that many songs from the radio mix (YouTube's related-songs list for what was
+requested) queued behind the requests, like YouTube Music's radio: request one song and the next N
+songs of its mix appear in the queue in order, and the list is topped up as songs start playing.
+Requests from viewers still go in front of the radio songs, and radio songs never count against the
+queue cap. Only the song that is next gets prepared ahead of time, so queuing more costs no extra
+memory or CPU while they wait. Turning it off removes the queued radio songs; a single radio song is
+then added only when the queue runs dry. It needs auto-radio on (`!radio on`), and it can only be
+changed here, not from chat or the browser settings page.
+
+**Appearance.** Settings > This app > Appearance: match your system, light, or dark.
 
 ---
 
@@ -183,7 +203,7 @@ To build the installer yourself, see [BUILD.md](BUILD.md).
 | | Desktop app | From source |
 |---|---|---|
 | Settings (`.env`) | `%APPDATA%\TwitchRadio\.env` | `.env` in the project folder |
-| Tokens, queue, limits, yt-dlp cache | `%APPDATA%\TwitchRadio\data\` | `data\` in the project folder |
+| Tokens, queue, limits, radio lookahead, yt-dlp cache | `%APPDATA%\TwitchRadio\data\` | `data\` in the project folder |
 | Logs | `%APPDATA%\TwitchRadio\logs\` | `logs\` in the project folder |
 | Window preferences | `%APPDATA%\TwitchRadio\gui\` | same |
 

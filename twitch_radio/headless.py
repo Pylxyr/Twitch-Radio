@@ -13,6 +13,10 @@ Protocol (one JSON object per line, UTF-8):
 
   app -> core (stdin)
     {"cmd":"stop"|"skip"|"pause"|"resume"|"clear_queue", "id"?: n}
+    {"cmd":"request", "query": "song name or link", "id": n}   queue a song for the streamer;
+                                the ack carries {"ok", "title", "position"} or {"ok": false, "error"}
+    {"cmd":"radio_lookahead", "id"?: n}   the radio-mix lookahead / auto-radio setting changed:
+                                re-read it and trim or top up the queue
     {"cmd":"watch", "on": true|false}   the dashboard is / is not on screen
 
 stdin reaching EOF means the app is gone (closed, crashed, killed): the bot
@@ -32,6 +36,7 @@ import queue
 import sys
 import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 from twitch_radio.logbus import LogBus
@@ -100,15 +105,47 @@ def _bootstrap_logging(emitter: Emitter) -> LogBus:
     return bus
 
 
-def _read_commands(loop: asyncio.AbstractEventLoop, runtime: BotRuntime, emitter: Emitter) -> None:
+def build_dispatcher(runtime: BotRuntime, emitter: Emitter) -> Callable[[dict[str, Any]], None]:
+    """The function that carries out one command from the app. Must be called on the event loop."""
     log = logging.getLogger("twitch_radio.headless")
-    stdin = sys.stdin.buffer if sys.stdin is not None else None
-    if stdin is None:
-        return
+    background: set[asyncio.Task[None]] = set()
+
+    def run_async(message: dict[str, Any], work: Any) -> None:
+        """Commands that take a while (a song lookup): answered when they finish, not before."""
+
+        async def finish() -> None:
+            reply: dict[str, Any] = {"t": "ack", "id": message.get("id")}
+            try:
+                reply.update(await work())
+            except Exception:  # noqa: BLE001 - the app gets an answer either way
+                log.exception("Command %r failed", message.get("cmd"))
+                reply.update(ok=False, error="Something went wrong. See the Logs tab.")
+            if message.get("id") is not None:
+                emitter.send(reply)
+
+        task = asyncio.get_running_loop().create_task(finish(), name=f"command-{message.get('cmd')}")
+        background.add(task)
+        task.add_done_callback(background.discard)
 
     def dispatch(message: dict[str, Any]) -> None:
         command = message.get("cmd")
         reply: dict[str, Any] = {"t": "ack", "id": message.get("id"), "ok": True}
+        if command == "request":
+            query = message.get("query")
+
+            async def request() -> dict[str, Any]:
+                return await runtime.request_song(query if isinstance(query, str) else "")
+
+            run_async(message, request)
+            return
+        if command == "radio_lookahead":
+
+            async def apply() -> dict[str, Any]:
+                await runtime.apply_radio_lookahead()
+                return {"ok": True}
+
+            run_async(message, apply)
+            return
         if command == "stop":
             runtime.request_stop("stop requested from the app")
         elif command == "skip":
@@ -127,6 +164,21 @@ def _read_commands(loop: asyncio.AbstractEventLoop, runtime: BotRuntime, emitter
         if message.get("id") is not None:
             emitter.send(reply)
 
+    return dispatch
+
+
+def _read_commands(loop: asyncio.AbstractEventLoop, runtime: BotRuntime, emitter: Emitter) -> None:
+    stdin = sys.stdin.buffer if sys.stdin is not None else None
+    if stdin is None:
+        return
+    dispatch: Callable[[dict[str, Any]], None] | None = None
+
+    def ensure_dispatcher(message: dict[str, Any]) -> None:
+        nonlocal dispatch
+        if dispatch is None:
+            dispatch = build_dispatcher(runtime, emitter)
+        dispatch(message)
+
     while True:
         try:
             raw = stdin.readline()
@@ -140,7 +192,7 @@ def _read_commands(loop: asyncio.AbstractEventLoop, runtime: BotRuntime, emitter
         except ValueError:
             continue
         if isinstance(message, dict):
-            loop.call_soon_threadsafe(dispatch, message)
+            loop.call_soon_threadsafe(ensure_dispatcher, message)
 
 
 def run_headless() -> int:

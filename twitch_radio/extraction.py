@@ -604,7 +604,7 @@ class Resolver:
             "and that your firewall or antivirus allows github.com, then try again."
         )
 
-    async def resolve_radio_mix(self, mix_url: str) -> list[dict[str, Any]]:
+    async def resolve_radio_mix(self, mix_url: str, limit: int = 15) -> list[dict[str, Any]]:
         """Flat-extracts a YouTube 'watch?v=X&list=RDX' Mix — YouTube's own
         "more like this" queue, reused instead of building a recommendation
         engine. extract_flat skips per-entry format resolution, so this
@@ -619,7 +619,7 @@ class Resolver:
         options = {
             **self._build_options(),
             "extract_flat": "in_playlist",
-            "playlist_items": "1-15",
+            "playlist_items": f"1-{max(1, limit)}",
             "noplaylist": False,
         }
         try:
