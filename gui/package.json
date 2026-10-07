@@ -1,7 +1,7 @@
 {
   "name": "twitch-radio",
   "productName": "Twitch Radio",
-  "version": "1.0.2",
+  "version": "1.1.0",
   "description": "Twitch Radio: desktop control panel for the song-request radio",
   "main": "main.js",
   "private": true,

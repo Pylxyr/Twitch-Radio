@@ -5,7 +5,8 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { WINDOW_COLORS, resolveTheme } = require('../theme');
 
-const css = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'styles.css'), 'utf8');
+// Git checks files out with CRLF line endings on Windows (see .gitattributes); the patterns below use \n.
+const css = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'styles.css'), 'utf8').replace(/\r\n/g, '\n');
 
 /** The `--name: value` pairs inside a block that starts at `opener`. */
 function variablesIn(opener) {
