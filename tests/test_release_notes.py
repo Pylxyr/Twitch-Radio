@@ -368,3 +368,26 @@ def test_an_http_error_shows_the_services_own_explanation(
     assert release_notes.ai_summary("v1.0.0", "v1.1.0", []) is None
     err = capsys.readouterr().err
     assert "HTTP 404" in err and "does not exist" in err
+
+
+def test_post_json_sends_a_user_agent(monkeypatch):
+    # Cloudflare-fronted services (Groq) reject urllib's default agent with "HTTP 403: error code: 1010".
+    seen = {}
+
+    class _Reply:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, *args):
+            return b"{}"
+
+    def fake_urlopen(request, timeout=None):
+        seen["agent"] = request.get_header("User-agent")
+        return _Reply()
+
+    monkeypatch.setattr(release_notes.urllib.request, "urlopen", fake_urlopen)
+    release_notes._post_json("https://example.invalid/v1/chat/completions", {}, {})
+    assert seen["agent"] and "Python-urllib" not in seen["agent"]
