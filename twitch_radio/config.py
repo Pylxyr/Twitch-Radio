@@ -116,6 +116,41 @@ def _clamped_int_env(name: str, default: int, lo: int, hi: int) -> int:
     return clamped
 
 
+def _clamped_float_env(name: str, default: float, lo: float, hi: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        _warn(f"WARNING: {name}={raw!r} is not a valid number — using {default}.")
+        return default
+    if value != value:  # NaN
+        return default
+    clamped = max(lo, min(hi, value))
+    if clamped != value:
+        _warn(f"WARNING: {name}={value} is outside the allowed range {lo}-{hi} — using {clamped}.")
+    return clamped
+
+
+# What the app is for. "twitch": the song-request bot for a stream (chat commands, OBS audio source
+# and overlay), the default. "player": a plain music player - songs you search for play through this
+# PC's speakers; no Twitch account, sign-in or OBS involved.
+MODE_TWITCH = "twitch"
+MODE_PLAYER = "player"
+MODES = (MODE_TWITCH, MODE_PLAYER)
+
+
+def _mode_env(name: str = "RADIO_MODE") -> str:
+    raw = os.getenv(name, "").strip().lower()
+    if not raw:
+        return MODE_TWITCH
+    if raw not in MODES:
+        _warn(f"WARNING: {name}={raw!r} is not one of {', '.join(MODES)} — using {MODE_TWITCH}.")
+        return MODE_TWITCH
+    return raw
+
+
 _VALID_LOG_LEVELS = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
 
 
@@ -237,6 +272,13 @@ class Settings:
     log_to_file: bool
     log_dir: Path
 
+    # MODE_TWITCH or MODE_PLAYER (see above). The Twitch fields above are only filled in, and only
+    # required, in MODE_TWITCH.
+    mode: str = MODE_TWITCH
+    # How far the overlay and dashboard trail the player, to match what listeners hear (OBS and
+    # audio players buffer the stream before playing it).
+    overlay_delay_seconds: float = 4.0
+
 
 HOST_JS_ENV = "TWITCH_RADIO_HOST_JS_EXE"
 
@@ -274,10 +316,18 @@ def load_settings() -> Settings:
             )
         return value
 
-    client_id = _required("TWITCH_CLIENT_ID")
-    client_secret = _required("TWITCH_CLIENT_SECRET")
-    bot_id = _required_numeric_id("TWITCH_BOT_ID")
-    owner_id = _required_numeric_id("TWITCH_OWNER_ID")
+    mode = _mode_env()
+    if mode == MODE_TWITCH:
+        client_id = _required("TWITCH_CLIENT_ID")
+        client_secret = _required("TWITCH_CLIENT_SECRET")
+        bot_id = _required_numeric_id("TWITCH_BOT_ID")
+        owner_id = _required_numeric_id("TWITCH_OWNER_ID")
+    else:
+        # A music player never connects to Twitch: whatever is (or is not) filled in is not checked.
+        client_id = os.getenv("TWITCH_CLIENT_ID", "").strip()
+        client_secret = os.getenv("TWITCH_CLIENT_SECRET", "").strip()
+        bot_id = os.getenv("TWITCH_BOT_ID", "").strip()
+        owner_id = os.getenv("TWITCH_OWNER_ID", "").strip()
 
     js_runtime_path = os.getenv("YTDLP_JS_RUNTIME_PATH", "").strip() or None
     js_runtime_name = os.getenv("YTDLP_JS_RUNTIME_NAME", "deno").strip() or "deno"
@@ -343,6 +393,8 @@ def load_settings() -> Settings:
         log_level=_log_level_env("LOG_LEVEL", "INFO"),
         log_to_file=_bool_env("LOG_TO_FILE", True),
         log_dir=LOG_DIR,
+        mode=mode,
+        overlay_delay_seconds=_clamped_float_env("OVERLAY_DELAY_SECONDS", 4.0, 0.0, 15.0),
     )
 
 

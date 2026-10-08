@@ -10,6 +10,9 @@ const LOOKAHEAD_DEFAULT_ENABLED = true;
 
 const MAX_QUERY_LENGTH = 300;
 const THEMES = ['system', 'light', 'dark'];
+// Same names as twitch_radio/config.py (MODES): the Twitch song-request bot, or a plain music player.
+const MODES = ['twitch', 'player'];
+const VOLUME_DEFAULT = 0.8;
 
 /** A song search or link typed in the dashboard: one tidy line, or null when there is nothing usable. */
 function cleanQuery(value) {
@@ -30,6 +33,12 @@ function normalizeLookahead(value) {
 }
 
 const isTheme = (value) => THEMES.includes(value);
+const isMode = (value) => MODES.includes(value);
+
+/** The music player's volume from anything: a number from 0 to 1, the default when it is not one. */
+function normalizeVolume(value) {
+  return typeof value === 'number' && Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : VOLUME_DEFAULT;
+}
 
 module.exports = {
   LOOKAHEAD_MIN,
@@ -38,6 +47,10 @@ module.exports = {
   LOOKAHEAD_DEFAULT_ENABLED,
   MAX_QUERY_LENGTH,
   THEMES,
+  MODES,
+  VOLUME_DEFAULT,
+  isMode,
+  normalizeVolume,
   cleanQuery,
   normalizeLookahead,
   isTheme,

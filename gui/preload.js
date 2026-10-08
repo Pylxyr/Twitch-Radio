@@ -22,6 +22,10 @@ contextBridge.exposeInMainWorld('api', {
   getLookahead: invoke('radio:getLookahead'),
   setLookahead: invoke('radio:setLookahead'),
   onStatus: subscribe('bot:status'),
+  hideToTray: invoke('window:hideToTray'),
+  getMode: invoke('mode:get'),
+  setMode: invoke('mode:set'),
+  onMode: subscribe('app:mode'),
   onState: subscribe('bot:state'),
   // logs
   getLogs: invoke('logs:get'),

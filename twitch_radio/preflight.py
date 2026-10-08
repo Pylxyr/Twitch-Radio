@@ -71,7 +71,14 @@ def build_report() -> dict[str, Any]:
         "bin_dirs": [str(d) for d in bin_dirs],
     }
     try:
-        missing = [name for name in _REQUIRED if not os.getenv(name, "").strip()]
+        mode = config._mode_env()
+        report["mode"] = mode
+        # Only the Twitch bot needs credentials; a music player works without any.
+        missing = (
+            [name for name in _REQUIRED if not os.getenv(name, "").strip()]
+            if mode == config.MODE_TWITCH
+            else []
+        )
         report["missing"] = missing
         settings = None
         error = None

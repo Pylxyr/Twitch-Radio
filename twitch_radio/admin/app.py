@@ -43,6 +43,7 @@ _ROUTES: tuple[tuple[str, str, _Handler], ...] = (
     ("GET", "/healthz", live.handle_healthz),
     ("GET", "/ws/nowplaying", live.handle_ws_nowplaying),
     ("GET", "/overlay", live.handle_overlay),
+    ("GET", "/player", live.handle_player),
     ("GET", "/logo.png", live.handle_logo),
     ("GET", "/thumb-proxy", media.handle_thumb_proxy),
     ("GET", "/stream.opus", media.handle_stream),
@@ -120,7 +121,7 @@ async def run_admin_server(
         await thumb_session.close()
         raise
     log.info(
-        "Local server listening on http://%s:%d (/stream.opus, /overlay, "
+        "Local server listening on http://%s:%d (/stream.opus, /overlay, /player, "
         "/nowplaying.json, /ws/nowplaying, /healthz, /logo.png, /settings)",
         BIND_HOST,
         port,

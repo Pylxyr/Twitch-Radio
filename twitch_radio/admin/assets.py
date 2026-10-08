@@ -24,6 +24,7 @@ LOGO_DIR = resource_dir() / "assets"
 
 STATIC_FILES = (
     "overlay.html",
+    "player.html",
     "settings.html",
     "settings.css",
     "settings.js",

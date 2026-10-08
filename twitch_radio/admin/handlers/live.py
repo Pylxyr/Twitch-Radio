@@ -20,10 +20,13 @@ _WS_HEARTBEAT_SECONDS = 30
 
 
 def nowplaying_payload(ctx: AdminContext) -> dict[str, Any]:
-    np = ctx.player.now_playing
+    # What a listener hears, not what the player is doing this instant: the stream reaches OBS (or
+    # the app's audio element) a few seconds late, and an overlay that ran ahead of the sound
+    # showed the next song while the last one was still ending.
+    view = ctx.player.audible_view()
+    np = view.now
     queue = [
-        {"title": item.title or "Unknown title", "requester_name": item.requester_name}
-        for item in ctx.player.queued_items()
+        {"title": item.title or "Unknown title", "requester_name": item.requester_name} for item in view.queue
     ]
     # "state" drives the /settings page's realtime chips (idle / resolving /
     # playing / paused); the overlay ignores fields it doesn't recognise.
@@ -38,7 +41,7 @@ def nowplaying_payload(ctx: AdminContext) -> dict[str, Any]:
         "thumbnail_url": np.thumbnail_url,
         "requester_name": np.requester_name,
         "webpage_url": np.webpage_url,
-        "elapsed_seconds": max(0.0, time.monotonic() - np.started_at),
+        "elapsed_seconds": view.elapsed,
         "duration_seconds": np.duration,
         "queue_size": len(queue),
         "queue": queue,
@@ -114,6 +117,20 @@ async def handle_ws_nowplaying(request: web.Request) -> web.WebSocketResponse:
 
 async def handle_overlay(request: web.Request) -> web.Response:
     return web.Response(text=static_text("overlay.html"), content_type="text/html")
+
+
+async def handle_player(request: web.Request) -> web.Response:
+    """The page behind the desktop app's Music player mode: an audio element playing /stream.opus,
+    loaded by a hidden window of the app (see gui/main.js). Served from here, not from a file, so
+    the stream request is same-origin and passes the cross-site check on /stream.opus."""
+    return web.Response(
+        text=static_text("player.html"),
+        content_type="text/html",
+        headers={
+            "Cache-Control": "no-store",
+            "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; media-src 'self'",
+        },
+    )
 
 
 async def handle_logo(request: web.Request) -> web.Response:

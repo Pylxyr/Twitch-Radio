@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Twitch Radio - audio</title>
+</head>
+<body>
+<!--
+  The speaker behind the desktop app's "Music player" mode. A hidden window of the app loads this page
+  and plays the radio's own stream, so the sound keeps going when the app's main window is closed to
+  the tray. Nothing here is shown. The app sets the volume through window.setVolume().
+-->
+<audio id="speaker"></audio>
+<script>
+'use strict';
+const speaker = document.getElementById('speaker');
+let retries = 0;
+let timer = 0;
+
+function connect() {
+  clearTimeout(timer);
+  // A new connection every time: it is a live stream, there is nothing to resume.
+  speaker.src = '/stream.opus?c=' + Date.now();
+  const started = speaker.play();
+  if (started && started.catch) started.catch(retrySoon);
+}
+
+function retrySoon() {
+  clearTimeout(timer);
+  retries = Math.min(retries + 1, 6);
+  timer = setTimeout(connect, 500 * retries);
+}
+
+speaker.addEventListener('playing', () => { retries = 0; });
+speaker.addEventListener('error', retrySoon);
+speaker.addEventListener('ended', retrySoon);
+
+window.setVolume = (value) => {
+  const volume = Number(value);
+  if (Number.isFinite(volume)) speaker.volume = Math.min(1, Math.max(0, volume));
+};
+
+connect();
+</script>
+</body>
+</html>

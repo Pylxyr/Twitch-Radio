@@ -121,7 +121,30 @@ memory or CPU while they wait. Turning it off removes the queued radio songs; a 
 then added only when the queue runs dry. It needs auto-radio on (`!radio on`), and it can only be
 changed here, not from chat or the browser settings page.
 
-**Appearance.** Settings > This app > Appearance: match your system, light, or dark.
+**Twitch bot or music player.** The switch at the top of the window picks what the app is for.
+*Twitch bot* is the default: chat commands, the OBS audio source and the overlay. *Music player* is a
+plain player: the songs you search for in the dashboard play through this PC's speakers. It needs no
+Twitch account, sign-in or OBS (the Twitch setup steps and sign-in checks are hidden), has a volume
+slider next to the switch, and keeps playing when the window is closed to the tray. Changing the mode
+restarts a running bot. The tray menu has the same switch. Under the hood the player listens to the
+app's own local stream, so there is still a server on 127.0.0.1, but there is nothing for you to set up.
+
+**Hide to tray.** The arrow button at the top closes the window and leaves the app running in the tray, with no question asked (click the tray icon to bring it back).
+
+**Light and dark.** The sun/moon button at the top switches straight between light and dark (the tray
+menu has a Dark mode item too). Settings > This app > Appearance also offers *System*, which follows
+Windows or your desktop.
+
+**Songs follow the sound.** The stream reaches OBS (or the player) a few seconds after it is made, so
+the overlay and the dashboard are held back by the same amount: the next song appears, and the last one
+leaves, when you hear it, and a request shows in the queue as soon as it is made. If they still run
+ahead of the sound, raise *Overlay delay* in Settings > Audio & playback (default 4 seconds); if they
+lag behind, lower it.
+
+**Gapless playback.** The next song is looked up a minute before the current one ends and its decoder
+is started and waiting about eight seconds before the end, tracked by how much of the song has actually
+played rather than the length YouTube reports. The audio runs against one clock, so the hand-off is just
+the next piece of sound. A song queued with only seconds to spare is picked up too.
 
 ---
 
@@ -140,6 +163,7 @@ and auto-radio on/off.
 | Setting | Default | What it does |
 |---|---|---|
 | Audio bitrate | `160` kbps | Opus quality of the stream sent to OBS. 160 is already transparent for nearly everything. |
+| Overlay delay | `4` s | How far the overlay and dashboard trail the player, to match what you hear (see above). |
 | Pause when nobody is listening | off | Hold the queue while OBS isn't connected, so songs don't quietly play through while you're offline. |
 | Port | `8098` | The local web server's port. |
 | Parallel lookups | `2` | The most YouTube lookups that may run at once. |

@@ -68,6 +68,67 @@
   }
   const running = () => status.phase === 'running' || status.phase === 'starting';
 
+  // ------------------------------------------------------- mode & appearance ---
+  // The title bar holds the two things worth reaching in one click: which job the app is doing (a
+  // Twitch bot, or a plain music player) and light or dark.
+  let mode = 'twitch';
+  function renderMode() {
+    document.body.dataset.mode = mode;
+    for (const button of $$('#modeSwitch button')) button.setAttribute('aria-pressed', String(button.dataset.mode === mode));
+    renderDashboard();
+    renderSetup();
+  }
+  $('#modeSwitch').addEventListener('click', async (event) => {
+    const button = event.target.closest('button[data-mode]');
+    if (!button || button.dataset.mode === mode) return;
+    const switcher = $('#modeSwitch');
+    switcher.classList.add('busy'); // a running bot restarts to change mode: don't stack clicks
+    try {
+      const result = await api.setMode(button.dataset.mode);
+      if (result && result.ok) {
+        mode = result.mode;
+        renderMode();
+        toast(mode === 'player' ? 'Music player: songs you add play through this PC.' : 'Twitch bot: requests come from chat.', 'ok');
+      } else {
+        toast((result && result.error) || "Couldn't switch the mode.", 'err');
+      }
+    } catch (error) {
+      toast(`Couldn't switch the mode: ${error.message}`, 'err');
+    } finally {
+      switcher.classList.remove('busy');
+    }
+  });
+
+  const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
+  function renderTheme() {
+    const label = darkQuery.matches ? 'Switch to light mode' : 'Switch to dark mode';
+    const button = $('#btnTheme');
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    const select = $('#p-theme');
+    if (select && prefs.theme) select.value = prefs.theme;
+  }
+  // Fires for the button, the tray's Dark mode switch, Settings > Appearance and the OS itself.
+  darkQuery.addEventListener('change', () => {
+    api.getPrefs().then((next) => {
+      prefs = next;
+      renderTheme();
+    });
+  });
+  $('#btnTheme').addEventListener('click', async () => {
+    prefs = await api.setPrefs({ theme: darkQuery.matches ? 'light' : 'dark' });
+    renderTheme();
+  });
+
+  $('#btnTray').addEventListener('click', () => api.hideToTray());
+
+  let volumeTimer = 0;
+  $('#volume').addEventListener('input', (event) => {
+    clearTimeout(volumeTimer);
+    const volume = Number(event.target.value) / 100;
+    volumeTimer = setTimeout(() => api.setPrefs({ volume }).then((next) => (prefs = next)), 120);
+  });
+
   // --------------------------------------------------------------- tabs ---
   let currentTab = 'dashboard';
   function switchTab(name) {
@@ -155,7 +216,9 @@
     const items = [];
     const add = (name, state, value) => items.push({ name, state, value });
 
-    if (!live) add('Twitch chat', 'idle', 'Offline');
+    if (mode === 'player') {
+      // a music player has no chat to connect to
+    } else if (!live) add('Twitch chat', 'idle', 'Offline');
     else if (s && s.chat.ready && s.chat.subscribed) add('Twitch chat', 'ok', 'Connected');
     else if (s && s.chat.ready) add('Twitch chat', 'warn', 'Waiting for sign-in');
     else add('Twitch chat', 'warn', 'Connecting…');
@@ -164,8 +227,10 @@
       if (tok.readable === false) add(name, 'err', 'Token file unreadable');
       else add(name, ok ? 'ok' : pre && pre.config_ok ? 'warn' : 'idle', ok ? 'Authorized' : 'Not authorized');
     };
-    signIn('Bot account sign-in', !!tok.bot);
-    signIn('Broadcaster sign-in', !!tok.owner);
+    if (mode !== 'player') {
+      signIn('Bot account sign-in', !!tok.bot);
+      signIn('Broadcaster sign-in', !!tok.owner);
+    }
 
     if (!live) add('Audio encoder', 'idle', 'Idle');
     else if (s && s.player.encoder_running) add('Audio encoder', s.player.encoder_starts > 1 ? 'warn' : 'ok', s.player.encoder_starts > 1 ? `Restarted ${s.player.encoder_starts - 1}×` : 'Running');
@@ -229,7 +294,7 @@
 
   function renderSetup() {
     const card = $('#setupCard');
-    if (!pre) {
+    if (!pre || mode === 'player') {
       card.hidden = true;
       return;
     }
@@ -365,7 +430,12 @@
     // now playing
     const np = live && s ? s.now : null;
     $('#nowTitle').textContent = np ? np.title : live ? 'Waiting for a request…' : 'Nothing playing';
-    $('#nowSub').textContent = np ? np.uploader || '' : live ? 'Add a song above, or type !sr <song or link> in your chat.' : 'Start the bot, then add a song above or use !sr in chat.';
+    const asPlayer = mode === 'player';
+    $('#nowSub').textContent = np
+      ? np.uploader || ''
+      : live
+        ? asPlayer ? 'Search for a song above and add it.' : 'Add a song above, or type !sr <song or link> in your chat.'
+        : asPlayer ? 'Press Start, then search for a song above.' : 'Start the bot, then add a song above or use !sr in chat.';
     const tags = $('#nowTags');
     tags.replaceChildren();
     if (np) {
@@ -606,6 +676,7 @@
       title: 'Audio & playback',
       fields: [
         { key: 'AUDIO_BITRATE_KBPS', label: 'Audio bitrate (kbps)', type: 'number', min: 64, max: 256, placeholder: '160', hint: 'Opus quality of the stream sent to OBS.' },
+        { key: 'OVERLAY_DELAY_SECONDS', label: 'Overlay delay (seconds)', type: 'number', min: 0, max: 15, placeholder: '4', hint: 'The overlay and dashboard trail the player by this much, to match what you hear (OBS buffers the stream). Raise it if they change before the sound does; lower it if they lag.' },
         { key: 'PAUSE_QUEUE_WHEN_NO_LISTENERS', label: 'Pause when nobody is listening', type: 'bool', def: false, hint: 'Holds the queue while OBS has no audio source connected.' },
       ],
     },
@@ -998,6 +1069,9 @@
       renderLookahead();
     }).catch(() => {});
     $('#sideVersion').textContent = `v${appInfo.version}`;
+    mode = (await api.getMode()) || 'twitch';
+    $('#volume').value = String(Math.round((typeof prefs.volume === 'number' ? prefs.volume : 0.8) * 100));
+    renderTheme();
     const current = await api.getStatus();
     status = current.status;
     snap = current.state;
@@ -1006,7 +1080,7 @@
     unseenErrors = 0; // history from before the window opened isn't news
     renderBadge();
     renderStatus();
-    renderDashboard();
+    renderMode();
 
     let lastPhase = status.phase;
     api.onStatus((next) => {
@@ -1021,6 +1095,12 @@
       snap = next;
       snapAt = Date.now();
       renderDashboard();
+    });
+    api.onMode((next) => {
+      // switched from the tray: the bot restarts, and what Settings requires changes with it
+      mode = next;
+      renderMode();
+      refreshPreflight(true);
     });
     api.onLogs(addLogs);
     // Nothing polls. The report is refreshed when something changed (start/stop, a save)

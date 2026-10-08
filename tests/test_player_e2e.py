@@ -270,3 +270,80 @@ def test_songs_play_at_their_own_volume() -> None:
     cmd = player_mod._decoder_cmd("http://127.0.0.1/x.webm")
     assert "-af" not in cmd and "-filter:a" not in cmd and "-filter_complex" not in cmd
     assert not hasattr(player_mod, "_DYNAMIC_LOUDNESS_FILTER")
+
+
+def _silent_stretches(ogg: bytes, directory: Path) -> tuple[float, list[float]]:
+    """Total length of a captured stream and every silent stretch in it (>= 0.15 s below -45 dB)."""
+    path = directory / "captured.ogg"
+    path.write_bytes(ogg)
+    pcm = subprocess.run(
+        [FIXTURE_FFMPEG, "-v", "error", "-i", str(path), "-f", "s16le", "-ar", "48000", "-ac", "2", "-"],
+        capture_output=True,
+        check=True,
+    ).stdout
+    detect = subprocess.run(
+        [FIXTURE_FFMPEG, "-hide_banner", "-nostats", "-i", str(path), "-af", "silencedetect=noise=-45dB:d=0.15",
+         "-f", "null", "-"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stderr  # fmt: skip
+    gaps = [
+        float(line.split("silence_duration:")[1])
+        for line in detect.splitlines()
+        if "silence_duration" in line
+    ]
+    return len(pcm) / (48000 * 2 * 2), gaps
+
+
+def test_no_silence_between_songs_even_when_the_reported_duration_is_wrong(tmp_path: Path) -> None:
+    """Metadata durations are rarely exact, and the CDN takes a moment to answer. The next song is
+    prepared by how much of the current one has actually played, not by its claimed length, so the
+    hand-off is still seamless: the captured stream is as long as the songs and has no silence."""
+    names = ["a.webm", "b.webm", "c.webm"]
+    for name in names:
+        make_audio(tmp_path / name, 5)
+
+    async def scenario() -> bytes:
+        async with Env(tmp_path) as env:
+            # Reported 7 s for songs that are really 5 s long, and the server takes a second to open one.
+            tracks = {name: env.track(name, 7) for name in names}
+
+            async def resolver(query: str, requester_id: int) -> Track | None:
+                return tracks.get(query.rsplit("/", 1)[-1])
+
+            player = RadioPlayer(resolver=resolver, audio_bitrate_kbps=96, prefetch_enabled=True)
+            player.start()
+            captured = bytearray()
+            try:
+                queue = player.subscribe()
+                captured += player.ogg_header_snapshot()
+
+                async def drain() -> None:
+                    while True:
+                        captured.extend(await queue.get())
+
+                drainer = asyncio.create_task(drain())
+                for name in names:
+                    player.enqueue(request(name))
+                seen: set[str] = set()
+                deadline = asyncio.get_running_loop().time() + 40
+                while len(seen) < len(names) or player.now_playing is not None or player.queue_size():
+                    assert asyncio.get_running_loop().time() < deadline, "songs did not finish in time"
+                    if player.now_playing is not None:
+                        seen.add(player.now_playing.title)
+                    await asyncio.sleep(0.05)
+                await asyncio.sleep(1.0)
+                drainer.cancel()
+            finally:
+                await player.stop()
+            return bytes(captured)
+
+    stream = run_long(scenario())
+    total, gaps = _silent_stretches(stream, tmp_path)
+    assert abs(total - 15) < 0.6, f"expected about 15 s of audio, the stream holds {total:.2f} s"
+    assert gaps == [], f"silence between songs: {gaps}"
+
+
+def run_long(coro: Awaitable[Any]) -> Any:
+    return asyncio.run(asyncio.wait_for(coro, timeout=90))  # type: ignore[arg-type]

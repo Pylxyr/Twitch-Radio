@@ -5,6 +5,7 @@ import contextlib
 import logging
 import shutil
 import time
+from collections import deque
 from collections.abc import Awaitable, Callable, Collection, Coroutine
 from dataclasses import dataclass, field
 from enum import Enum
@@ -21,7 +22,8 @@ log = logging.getLogger(__name__)
 AUDIO_RATE = 48000
 AUDIO_CHANNELS = 2
 _CHUNK_DURATION = 0.1
-_CHUNK_BYTES = int(AUDIO_RATE * AUDIO_CHANNELS * 2 * _CHUNK_DURATION)
+_BYTES_PER_SECOND = AUDIO_RATE * AUDIO_CHANNELS * 2  # s16le
+_CHUNK_BYTES = int(_BYTES_PER_SECOND * _CHUNK_DURATION)
 _SILENCE_CHUNK = b"\x00" * _CHUNK_BYTES
 _STREAM_CHUNK_BYTES = 8192
 # ~5-10s of Opus at typical bitrates; a stalled listener gets dropped, not buffered forever.
@@ -39,10 +41,14 @@ _IDLE_TICK_SECONDS = 2.0
 # difference nobody can hear at 160 kbps.
 _OPUS_COMPLEXITY = 5
 
-# How far behind real time a listener typically hears /stream.opus (client
-# buffering) — the overlay's title change is held back by this much so it
-# doesn't jump ahead of what's actually audible. Tune to taste.
-_OVERLAY_SYNC_DELAY_SECONDS = 4.0
+# Default for how far behind real time a listener hears /stream.opus: OBS (or the app's audio
+# element) buffers what it receives before playing it. What the overlay and the dashboard show
+# lags the player by this much, so they change when the sound does and not before. The setting is
+# OVERLAY_DELAY_SECONDS.
+_DEFAULT_OVERLAY_DELAY_SECONDS = 4.0
+# A song ending and the next one starting closer together than this is one continuous stretch of
+# sound, so the overlay doesn't flash "nothing playing" in between.
+_NO_SONG_DEBOUNCE_SECONDS = 1.5
 # Sanity ceiling on captured Ogg header bytes (see _pump_encoder_output).
 _MAX_OGG_HEADER_BYTES = 65536
 
@@ -84,24 +90,14 @@ _DECODER_START_TIMEOUT = 20.0
 # chunks normally arrive every _CHUNK_DURATION via ffmpeg's -re pacing, so
 # a real gap that long means the source is actually stuck.
 _STALL_TIMEOUT_SECONDS = 20.0
-# How long before a track ends to resolve the next one (network-only —
-# no decoder yet, see _DECODER_PREP_LEAD_SECONDS below) so the actual
-# resolve latency (~8-18s) is paid ahead of time rather than as part of
-# the transition.
-_PREFETCH_LEAD_SECONDS = 20.0
-# How long before a track ends to spawn the next decoder and read its
-# first chunk — deliberately much shorter than _PREFETCH_LEAD_SECONDS.
-# ffmpeg's -re paces its *own* clock from the moment it's spawned, not
-# from whenever we first read its output: a decoder spawned a full 20s
-# early would sit idle that whole time yet still believe, by -re's own
-# clock, that up to 20s of the track had already gone by — on a 3-4
-# minute track that's a small, unnoticeable trim off the very end; on a
-# short one it's the difference between "plays" and "skips itself
-# entirely" (caught by hand: a synthetic 3s test track was reduced to
-# under half a second of actual audio). Small enough that the same drift
-# here is negligible, comfortably above the sub-second ffmpeg spawn +
-# first-chunk time it needs to cover.
-_DECODER_PREP_LEAD_SECONDS = 3.0
+# How long before a track ends to start resolving the next one (network only, no decoder yet).
+# Generous on purpose: a lookup that has to wake a sleeping extraction process can take well over
+# ten seconds, and one that is still running when the song ends is a gap in the stream.
+_PREFETCH_LEAD_SECONDS = 60.0
+# How long before a track ends to start the next decoder and read its first chunk. The decoders
+# have no -re (the player paces everything itself, see _pace), so one started early simply waits
+# with a full pipe until its turn; the lead only has to cover a slow connection to the CDN.
+_DECODER_PREP_LEAD_SECONDS = 8.0
 
 
 def _ffmpeg() -> str:
@@ -149,7 +145,10 @@ def _decoder_cmd(stream_url: str) -> list[str]:
         "128k",
         "-analyzeduration",
         "0",
-        "-re",
+        # No -re: the player paces the audio itself (see RadioPlayer._pace), against one clock
+        # shared by every song and the silence between them. With -re each decoder kept its own
+        # clock from the moment it was started, which made a decoder prepared ahead of time
+        # burst when it was finally read.
         "-i",
         stream_url,
     ]
@@ -275,6 +274,17 @@ class NowPlaying:
 
 
 @dataclass(slots=True)
+class AudibleView:
+    """What a listener hears right now, as opposed to what the player is doing right now: the
+    overlay and the dashboard show this. `elapsed` counts from when `now` became audible, and
+    `queue` includes a song that has already started in the player but is not yet audible."""
+
+    now: NowPlaying | None
+    elapsed: float
+    queue: list[QueuedRequest]
+
+
+@dataclass(slots=True)
 class _PreparedNext:
     """A track resolved, decoded, and already producing audio ahead of
     time — built by _prepare_ahead() while the current track is still
@@ -304,8 +314,10 @@ class RadioPlayer:
         audio_bitrate_kbps: int,
         pause_when_no_listeners: bool = False,
         prefetch_enabled: bool = True,
+        overlay_delay_seconds: float = _DEFAULT_OVERLAY_DELAY_SECONDS,
     ) -> None:
         self._resolver = resolver
+        self._overlay_delay = max(0.0, float(overlay_delay_seconds))
         self._audio_bitrate_kbps = audio_bitrate_kbps
         self._pause_when_no_listeners = pause_when_no_listeners
         # Pointless when Resolver's cache is disabled
@@ -382,10 +394,21 @@ class RadioPlayer:
         # _RADIO_RETRY_BACKOFF_SECONDS of uptime when the bot starts.
         self._radio_fill_failed_at: float = float("-inf")
 
-        # Wall-clock deadline for the next silence chunk — see
-        # _write_paced_silence(). Zero means "not pacing yet"; the first
-        # call snaps it to now.
-        self._silence_deadline: float = 0.0
+        # The one real-time clock the audio is paced against: the deadline for the next chunk,
+        # whether that chunk is a piece of a song or silence. See _pace(). Zero means "not pacing
+        # yet"; the first call snaps it to now.
+        self._pace_deadline: float = 0.0
+        # Bytes of the current song handed to the encoder so far; with the song's duration this
+        # says how much of it is left, which is what decides when the next song is prepared.
+        self._played_bytes = 0
+        # Set whenever the queue or the player's state changes: wakes _prepare_next().
+        self._prep_event = asyncio.Event()
+
+        # What listeners hear, which trails what the player is doing by _overlay_delay. Each change
+        # of the current song is recorded with the moment it becomes audible; see audible_view().
+        self._audible: NowPlaying | None = None
+        self._audible_since: float = 0.0
+        self._audible_events: deque[tuple[float, NowPlaying | None]] = deque()
 
         # Manual pause (the desktop app's Pause/Resume) — separate from
         # _pause_when_no_listeners above, which is automatic and driven by
@@ -408,6 +431,59 @@ class RadioPlayer:
     @property
     def now_playing(self) -> NowPlaying | None:
         return self._now_playing
+
+    @property
+    def overlay_delay_seconds(self) -> float:
+        return self._overlay_delay
+
+    def _set_now_playing(self, now: NowPlaying | None) -> None:
+        """Every change of the current song goes through here: the player's own state changes at
+        once, what listeners hear (see audible_view) _overlay_delay later."""
+        self._now_playing = now
+        self._audible_events.append((time.monotonic() + self._overlay_delay, now))
+        if self._overlay_delay > 0:
+            self._fire_and_forget(
+                self._notify_state_changed_delayed(self._overlay_delay + 0.05),
+                name="radio-player-overlay-sync",
+            )
+        self._notify_state_changed()
+
+    def _audible_now(self) -> NowPlaying | None:
+        now = time.monotonic()
+        events = self._audible_events
+        while events and events[0][0] <= now:
+            due, song = events.popleft()
+            if (
+                song is None
+                and events
+                and events[0][1] is not None
+                and events[0][0] - due < _NO_SONG_DEBOUNCE_SECONDS
+            ):
+                continue  # the next song follows right behind: no flash of "nothing playing"
+            self._audible = song
+            self._audible_since = due
+        return self._audible
+
+    def audible_view(self) -> AudibleView:
+        """The song and queue as a listener of the stream experiences them. A request that arrives
+        shows up in the queue at once; a song leaves the queue and becomes "now playing" when its
+        first sound reaches the listener, and the song that just ended stays until its last does."""
+        audible = self._audible_now()
+        queue = list(self._pending)
+        current = self._now_playing
+        if current is not None and current is not audible:
+            queue.insert(
+                0,
+                QueuedRequest(
+                    webpage_url=current.webpage_url,
+                    requester_id=current.requester_id,
+                    requester_name=current.requester_name,
+                    title=current.title,
+                    uploader=current.uploader,
+                ),
+            )
+        elapsed = max(0.0, time.monotonic() - self._audible_since) if audible is not None else 0.0
+        return AudibleView(now=audible, elapsed=elapsed, queue=queue)
 
     @property
     def active_requester_id(self) -> int | None:
@@ -729,6 +805,7 @@ class RadioPlayer:
         # Everything that changes what the feed loop should do (a request
         # arriving, pause/resume, a cancel) also lands here.
         self._wake.set()
+        self._prep_event.set()
         for q in list(self._state_subscribers):
             with contextlib.suppress(asyncio.QueueFull):
                 q.put_nowait(None)
@@ -1171,8 +1248,18 @@ class RadioPlayer:
             await self._idle_wait(_IDLE_TICK_SECONDS)
             return
         await self._write_pcm(_SILENCE_CHUNK)
-        self._silence_deadline = max(self._silence_deadline + _CHUNK_DURATION, time.monotonic())
-        delay = self._silence_deadline - time.monotonic()
+        await self._pace(_CHUNK_DURATION)
+
+    async def _pace(self, seconds: float) -> None:
+        """Accounts for `seconds` of audio just handed to the encoder and sleeps until the next
+        chunk is due. Songs and silence share this one clock, so the stream never runs fast
+        (a burst when a decoder prepared ahead of time is finally read) or slow (drift), and the
+        hand-off from one song to the next is just the next chunk on the same schedule.
+
+        A late tick borrows from the next one instead of building debt, and the deadline is clamped
+        forward after a long gap (idle, a stall) so it never catches up with a burst."""
+        self._pace_deadline = max(self._pace_deadline + seconds, time.monotonic())
+        delay = self._pace_deadline - time.monotonic()
         if delay > 0:
             await asyncio.sleep(delay)
 
@@ -1205,67 +1292,89 @@ class RadioPlayer:
                     await task
             self._notify_state_changed()
 
+    def _remaining_seconds(self, duration: float) -> float:
+        """How much of the current song is left, by how much of it has actually been played
+        (not by the clock, which a stalled source would put ahead of the audio)."""
+        return duration - self._played_bytes / _BYTES_PER_SECOND
+
     async def _prepare_ahead(self, current_duration: int) -> None:
-        """Best-effort: once playback is close to ending, gets whatever
-        should play next fully ready — resolved, decoded, and already
-        producing audio — so _feed_loop's handoff to it has no silence
-        gap. Includes asking for a radio-mix pick if the queue is empty,
-        so "gapless" applies to autoplay too, not just a queued request.
+        """Best effort, runs beside the current song: gets whatever plays next fully ready -
+        resolved, decoded and already producing audio - so the hand-off has no silence in it.
+        Includes a radio-mix pick when the queue is empty, so autoplay is gapless too.
 
-        Two separate waits, not one: the resolve (network-bound, wants a
-        big lead — _PREFETCH_LEAD_SECONDS) and the decoder spawn (wants a
-        small one — _DECODER_PREP_LEAD_SECONDS, see its comment for why).
-
-        Stashed in self._prepared; only used if it's still what's
-        actually next once this track ends (see _play_one_inner) — a real
-        request can preempt a radio-mix pick at any point up to that
-        moment (see enqueue()), and this notices rather than playing the
-        stale one. Never raises; on any failure, or if nothing's ready in
-        time, that transition just falls back to resolving fresh, exactly
-        as if this didn't run at all.
+        It watches the queue instead of making one decision: if a request jumps ahead of what was
+        prepared, or arrives only seconds before the song ends, whatever is first in line now is
+        prepared instead. What it prepares is only used if it is still what plays next when the
+        song ends (see _play_one_inner); on any failure, or if nothing is ready in time, that
+        transition falls back to resolving fresh, exactly as if this never ran. Never raises.
         """
-        started_at = time.monotonic()
-        resolve_delay = max(0.0, current_duration - _PREFETCH_LEAD_SECONDS)
-        # Cancelled cleanly by _play_one's finally when the track ends first.
-        await asyncio.sleep(resolve_delay)
-        if not self._pending:
-            # Ask for a radio-mix pick ourselves — awaited, not the fire-
-            # and-forget _maybe_start_radio_fill(), so there's actually
-            # something here to prepare rather than hoping one turns up
-            # in time. Same backoff so a broken radio source isn't retried
-            # on every single track transition.
-            if time.monotonic() - self._radio_fill_failed_at >= _RADIO_RETRY_BACKOFF_SECONDS:
-                picked = await self._get_radio_pick()
-                if picked is not None:
-                    self.enqueue(picked)
-                    log.info("Radio autoplay queued: %s", picked.title)
-            if not self._pending:
-                return
-        candidate = self._pending[0]
-        if candidate.cancelled:
-            return
-        track = await self._resolve_ahead(candidate)
-        if track is None:
-            return
+        try:
+            await self._prepare_next(current_duration)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("Prepare-ahead failed (non-fatal).", exc_info=True)
 
-        decoder_at = started_at + max(0.0, current_duration - _DECODER_PREP_LEAD_SECONDS)
-        remaining = decoder_at - time.monotonic()
-        if remaining > 0:
-            await asyncio.sleep(remaining)
-        # Re-check before spawning: a real request can jump ahead of
-        # radio-mix filler (enqueue()) at any point while the above was
-        # sleeping/awaiting, and a clear-queue can cancel `candidate` outright.
-        if not self._pending or self._pending[0] is not candidate or candidate.cancelled:
-            return
-        prepared = await self._spawn_ahead(candidate, track)
-        if prepared is None:
-            return
-        # One more re-check: the spawn itself just awaited too.
-        if self._pending and self._pending[0] is candidate and not candidate.cancelled:
-            self._prepared = prepared
-        else:
-            with contextlib.suppress(ProcessLookupError):
-                prepared.decoder.kill()
+    async def _prepare_next(self, duration: float) -> None:
+        # Resolving opens a window of _PREFETCH_LEAD_SECONDS before the end of the song, measured on
+        # the audio actually played.
+        while True:
+            ahead = self._remaining_seconds(duration) - _PREFETCH_LEAD_SECONDS
+            if ahead <= 0:
+                break
+            await asyncio.sleep(min(2.0, ahead))
+
+        resolved: tuple[QueuedRequest, Track] | None = None
+        failed_for: QueuedRequest | None = None
+        failures = 0
+        while True:
+            self._prep_event.clear()
+            candidate = self._pending[0] if self._pending else None
+            if candidate is not None and candidate.cancelled:
+                candidate = None
+            if self._prepared is not None and self._prepared.request is not candidate:
+                self._discard_prepared()  # something else is first in line now
+            if resolved is not None and resolved[0] is not candidate:
+                resolved = None
+            if failed_for is not candidate:
+                failed_for, failures = candidate, 0
+
+            wait = 2.0
+            if candidate is None:
+                # Nothing queued: ask the radio for something (the same backoff as everywhere, so
+                # a broken radio source isn't retried on every song change).
+                if time.monotonic() - self._radio_fill_failed_at >= _RADIO_RETRY_BACKOFF_SECONDS:
+                    picked = await self._get_radio_pick()
+                    if picked is not None:
+                        self.enqueue(picked)
+                        log.info("Radio autoplay queued: %s", picked.title)
+                        continue
+            elif self._prepared is None and failures < 2:
+                if resolved is None:
+                    track = await self._resolve_ahead(candidate)
+                    if track is None:
+                        failures += 1  # the normal path resolves it again, and reports if it still fails
+                    else:
+                        resolved = (candidate, track)
+                        continue  # the queue may have changed meanwhile: look again
+                else:
+                    until_spawn = self._remaining_seconds(duration) - _DECODER_PREP_LEAD_SECONDS
+                    if until_spawn > 0:
+                        wait = min(wait, until_spawn)
+                    else:
+                        prepared = await self._spawn_ahead(candidate, resolved[1])
+                        head = self._pending[0] if self._pending else None
+                        if prepared is None:
+                            failures += 1
+                            resolved = None
+                        elif head is candidate and not candidate.cancelled and self._prepared is None:
+                            self._prepared = prepared
+                        else:
+                            with contextlib.suppress(ProcessLookupError):
+                                prepared.decoder.kill()
+                        continue
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(self._prep_event.wait(), wait)
 
     async def _resolve_ahead(self, request: QueuedRequest) -> Track | None:
         """The resolve+validate half of what _play_one_inner always ran
@@ -1498,15 +1607,18 @@ class RadioPlayer:
         assert decoder.stdout is not None
         stdout = decoder.stdout
         self._current_decoder = decoder
-        self._now_playing = NowPlaying(
-            title=track.title,
-            uploader=track.uploader,
-            thumbnail_url=track.thumbnail_url,
-            requester_name=request.requester_name,
-            requester_id=request.requester_id,
-            webpage_url=track.webpage_url,
-            started_at=time.monotonic(),
-            duration=track.duration,
+        self._played_bytes = 0
+        self._set_now_playing(
+            NowPlaying(
+                title=track.title,
+                uploader=track.uploader,
+                thumbnail_url=track.thumbnail_url,
+                requester_name=request.requester_name,
+                requester_id=request.requester_id,
+                webpage_url=track.webpage_url,
+                started_at=time.monotonic(),
+                duration=track.duration,
+            )
         )
         # Seed for the next radio-autoplay pick — set only once playback
         # is actually going ahead, so a track that fails to resolve/decode
@@ -1514,9 +1626,6 @@ class RadioPlayer:
         self._last_played_webpage_url = track.webpage_url
         if self._radio_played_notifier is not None:
             self._radio_played_notifier(track.webpage_url)
-        self._fire_and_forget(
-            self._notify_state_changed_delayed(_OVERLAY_SYNC_DELAY_SECONDS), name="radio-player-overlay-sync"
-        )
         log.info("Now playing: %s (requested by %s)", track.title, request.requester_name)
         self._fire_and_forget(
             self._announce_now_playing(request, track), name="radio-player-announce-now-playing"
@@ -1530,6 +1639,8 @@ class RadioPlayer:
             chunk = first_chunk
             while chunk:
                 await self._write_pcm(chunk)
+                self._played_bytes += len(chunk)
+                await self._pace(len(chunk) / _BYTES_PER_SECOND)
                 try:
                     chunk = await asyncio.wait_for(stdout.read(_CHUNK_BYTES), timeout=_STALL_TIMEOUT_SECONDS)
                 except TimeoutError:
@@ -1547,11 +1658,13 @@ class RadioPlayer:
                 await self._notify(f"{request.requester_name}'s song was cut off — reconnecting the stream.")
             raise
         finally:
+            # Recorded first: this is the moment the song's last audio went out, which is what
+            # the audible timeline (and so the overlay) counts from.
+            self._set_now_playing(None)
             with contextlib.suppress(ProcessLookupError):
                 decoder.kill()
             await decoder.wait()
             self._current_decoder = None
-            self._now_playing = None
 
     async def _announce_now_playing(self, request: QueuedRequest, track: Track) -> None:
         counters.record("tracks_played")
