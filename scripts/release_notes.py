@@ -423,9 +423,16 @@ def build_prompt(
     return f"{head}\n\n## Diff\n{_trim_diff(diff, room)}"
 
 
+# urllib's default "Python-urllib/3.x" agent is refused by services behind Cloudflare (Groq answers
+# "HTTP 403: error code: 1010"), so the request names itself.
+_USER_AGENT = "TwitchRadio-release-notes (+https://github.com/Pylxyr/Twitch-Radio)"
+
+
 def _post_json(url: str, headers: dict[str, str], payload: dict) -> dict:
     request = urllib.request.Request(
-        url, data=json.dumps(payload).encode(), headers={"content-type": "application/json", **headers}
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"content-type": "application/json", "user-agent": _USER_AGENT, **headers},
     )
     try:
         with urllib.request.urlopen(request, timeout=90) as response:  # noqa: S310 (https endpoint chosen by the workflow)
