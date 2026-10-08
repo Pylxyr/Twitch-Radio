@@ -100,7 +100,18 @@
   });
 
   const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
+  // A colour style (renderer/skins.js) overrides some of the palette's variables on <html>; which values
+  // depends on light or dark, so this runs again whenever that changes.
+  let skinVars = [];
+  function applySkin() {
+    const root = document.documentElement;
+    for (const name of skinVars) root.style.removeProperty(name);
+    const vars = Skins.skinVariables(prefs.skin, darkQuery.matches ? 'dark' : 'light');
+    skinVars = Object.keys(vars);
+    for (const [name, value] of Object.entries(vars)) root.style.setProperty(name, value);
+  }
   function renderTheme() {
+    applySkin();
     const label = darkQuery.matches ? 'Switch to light mode' : 'Switch to dark mode';
     const button = $('#btnTheme');
     button.title = label;
@@ -198,8 +209,24 @@
   }
   $('#btnSkip').addEventListener('click', () => command('skip', 'Skipping…'));
   $('#btnPause').addEventListener('click', () => command(snap && snap.player.paused ? 'resume' : 'pause'));
+  // Two clicks instead of confirm(): after a native dialog, Electron on Windows can leave the page's
+  // text boxes unable to take focus, which made the search bar impossible to click.
+  let clearArmed = 0;
+  function disarmClear() {
+    clearTimeout(clearArmed);
+    clearArmed = 0;
+    $('#btnClear').textContent = 'Clear';
+    $('#btnClear').classList.remove('armed');
+  }
   $('#btnClear').addEventListener('click', () => {
-    if (confirm('Remove every request from the queue?')) command('clear_queue', 'Queue cleared.');
+    if (!clearArmed) {
+      $('#btnClear').textContent = 'Click again to clear';
+      $('#btnClear').classList.add('armed');
+      clearArmed = setTimeout(disarmClear, 4000);
+      return;
+    }
+    disarmClear();
+    command('clear_queue', 'Queue cleared.');
   });
   $('#btnOpenWeb').addEventListener('click', () => api.openExternal($('#urlSettings').textContent));
 
@@ -334,23 +361,47 @@
     clearTimeout(requestStatusTimer);
     if (message && kind) requestStatusTimer = setTimeout(() => setRequestStatus(''), 9000);
   }
+  let searching = false;
+  const looksLikeLink = (text) => /^https?:\/\//i.test(text);
   function renderRequestForm() {
     const live = running();
     $('#requestInput').disabled = !live || requesting;
-    $('#btnRequest').disabled = !live || requesting;
-    $('#btnRequest').textContent = requesting ? 'Looking…' : 'Add to queue';
+    $('#btnRequest').disabled = !live || requesting || searching;
+    $('#btnRequest').textContent = requesting ? 'Adding…' : searching ? 'Searching…' : looksLikeLink($('#requestInput').value.trim()) ? 'Add to queue' : 'Search';
     $('#requestInput').title = live ? '' : 'Start the bot first';
   }
-  $('#requestForm').addEventListener('submit', async (event) => {
-    event.preventDefault();
+  function hideResults() {
+    const box = $('#searchResults');
+    box.hidden = true;
+    box.replaceChildren();
+  }
+  /** The matches of a search, to click on: choosing one is what actually queues the song. */
+  function showResults(results) {
+    const box = $('#searchResults');
+    const rows = results.map((item) => {
+      const picture = item.thumbnail ? h('img', { class: 'r-thumb', src: item.thumbnail, alt: '', loading: 'lazy' }) : h('span', { class: 'r-thumb ph' });
+      if (item.thumbnail) picture.addEventListener('error', () => picture.replaceWith(h('span', { class: 'r-thumb ph' })));
+      const by = [item.uploader, item.duration ? fmtDur(item.duration) : ''].filter(Boolean).join(' · ');
+      return h('li', {}, h('button', { class: 'result', type: 'button', title: 'Add this song to the queue', onclick: () => addSong(item.url) },
+        picture,
+        h('span', { class: 'r-text' }, h('span', { class: 'r-title', text: item.title }), h('span', { class: 'r-by', text: by })),
+        h('span', { class: 'r-add', text: 'Add' })));
+    });
+    box.replaceChildren(
+      h('div', { class: 'results-head' }, h('span', { text: 'Pick the song to add' }), h('button', { class: 'btn ghost sm', type: 'button', text: 'Close', onclick: hideResults })),
+      h('ul', {}, ...rows),
+    );
+    box.hidden = false;
+  }
+  async function addSong(query) {
+    if (requesting || !running()) return;
     const input = $('#requestInput');
-    const text = input.value.trim();
-    if (!text || requesting || !running()) return;
     requesting = true;
-    setRequestStatus('Looking that up…');
+    hideResults();
+    setRequestStatus('Adding…');
     renderRequestForm();
     try {
-      const result = await api.requestSong(text);
+      const result = await api.requestSong(query);
       if (result && result.ok) {
         input.value = '';
         setRequestStatus(`Added: ${result.title} (#${result.position} in the queue)`, 'ok');
@@ -364,6 +415,42 @@
       renderRequestForm();
       input.focus();
     }
+  }
+  async function searchSongs(text) {
+    if (searching || requesting || !running()) return;
+    searching = true;
+    hideResults();
+    setRequestStatus('Searching…');
+    renderRequestForm();
+    try {
+      const result = await api.searchSongs(text);
+      if (result && result.ok && result.results.length) {
+        setRequestStatus('');
+        showResults(result.results);
+      } else {
+        setRequestStatus((result && result.error) || 'No results for that.', 'err');
+      }
+    } catch {
+      setRequestStatus('Could not reach the bot.', 'err');
+    } finally {
+      searching = false;
+      renderRequestForm();
+    }
+  }
+  $('#requestForm').addEventListener('submit', (event) => {
+    event.preventDefault();
+    const text = $('#requestInput').value.trim();
+    if (!text) return;
+    // A link is already a choice; anything else is searched, and the person picks the match.
+    if (looksLikeLink(text)) addSong(text);
+    else searchSongs(text);
+  });
+  $('#requestInput').addEventListener('input', () => {
+    renderRequestForm();
+    if (!$('#searchResults').hidden) hideResults(); // the matches belonged to the old text
+  });
+  $('#requestInput').addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') hideResults();
   });
 
   // ----------------------------------------------------- radio-mix lookahead ---
@@ -465,7 +552,11 @@
     const list = $('#queueList');
     const items = live && s ? s.queue : [];
     list.replaceChildren(
-      ...items.map((item) => h('li', { class: item.radio ? 'radio' : '' }, h('span', { class: 'q-title', text: item.title }), h('span', { class: 'q-by', text: item.radio ? 'radio mix' : item.requester }))),
+      ...items.map((item) => {
+        const picture = item.thumbnail ? h('img', { class: 'q-thumb', src: item.thumbnail, alt: '', loading: 'lazy' }) : h('span', { class: 'q-thumb ph' });
+        if (item.thumbnail) picture.addEventListener('error', () => picture.replaceWith(h('span', { class: 'q-thumb ph' })));
+        return h('li', { class: item.radio ? 'radio' : '' }, picture, h('span', { class: 'q-title', text: item.title }), h('span', { class: 'q-by', text: item.radio ? 'radio mix' : item.requester }));
+      }),
     );
     if (live && s && s.queue_size > items.length) list.append(h('li', {}, h('span', { class: 'q-title muted', text: `…and ${s.queue_size - items.length} more` })));
     $('#queueEmpty').hidden = items.length > 0;
@@ -858,6 +949,27 @@
       prefs = await api.setPrefs({ theme: theme.value });
     });
     card.append(h('div', { class: 'field' }, h('label', { class: 'name', for: 'p-theme', text: 'Appearance' }), h('div', { class: 'ctl' }, theme, h('div', { class: 'hint', text: 'Light or dark, or follow Windows / your desktop.' }))));
+    const styleGrid = h('div', { class: 'skin-grid', role: 'group', 'aria-label': 'Color style' });
+    const drawStyles = () => {
+      const mode = darkQuery.matches ? 'dark' : 'light';
+      styleGrid.replaceChildren(...Skins.SKIN_NAMES.map((name) => {
+        const look = Skins.preview(name, mode);
+        const chip = h('button', { class: 'skin', type: 'button', 'aria-pressed': String((prefs.skin || 'default') === name), title: Skins.SKINS[name].label },
+          h('span', { class: 'sw' }, h('i', {})), h('span', { text: Skins.SKINS[name].label }));
+        chip.style.setProperty('--sw-bg', look.bg);
+        chip.style.setProperty('--sw-panel', look.panel);
+        chip.style.setProperty('--sw-accent', look.accent);
+        chip.addEventListener('click', async () => {
+          prefs = await api.setPrefs({ skin: name });
+          applySkin();
+          drawStyles();
+        });
+        return chip;
+      }));
+    };
+    drawStyles();
+    darkQuery.addEventListener('change', () => { if (styleGrid.isConnected) drawStyles(); });
+    card.append(h('div', { class: 'field' }, h('label', { class: 'name', text: 'Color style' }), h('div', { class: 'ctl' }, styleGrid, h('div', { class: 'hint', text: 'Tints the whole window, in light or dark.' }))));
     toggles.forEach(([key, label, hint]) => {
       const box = h('input', { type: 'checkbox', id: `p-${key}` });
       box.checked = !!prefs[key];

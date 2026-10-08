@@ -13,6 +13,7 @@ Protocol (one JSON object per line, UTF-8):
 
   app -> core (stdin)
     {"cmd":"stop"|"skip"|"pause"|"resume"|"clear_queue", "id"?: n}
+    {"cmd":"search", "query": "song name", "id": n}   up to six matches for the dashboard to choose from;
     {"cmd":"request", "query": "song name or link", "id": n}   queue a song for the streamer;
                                 the ack carries {"ok", "title", "position"} or {"ok": false, "error"}
     {"cmd":"radio_lookahead", "id"?: n}   the radio-mix lookahead / auto-radio setting changed:
@@ -137,6 +138,14 @@ def build_dispatcher(runtime: BotRuntime, emitter: Emitter) -> Callable[[dict[st
                 return await runtime.request_song(query if isinstance(query, str) else "")
 
             run_async(message, request)
+            return
+        if command == "search":
+            search_query = message.get("query")
+
+            async def search() -> dict[str, Any]:
+                return await runtime.search_songs(search_query if isinstance(search_query, str) else "")
+
+            run_async(message, search)
             return
         if command == "radio_lookahead":
 

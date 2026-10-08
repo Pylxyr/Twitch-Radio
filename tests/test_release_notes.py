@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -312,3 +313,58 @@ def test_ai_summary_survives_a_quota_error(monkeypatch: pytest.MonkeyPatch) -> N
 
     monkeypatch.setattr(release_notes.urllib.request, "urlopen", boom)
     assert release_notes.ai_summary("v1", "v2", []) is None
+
+
+def _compatible_service(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("ANTHROPIC_API_KEY", "AI_MAX_OUTPUT_TOKENS"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AI_API_KEY", "k")
+    monkeypatch.setenv("AI_BASE_URL", "https://api.example.com/v1")
+    monkeypatch.setenv("AI_MODEL", "some/model")
+    monkeypatch.setattr(release_notes, "git", lambda *a: "diff --git a/x.py b/x.py\n+print(1)\n")
+
+
+def test_compatible_service_gets_room_to_think_and_it_is_adjustable(monkeypatch: pytest.MonkeyPatch) -> None:
+    _compatible_service(monkeypatch)
+    sent: list[dict] = []
+
+    def fake_urlopen(request, *a, **k):  # type: ignore[no-untyped-def]
+        sent.append(json.loads(request.data))
+        return _FakeResponse({"choices": [{"message": {"content": "### Added\n- Something"}}]})
+
+    monkeypatch.setattr(release_notes.urllib.request, "urlopen", fake_urlopen)
+    assert release_notes.ai_summary("v1.0.0", "v1.1.0", []) == "### Added\n- Something"
+    assert sent[-1]["max_tokens"] == 3000
+    monkeypatch.setenv("AI_MAX_OUTPUT_TOKENS", "5000")
+    release_notes.ai_summary("v1.0.0", "v1.1.0", [])
+    assert sent[-1]["max_tokens"] == 5000
+    for odd, expected in (("lots", 3000), ("5", 256), ("999999", 16000)):
+        assert release_notes._max_output_tokens({"AI_MAX_OUTPUT_TOKENS": odd}) == expected
+
+
+def test_a_reply_cut_off_before_any_text_says_what_to_change(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    _compatible_service(monkeypatch)
+    cut_off = {"choices": [{"message": {"content": None}, "finish_reason": "length"}]}
+    monkeypatch.setattr(release_notes.urllib.request, "urlopen", lambda *a, **k: _FakeResponse(cut_off))
+    assert release_notes.ai_summary("v1.0.0", "v1.1.0", []) is None
+    assert "AI_MAX_OUTPUT_TOKENS" in capsys.readouterr().err
+
+
+def test_an_http_error_shows_the_services_own_explanation(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import io
+    import urllib.error
+
+    _compatible_service(monkeypatch)
+
+    def refuse(request, *a, **k):  # type: ignore[no-untyped-def]
+        body = io.BytesIO(b'{"error":{"message":"The model `some/model` does not exist"}}')
+        raise urllib.error.HTTPError(request.full_url, 404, "Not Found", {}, body)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(release_notes.urllib.request, "urlopen", refuse)
+    assert release_notes.ai_summary("v1.0.0", "v1.1.0", []) is None
+    err = capsys.readouterr().err
+    assert "HTTP 404" in err and "does not exist" in err

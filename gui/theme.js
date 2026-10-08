@@ -3,10 +3,18 @@
 // the caption buttons drawn over the title bar. They must match --bg in renderer/styles.css, which
 // gui/test/theme.test.js checks. The page itself follows prefers-color-scheme, which Electron's
 // nativeTheme.themeSource drives (see applyTheme in main.js).
+const skins = require('./renderer/skins');
+
+// The default style's colours; the other colour styles (renderer/skins.js) tint them.
 const WINDOW_COLORS = {
-  dark: { background: '#0b0b10', symbols: '#c9c9d9' },
-  light: { background: '#f3f3f8', symbols: '#33334a' },
+  dark: skins.windowColors('default', 'dark'),
+  light: skins.windowColors('default', 'light'),
 };
+
+/** Window colours for a colour style in 'dark' or 'light'. */
+function windowColorsFor(skin, mode) {
+  return skins.windowColors(skin, mode);
+}
 
 /** 'dark' or 'light' for a preference ('system' | 'light' | 'dark') given what the OS currently uses. */
 function resolveTheme(preference, systemIsDark) {
@@ -14,4 +22,4 @@ function resolveTheme(preference, systemIsDark) {
   return systemIsDark ? 'dark' : 'light';
 }
 
-module.exports = { WINDOW_COLORS, resolveTheme };
+module.exports = { WINDOW_COLORS, windowColorsFor, resolveTheme };

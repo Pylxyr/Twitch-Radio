@@ -173,6 +173,7 @@ class SongRequestComponent(commands.Component):
                     requester_name=requester_name,
                     title=track.title,
                     uploader=track.uploader,
+                    thumbnail_url=track.thumbnail_url,
                     on_start=_on_start,
                 )
             )

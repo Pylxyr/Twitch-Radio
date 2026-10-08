@@ -13,8 +13,8 @@ const fs = require('fs');
 const readline = require('readline');
 const { spawn, execFile } = require('child_process');
 const { checkForAppUpdate, shouldAutoCheck, shouldAutoCheckYtdlp } = require('./updates');
-const { cleanQuery, normalizeLookahead, isTheme, isMode, normalizeVolume, VOLUME_DEFAULT } = require('./validate');
-const { WINDOW_COLORS, resolveTheme } = require('./theme');
+const { cleanQuery, normalizeLookahead, isTheme, isMode, isSkin, normalizeVolume, VOLUME_DEFAULT } = require('./validate');
+const { windowColorsFor, resolveTheme } = require('./theme');
 
 const IS_WIN = process.platform === 'win32';
 const PROJECT_ROOT = path.resolve(__dirname, '..');
@@ -34,6 +34,7 @@ const DEFAULT_PREFS = {
   autoRestart: true, // restart after a crash (never after a config error)
   startBotOnLaunch: false,
   theme: 'system', // 'system' | 'light' | 'dark'
+  skin: 'default', // colour style, see renderer/skins.js
   volume: VOLUME_DEFAULT, // Music player mode, 0 to 1
   launchAtLogin: false,
   checkAppUpdates: true, // at most once a day
@@ -48,6 +49,7 @@ function loadPrefs() {
   try {
     prefs = { ...DEFAULT_PREFS, ...JSON.parse(fs.readFileSync(prefsFile(), 'utf8')) };
     if (!isTheme(prefs.theme)) prefs.theme = DEFAULT_PREFS.theme;
+    if (!isSkin(prefs.skin)) prefs.skin = DEFAULT_PREFS.skin;
   } catch {
     prefs = { ...DEFAULT_PREFS };
   }
@@ -613,7 +615,7 @@ function send(channel, payload) {
 
 // ----------------------------------------------------------------- theme ---
 function currentWindowColors() {
-  return WINDOW_COLORS[resolveTheme(prefs.theme, nativeTheme.shouldUseDarkColors)];
+  return windowColorsFor(prefs.skin, resolveTheme(prefs.theme, nativeTheme.shouldUseDarkColors));
 }
 // ------------------------------------------------------------------ mode ---
 // "twitch": the song-request bot (chat, OBS audio source, overlay). "player": a plain music player
@@ -865,6 +867,12 @@ function registerIpc() {
     if (!query) return { ok: false, error: 'Type a song name or paste a link.' };
     return sendCommand('request', { query }, 90000);
   });
+  // The search bar's first step: a few matches to choose from; choosing one is a bot:requestSong.
+  ipcMain.handle('bot:searchSongs', (_e, text) => {
+    const query = cleanQuery(text);
+    if (!query) return { ok: false, error: 'Type a song name to search for.' };
+    return sendCommand('search', { query }, 40000);
+  });
   ipcMain.handle('radio:getLookahead', () => getLookahead());
   ipcMain.handle('radio:setLookahead', (_e, value) => setLookahead(value));
 
@@ -905,6 +913,7 @@ function registerIpc() {
       if (patch && key in patch && typeof patch[key] === typeof DEFAULT_PREFS[key]) prefs[key] = patch[key];
     }
     if (!isTheme(prefs.theme)) prefs.theme = DEFAULT_PREFS.theme;
+    if (!isSkin(prefs.skin)) prefs.skin = DEFAULT_PREFS.skin;
     prefs.volume = normalizeVolume(prefs.volume);
     savePrefs();
     applyTheme();

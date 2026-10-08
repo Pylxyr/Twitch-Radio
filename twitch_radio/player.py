@@ -247,6 +247,8 @@ class QueuedRequest:
     # would otherwise defer, so an explicit resume unambiguously resumes
     # rather than silently staying paused because nobody's connected yet.
     bypass_listener_pause: bool = False
+    # A picture for the dashboard's queue; None when unknown.
+    thumbnail_url: str | None = None
 
 
 class PlayerState(str, Enum):
@@ -480,6 +482,7 @@ class RadioPlayer:
                     requester_name=current.requester_name,
                     title=current.title,
                     uploader=current.uploader,
+                    thumbnail_url=current.thumbnail_url,
                 ),
             )
         elapsed = max(0.0, time.monotonic() - self._audible_since) if audible is not None else 0.0
@@ -561,6 +564,7 @@ class RadioPlayer:
                 "requester_name": r.requester_name,
                 "title": r.title,
                 "uploader": r.uploader,
+                "thumbnail_url": r.thumbnail_url,
             }
             for r in pending
             if r.requester_id != 0
@@ -596,6 +600,7 @@ class RadioPlayer:
                     requester_name=str(item.get("requester_name") or "a viewer"),
                     title=str(item.get("title") or ""),
                     uploader=str(item.get("uploader") or ""),
+                    thumbnail_url=str(item.get("thumbnail_url") or "") or None,
                 )
             )
             restored += 1
@@ -859,8 +864,8 @@ class RadioPlayer:
         any) is preserved and replayed from the top on resume(): inserted
         straight into _pending[0], the same place any other "play this
         next" request lives, rather than a separate field — see
-        _feed_loop. No seek support anywhere in this pipeline (ffmpeg runs
-        with -re, no -ss), so "resume" always means from 0:00."""
+        _feed_loop. No seek support anywhere in this pipeline (the decoder
+        is never given -ss), so "resume" always means from 0:00."""
         if self._paused:
             return False
         self._paused = True
@@ -872,6 +877,7 @@ class RadioPlayer:
                 requester_name=active.requester_name,
                 title=self._now_playing.title if self._now_playing else active.title,
                 uploader=self._now_playing.uploader if self._now_playing else active.uploader,
+                thumbnail_url=self._now_playing.thumbnail_url if self._now_playing else active.thumbnail_url,
                 bypass_listener_pause=True,
             )
             self._pending.insert(0, resumed)

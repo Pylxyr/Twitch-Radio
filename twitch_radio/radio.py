@@ -6,6 +6,7 @@ from collections.abc import Collection
 from typing import Any
 
 from twitch_radio.extraction import Resolver
+from twitch_radio.models import youtube_thumbnail
 from twitch_radio.player import QueuedRequest
 from twitch_radio.youtube import youtube_video_id
 
@@ -111,6 +112,7 @@ class RadioSuggester:
             requester_name=_REQUESTER_LABEL,
             title=entry.get("title") or "Unknown title",
             uploader=entry.get("uploader") or entry.get("channel") or "",
+            thumbnail_url=youtube_thumbnail(entry),
         )
 
     async def suggest(self, seed_webpage_url: str) -> QueuedRequest | None:
@@ -139,5 +141,6 @@ class RadioSuggester:
                 requester_name=_REQUESTER_LABEL,
                 title=entry.get("title") or "Unknown title",
                 uploader=uploader,
+                thumbnail_url=youtube_thumbnail(entry),
             )
         return None

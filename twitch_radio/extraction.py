@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 from twitch_radio import ytdlp_loader
 from twitch_radio.config import BASE_DIR, DATA_DIR, Settings
-from twitch_radio.models import Track
+from twitch_radio.models import Track, youtube_thumbnail
 from twitch_radio.paths import hidden_subprocess_kwargs, is_frozen, source_root
 from twitch_radio.telemetry import counters
 
@@ -73,6 +73,7 @@ _FAST_JS_RUNTIMES: dict[str, dict[str, str]] = {"quickjs": {}}
 
 _FAST_EXTRACT_TIMEOUT_SECONDS = 15.0
 _RADIO_MIX_TIMEOUT_SECONDS = 15.0
+_SEARCH_TIMEOUT_SECONDS = 25.0
 
 # Generous: yt_dlp's import alone can take seconds on a loaded VPS, and this
 # only costs anything when something's genuinely wrong.
@@ -632,6 +633,35 @@ class Resolver:
             return []
         entries = info.get("entries") if isinstance(info, dict) else None
         return [e for e in (entries or []) if e]
+
+    async def search(self, query: str, limit: int = 6) -> list[dict[str, Any]]:
+        """The first few YouTube results for a text search, for the dashboard's picker: title,
+        uploader, length, picture and link, nothing that needs a format resolved (flat, like the radio
+        mix), so it is quick. Links are not searched. Raises on failure; [] means nothing found."""
+        raw = " ".join(query.split())
+        if not raw or _URL_RE.match(raw):
+            return []
+        limit = max(1, min(int(limit), 10))
+        options = {**self._build_options(), "extract_flat": "in_playlist"}
+        info = await self._backend.extract(f"ytsearch{limit}:{raw}", options, _SEARCH_TIMEOUT_SECONDS)
+        results: list[dict[str, Any]] = []
+        for entry in (info.get("entries") if isinstance(info, dict) else None) or []:
+            video_id = entry.get("id") if isinstance(entry, dict) else None
+            if not video_id or entry.get("is_live"):
+                continue
+            url = entry.get("url") or ""
+            if not _URL_RE.match(url) or not _is_allowed_url(url):
+                url = f"https://www.youtube.com/watch?v={video_id}"
+            results.append(
+                {
+                    "title": entry.get("title") or "Unknown title",
+                    "url": url,
+                    "uploader": entry.get("uploader") or entry.get("channel") or "",
+                    "duration": int(entry.get("duration") or 0),
+                    "thumbnail": youtube_thumbnail(entry),
+                }
+            )
+        return results
 
     def _query_for(self, raw: str) -> str:
         raw = raw.strip()

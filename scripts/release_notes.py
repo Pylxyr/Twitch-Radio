@@ -427,8 +427,32 @@ def _post_json(url: str, headers: dict[str, str], payload: dict) -> dict:
     request = urllib.request.Request(
         url, data=json.dumps(payload).encode(), headers={"content-type": "application/json", **headers}
     )
-    with urllib.request.urlopen(request, timeout=90) as response:  # noqa: S310 (https endpoint chosen by the workflow)
-        return json.load(response)
+    try:
+        with urllib.request.urlopen(request, timeout=90) as response:  # noqa: S310 (https endpoint chosen by the workflow)
+            return json.load(response)
+    except urllib.error.HTTPError as exc:
+        # The status alone ("HTTP Error 429") hides what to fix: the service says why in the body
+        # (a wrong model name, a limit that was hit, a request that was too large).
+        try:
+            detail = exc.read().decode("utf-8", "replace").strip()[:300]
+        except OSError:
+            detail = ""
+        raise ValueError(f"HTTP {exc.code}{': ' + detail if detail else ''}") from exc
+
+
+# Room for the answer from an OpenAI-compatible service. Reasoning models (gpt-oss, Qwen3, ...) spend
+# part of it thinking before they write anything, so the 1500 that is plenty for Claude can leave
+# them with an empty reply. AI_MAX_OUTPUT_TOKENS overrides it.
+_DEFAULT_MAX_OUTPUT_TOKENS = 3000
+
+
+def _max_output_tokens(env: dict[str, str] | None = None) -> int:
+    raw = (os.environ if env is None else env).get("AI_MAX_OUTPUT_TOKENS", "").strip()
+    try:
+        value = int(raw) if raw else _DEFAULT_MAX_OUTPUT_TOKENS
+    except ValueError:
+        value = _DEFAULT_MAX_OUTPUT_TOKENS
+    return max(256, min(value, 16_000))
 
 
 def ask_model(provider: Provider, prompt: str) -> str:
@@ -449,12 +473,18 @@ def ask_model(provider: Provider, prompt: str) -> str:
         {"authorization": f"Bearer {provider.key}"},
         {
             "model": provider.model,
-            "max_tokens": 1500,
+            "max_tokens": _max_output_tokens(),
             "temperature": 0.2,
             "messages": [{"role": "system", "content": _AI_SYSTEM}, {"role": "user", "content": prompt}],
         },
     )
-    return str(data["choices"][0]["message"]["content"] or "").strip()
+    choice = data["choices"][0]
+    text = str(choice["message"]["content"] or "").strip()
+    if not text and choice.get("finish_reason") == "length":
+        raise ValueError(
+            "the model used its whole output allowance before it wrote anything - raise AI_MAX_OUTPUT_TOKENS"
+        )
+    return text
 
 
 def ai_summary(prev: str, tag: str, commits: list[tuple[str, str]]) -> str | None:

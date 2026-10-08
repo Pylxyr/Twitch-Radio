@@ -3,7 +3,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
-const { WINDOW_COLORS, resolveTheme } = require('../theme');
+const { WINDOW_COLORS, windowColorsFor, resolveTheme } = require('../theme');
+const Skins = require('../renderer/skins');
 
 // Git checks files out with CRLF line endings on Windows (see .gitattributes); the patterns below use \n.
 const css = fs.readFileSync(path.join(__dirname, '..', 'renderer', 'styles.css'), 'utf8').replace(/\r\n/g, '\n');
@@ -67,4 +68,57 @@ test('resolveTheme: an explicit choice wins, "system" follows the OS', () => {
   assert.equal(resolveTheme('system', true), 'dark');
   assert.equal(resolveTheme('system', false), 'light');
   assert.equal(resolveTheme('garbage', false), 'light');
+});
+
+/** WCAG contrast ratio between two #rrggbb colours. */
+function contrast(a, b) {
+  const relative = (hex) => {
+    const [r, g, bl] = [1, 3, 5].map((i) => {
+      const c = Number.parseInt(hex.slice(i, i + 2), 16) / 255;
+      return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * bl;
+  };
+  const [hi, lo] = [relative(a), relative(b)].sort((x, y) => y - x);
+  return (hi + 0.05) / (lo + 0.05);
+}
+const luminanceOf = (hex) => {
+  const [r, g, b] = [1, 3, 5].map((i) => Number.parseInt(hex.slice(i, i + 2), 16) / 255);
+  return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+};
+
+test('colour styles: the default changes nothing, the others only override known colour variables', () => {
+  assert.deepEqual(Skins.skinVariables('default', 'dark'), {});
+  assert.deepEqual(Skins.skinVariables('default', 'light'), {});
+  assert.deepEqual(Skins.skinVariables('no-such-style', 'dark'), {}, 'an unknown name falls back to the default');
+  assert.ok(Skins.SKIN_NAMES.length >= 6, 'a handful of styles to choose from');
+  for (const name of Skins.SKIN_NAMES) {
+    for (const mode of ['dark', 'light']) {
+      for (const key of Object.keys(Skins.skinVariables(name, mode))) assert.ok(dark.has(key), `${name}/${mode}: ${key} is not a palette variable`);
+    }
+  }
+});
+
+test('every colour style stays really dark in dark mode and really light in light mode', () => {
+  for (const name of Skins.SKIN_NAMES) {
+    const d = Skins.skinVariables(name, 'dark');
+    const l = Skins.skinVariables(name, 'light');
+    if (Object.keys(d).length) assert.ok(luminanceOf(d['--bg']) < 0.1 && luminanceOf(d['--panel']) < 0.15, `${name} dark is too bright`);
+    if (Object.keys(l).length) assert.ok(luminanceOf(l['--bg']) > 0.85 && luminanceOf(l['--panel']) > 0.9, `${name} light is too dark`);
+    for (const vars of [d, l]) {
+      if (!Object.keys(vars).length) continue;
+      assert.ok(contrast('#ffffff', vars['--accent']) >= 3, `${name}: white text on the accent (buttons) is hard to read`);
+      assert.ok(contrast(vars['--accent-text'], vars['--panel']) >= 4.5, `${name}: accent-coloured text on a card is hard to read`);
+    }
+  }
+});
+
+test('the window chrome matches the page background in every colour style', () => {
+  for (const name of Skins.SKIN_NAMES) {
+    for (const [mode, base] of [['dark', dark], ['light', light]]) {
+      const expected = (Skins.skinVariables(name, mode)['--bg'] || base.get('--bg')).toLowerCase();
+      assert.equal(windowColorsFor(name, mode).background.toLowerCase(), expected, `${name}/${mode}`);
+    }
+  }
+  assert.deepEqual(windowColorsFor('default', 'dark'), WINDOW_COLORS.dark);
 });

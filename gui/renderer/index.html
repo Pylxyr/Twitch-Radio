@@ -49,9 +49,10 @@
       <div class="card search">
         <form id="requestForm" autocomplete="off">
           <input id="requestInput" class="input" type="search" maxlength="300" placeholder="Search YouTube or paste a link to add a song to the queue…" spellcheck="false" disabled>
-          <button id="btnRequest" class="btn primary" type="submit" disabled>Add to queue</button>
+          <button id="btnRequest" class="btn primary" type="submit" disabled>Search</button>
         </form>
         <div id="requestStatus" class="search-status" aria-live="polite"></div>
+        <div id="searchResults" class="results" hidden></div>
       </div>
 
       <div class="kpis">
@@ -148,6 +149,7 @@
 </div>
 
 <div id="toasts" class="toasts" aria-live="polite"></div>
+<script src="skins.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

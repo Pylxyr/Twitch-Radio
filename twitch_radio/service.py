@@ -219,11 +219,33 @@ class BotRuntime:
                 requester_name=_DASHBOARD_REQUESTER,
                 title=track.title,
                 uploader=track.uploader,
+                thumbnail_url=track.thumbnail_url,
             )
         )
         counters.record("requests_queued")
         log.info("Queued from the dashboard: %s", track.title)
         return {"ok": True, "title": track.title, "position": player.real_queue_size()}
+
+    async def search_songs(self, query: str) -> dict[str, Any]:
+        """The dashboard search bar's first step: a handful of matches to choose from. Choosing one
+        is then an ordinary request_song() with that result's link.
+        Returns {"ok": True, "results": [...]} or {"ok": False, "error"}."""
+        query = " ".join(str(query).split())
+        if not query:
+            return {"ok": False, "error": "Type a song name to search for."}
+        if len(query) > _MAX_DASHBOARD_QUERY:
+            return {"ok": False, "error": "That is too long to search for."}
+        resolver = self._resolver
+        if resolver is None:
+            return {"ok": False, "error": "The bot is still starting."}
+        try:
+            results = await resolver.search(query)
+        except Exception:
+            log.exception("Dashboard search failed: %s", query)
+            return {"ok": False, "error": "Couldn't search right now. Try again."}
+        if not results:
+            return {"ok": False, "error": "No results for that."}
+        return {"ok": True, "results": results}
 
     def clear_queue(self) -> int:
         if self._player is None:
@@ -580,6 +602,7 @@ class BotRuntime:
                     "uploader": item.uploader or "",
                     "requester": item.requester_name,
                     "radio": item.requester_id == 0,
+                    "thumbnail": item.thumbnail_url,
                 }
                 for item in items[:_MAX_QUEUE_IN_SNAPSHOT]
             ]

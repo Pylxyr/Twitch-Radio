@@ -53,3 +53,10 @@ test('volume: always a number from 0 to 1', () => {
   assert.equal(normalizeVolume(-3), 0);
   for (const bad of ['0.5', null, undefined, NaN, Infinity, {}]) assert.equal(normalizeVolume(bad), VOLUME_DEFAULT, String(bad));
 });
+
+test('colour styles: only known names are accepted', () => {
+  const { isSkin } = require('../validate');
+  assert.equal(isSkin('default'), true);
+  assert.equal(isSkin('midnight'), true);
+  for (const bad of ['', 'Midnight', 'constructor', '__proto__', null, undefined, 3]) assert.equal(isSkin(bad), false, String(bad));
+});

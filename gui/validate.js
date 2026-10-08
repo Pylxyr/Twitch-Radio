@@ -34,6 +34,7 @@ function normalizeLookahead(value) {
 
 const isTheme = (value) => THEMES.includes(value);
 const isMode = (value) => MODES.includes(value);
+const isSkin = (value) => require('./renderer/skins').isSkin(value);
 
 /** The music player's volume from anything: a number from 0 to 1, the default when it is not one. */
 function normalizeVolume(value) {
@@ -50,6 +51,7 @@ module.exports = {
   MODES,
   VOLUME_DEFAULT,
   isMode,
+  isSkin,
   normalizeVolume,
   cleanQuery,
   normalizeLookahead,

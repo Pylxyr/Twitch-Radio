@@ -135,6 +135,16 @@ app's own local stream, so there is still a server on 127.0.0.1, but there is no
 menu has a Dark mode item too). Settings > This app > Appearance also offers *System*, which follows
 Windows or your desktop.
 
+**Color styles.** Settings > This app > Color style tints the whole window: Twitch purple (the default),
+Midnight, Ocean, Forest, Sunset, Rose, Graphite and AMOLED black. Every style works in light and dark.
+
+**Search, then pick.** Type a song name in the search bar and press Enter: up to six matches appear with
+their picture, uploader and length, and clicking one queues it. Pasting a YouTube link still adds it
+straight away. The queue (including the radio-mix lookahead) shows each song's picture.
+
+**Clear queue** asks with a second click on the same button ("Click again to clear") instead of a popup:
+on Windows, Electron's popups could leave the search bar unable to take focus.
+
 **Songs follow the sound.** The stream reaches OBS (or the player) a few seconds after it is made, so
 the overlay and the dashboard are held back by the same amount: the next song appears, and the last one
 leaves, when you hear it, and a request shows in the queue as soon as it is made. If they still run
