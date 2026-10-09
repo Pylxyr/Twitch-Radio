@@ -1,6 +1,6 @@
 twitchio==3.3.2
 aiohttp==3.14.3
-python-dotenv==1.2.3
+python-dotenv==1.2.4
 # Optional but recommended: CPU / memory numbers on the desktop dashboard.
 
 # yt-dlp, spelled out instead of `yt-dlp[default,curl-cffi]`, and with only what this app uses:
