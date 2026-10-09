@@ -107,7 +107,8 @@ test('every colour style stays really dark in dark mode and really light in ligh
     if (Object.keys(l).length) assert.ok(luminanceOf(l['--bg']) > 0.85 && luminanceOf(l['--panel']) > 0.9, `${name} light is too dark`);
     for (const vars of [d, l]) {
       if (!Object.keys(vars).length) continue;
-      assert.ok(contrast('#ffffff', vars['--accent']) >= 3, `${name}: white text on the accent (buttons) is hard to read`);
+      assert.ok(contrast('#ffffff', vars['--btn-accent']) >= 4.5, `${name}: white text on a primary button is hard to read`);
+      assert.ok(contrast('#ffffff', vars['--btn-accent-hover']) >= 4.5, `${name}: white text on a hovered primary button is hard to read`);
       assert.ok(contrast(vars['--accent-text'], vars['--panel']) >= 4.5, `${name}: accent-coloured text on a card is hard to read`);
     }
   }
@@ -121,4 +122,13 @@ test('the window chrome matches the page background in every colour style', () =
     }
   }
   assert.deepEqual(windowColorsFor('default', 'dark'), WINDOW_COLORS.dark);
+});
+
+test('the base palettes: white labels on buttons and badges read, and hover never lowers the contrast', () => {
+  for (const [mode, vars] of [['dark', dark], ['light', light]]) {
+    for (const key of ['--btn-accent', '--btn-accent-hover', '--err-fill']) {
+      assert.ok(contrast('#ffffff', vars.get(key)) >= 4.5, `${mode}: white on ${key} is hard to read`);
+    }
+    assert.ok(contrast('#ffffff', vars.get('--btn-accent-hover')) >= contrast('#ffffff', vars.get('--btn-accent')), `${mode}: hover lowers contrast`);
+  }
 });

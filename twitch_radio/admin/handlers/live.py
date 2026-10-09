@@ -119,20 +119,6 @@ async def handle_overlay(request: web.Request) -> web.Response:
     return web.Response(text=static_text("overlay.html"), content_type="text/html")
 
 
-async def handle_player(request: web.Request) -> web.Response:
-    """The page behind the desktop app's Music player mode: an audio element playing /stream.opus,
-    loaded by a hidden window of the app (see gui/main.js). Served from here, not from a file, so
-    the stream request is same-origin and passes the cross-site check on /stream.opus."""
-    return web.Response(
-        text=static_text("player.html"),
-        content_type="text/html",
-        headers={
-            "Cache-Control": "no-store",
-            "Content-Security-Policy": "default-src 'none'; script-src 'unsafe-inline'; media-src 'self'",
-        },
-    )
-
-
 async def handle_logo(request: web.Request) -> web.Response:
     """The bot mark, for the settings page and its favicon. Public like the
     rest of the overlay surface — a static image with nothing

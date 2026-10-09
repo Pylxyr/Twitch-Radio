@@ -385,8 +385,8 @@ class FakeRuntime:
     async def apply_radio_lookahead(self) -> None:
         self.applied += 1
 
-    def skip(self) -> bool:
-        return True
+    async def skip(self) -> dict[str, Any]:
+        return {"ok": False, "result": "not_ready", "error": "The next song is still loading."}
 
 
 def test_request_and_lookahead_commands_are_answered_when_they_finish() -> None:
@@ -400,7 +400,7 @@ def test_request_and_lookahead_commands_are_answered_when_they_finish() -> None:
         dispatch({"cmd": "radio_lookahead", "id": 4})
         dispatch({"cmd": "skip", "id": 5})
         dispatch({"cmd": "nope", "id": 6})
-        assert [m["id"] for m in sent.messages] == [5, 6]  # synchronous ones answered at once
+        assert [m["id"] for m in sent.messages] == [6]  # only the unknown command is answered at once
         await asyncio.sleep(0.05)
         by_id = {m["id"]: m for m in sent.messages}
         assert by_id[1] == {"t": "ack", "id": 1, "ok": True, "title": "Song 5", "position": 2}
@@ -408,6 +408,10 @@ def test_request_and_lookahead_commands_are_answered_when_they_finish() -> None:
         assert by_id[3]["ok"] is False and "Logs" in by_id[3]["error"]  # a crash still gets an answer
         assert by_id[4]["ok"] is True and runtime.applied == 1
         assert by_id[6]["ok"] is False
+        # a skip is answered when it finishes, and says why when it did not happen
+        assert (
+            by_id[5]["ok"] is False and by_id[5]["result"] == "not_ready" and "loading" in by_id[5]["error"]
+        )
 
     run(scenario())
 

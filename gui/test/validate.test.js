@@ -37,23 +37,6 @@ test('the dashboard asks for the same 1 to 15 range the core enforces', () => {
   assert.equal(`${LOOKAHEAD_MIN}-${LOOKAHEAD_MAX}`, '1-15');
 });
 
-test('modes: only the two known names are accepted', () => {
-  const { isMode, MODES } = require('../validate');
-  assert.deepEqual(MODES, ['twitch', 'player']);
-  assert.equal(isMode('twitch'), true);
-  assert.equal(isMode('player'), true);
-  for (const bad of ['', 'Twitch', 'both', null, undefined, 1, {}]) assert.equal(isMode(bad), false, String(bad));
-});
-
-test('volume: always a number from 0 to 1', () => {
-  const { normalizeVolume, VOLUME_DEFAULT } = require('../validate');
-  assert.equal(normalizeVolume(0.25), 0.25);
-  assert.equal(normalizeVolume(0), 0);
-  assert.equal(normalizeVolume(7), 1);
-  assert.equal(normalizeVolume(-3), 0);
-  for (const bad of ['0.5', null, undefined, NaN, Infinity, {}]) assert.equal(normalizeVolume(bad), VOLUME_DEFAULT, String(bad));
-});
-
 test('colour styles: only known names are accepted', () => {
   const { isSkin } = require('../validate');
   assert.equal(isSkin('default'), true);

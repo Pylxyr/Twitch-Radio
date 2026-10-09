@@ -71,6 +71,45 @@
   const channels = (hex) => [1, 3, 5].map((i) => Number.parseInt(hex.slice(i, i + 2), 16)).join(',');
   const rgba = (hex, alpha) => `rgba(${channels(hex)},${alpha})`;
 
+  const luminanceOf = (hex) => {
+    const [r, g, b] = [1, 3, 5].map((i) => {
+      const c = Number.parseInt(hex.slice(i, i + 2), 16) / 255;
+      return c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+    });
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+  };
+  const contrastWithWhite = (hex) => 1.05 / (luminanceOf(hex) + 0.05);
+  function hexToHsl(hex) {
+    const [r, g, b] = [1, 3, 5].map((i) => Number.parseInt(hex.slice(i, i + 2), 16) / 255);
+    const max = Math.max(r, g, b);
+    const min = Math.min(r, g, b);
+    const l = (max + min) / 2;
+    const d = max - min;
+    if (d === 0) return [0, 0, l];
+    const s = d / (1 - Math.abs(2 * l - 1));
+    let h;
+    if (max === r) h = ((g - b) / d) % 6;
+    else if (max === g) h = (b - r) / d + 2;
+    else h = (r - g) / d + 4;
+    return [(h * 60 + 360) % 360, s, l];
+  }
+  /** The accent, darkened just enough that white text on it reads (WCAG AA for normal text, 4.5:1). */
+  function fillForWhiteText(accent, minimum = 4.5) {
+    const [h, s, l0] = hexToHsl(accent);
+    let l = l0;
+    let fill = accent;
+    while (contrastWithWhite(fill) < minimum && l > 0.05) {
+      l -= 0.005;
+      fill = toHex(hslToRgb(h, s, l));
+    }
+    return fill;
+  }
+  /** A step darker than `fill`: a hover state that keeps (never lowers) the contrast of the white label. */
+  function pressedFill(fill) {
+    const [h, s, l] = hexToHsl(fill);
+    return toHex(hslToRgb(h, s, Math.max(0, l - 0.06)));
+  }
+
   /** The custom properties a style overrides for 'dark' or 'light' ({} when the base palette applies). */
   function skinVariables(name, mode) {
     const skin = SKINS[isSkin(name) ? name : 'default'];
@@ -78,6 +117,7 @@
     if (!accent || skin.h === undefined) return {};
     const dark = mode === 'dark';
     const { h } = skin;
+    const buttonFill = fillForWhiteText(accent.accent);
     const s = dark ? Math.min(0.6, skin.s * 1.4) : skin.s * 0.8;
     // lightness of: bg, panel, panel2, line, hover, hover line, log background, toast
     const L = dark
@@ -88,6 +128,7 @@
       '--bg': bg, '--panel': panel, '--panel2': panel2, '--line2': line,
       '--btn-hover': hover, '--btn-hover-line': hoverLine,
       '--accent': accent.accent, '--accent-hi': accent.hi,
+      '--btn-accent': buttonFill, '--btn-accent-hover': pressedFill(buttonFill),
       '--accent-soft': rgba(accent.accent, dark ? 0.16 : 0.12),
       '--accent-text': accent.text, '--code': accent.text,
       '--accent-line': rgba(accent.accent, dark ? 0.45 : 0.4),

@@ -158,7 +158,12 @@ def build_dispatcher(runtime: BotRuntime, emitter: Emitter) -> Callable[[dict[st
         if command == "stop":
             runtime.request_stop("stop requested from the app")
         elif command == "skip":
-            reply["ok"] = runtime.skip()
+
+            async def skip() -> dict[str, Any]:
+                return await runtime.skip()
+
+            run_async(message, skip)
+            return
         elif command == "pause":
             reply["ok"] = runtime.pause()
         elif command == "resume":

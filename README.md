@@ -97,7 +97,7 @@ The port can be changed in **Settings > Network** if `8098` is taken.
 |---|---|---|
 | `!sr <song or link>` | Everyone | Queue a YouTube song or search by name |
 | `!sq` (`!songqueue`) | Everyone | Show what's coming up. It is not `!queue`, so it doesn't clash with another bot that uses that name |
-| `!skip` | Mods, the broadcaster, or whoever requested the current song | Skip the current song |
+| `!skip` | Mods, the broadcaster, or whoever requested the current song | Skip the current song, once the next one is ready to play. If it is still loading, the current song keeps playing and the bot says so (try again in a moment) |
 | `!radio` | Everyone to check; only the broadcaster can change it (`!radio on` / `!radio off`) | Auto-radio: when the queue runs dry, queue a related song instead of going quiet. Turning it off also clears radio songs already queued |
 
 Nothing else is registered, so other bots in your channel keep every other `!command`. Pausing,
@@ -121,14 +121,6 @@ memory or CPU while they wait. Turning it off removes the queued radio songs; a 
 then added only when the queue runs dry. It needs auto-radio on (`!radio on`), and it can only be
 changed here, not from chat or the browser settings page.
 
-**Twitch bot or music player.** The switch at the top of the window picks what the app is for.
-*Twitch bot* is the default: chat commands, the OBS audio source and the overlay. *Music player* is a
-plain player: the songs you search for in the dashboard play through this PC's speakers. It needs no
-Twitch account, sign-in or OBS (the Twitch setup steps and sign-in checks are hidden), has a volume
-slider next to the switch, and keeps playing when the window is closed to the tray. Changing the mode
-restarts a running bot. The tray menu has the same switch. Under the hood the player listens to the
-app's own local stream, so there is still a server on 127.0.0.1, but there is nothing for you to set up.
-
 **Hide to tray.** The arrow button at the top closes the window and leaves the app running in the tray, with no question asked (click the tray icon to bring it back).
 
 **Light and dark.** The sun/moon button at the top switches straight between light and dark (the tray
@@ -145,11 +137,14 @@ straight away. The queue (including the radio-mix lookahead) shows each song's p
 **Clear queue** asks with a second click on the same button ("Click again to clear") instead of a popup:
 on Windows, Electron's popups could leave the search bar unable to take focus.
 
-**Songs follow the sound.** The stream reaches OBS (or the player) a few seconds after it is made, so
-the overlay and the dashboard are held back by the same amount: the next song appears, and the last one
-leaves, when you hear it, and a request shows in the queue as soon as it is made. If they still run
-ahead of the sound, raise *Overlay delay* in Settings > Audio & playback (default 4 seconds); if they
-lag behind, lower it.
+**Songs follow the sound.** The stream reaches OBS a few seconds after it is made, so the overlay and the
+dashboard are held back by the same amount: the next song appears, and the last one leaves, when you hear
+it, and a request shows in the queue as soon as it is made. Songs are prepared the moment they are
+queued (the next few are looked up and decoded ahead of time), and a skip only goes through once the next
+song is ready: if it is still loading, the current song keeps playing and the skip is refused (the
+dashboard and chat say so) rather than the overlay racing ahead of silence. *Overlay delay* only makes up
+for OBS's own buffering. If the overlay still runs ahead of the sound, raise it in Settings > Audio &
+playback (default 4 seconds); if it lags behind, lower it.
 
 **Gapless playback.** The next song is looked up a minute before the current one ends and its decoder
 is started and waiting about eight seconds before the end, tracked by how much of the song has actually
@@ -178,7 +173,7 @@ and auto-radio on/off.
 | Port | `8098` | The local web server's port. |
 | Parallel lookups | `2` | The most YouTube lookups that may run at once. |
 | Lookup process idle exit | `120` s | How long an unused lookup process stays loaded before it exits and frees its memory. |
-| Lookup timeout / result cache | `45` s / `900` s | How long a lookup may take; how long a resolved song is reused (`0` also turns off next-song prefetching). |
+| Lookup timeout / result cache | `45` s / `900` s | How long a lookup may take; how long a resolved song is reused (`0` turns caching off; queued songs are still prepared ahead of time). |
 | YouTube cookies | none | Only for age-restricted or members-only videos, or if YouTube insists on a sign-in. Import a Netscape-format `cookies.txt` in Settings. |
 
 ---

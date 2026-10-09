@@ -223,35 +223,28 @@ def test_env_template_ships_next_to_the_code() -> None:
     assert paths.env_template_path().exists()
 
 
-def test_music_player_mode_needs_no_twitch_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_twitch_credentials_are_always_required(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in ("TWITCH_CLIENT_ID", "TWITCH_CLIENT_SECRET", "TWITCH_BOT_ID", "TWITCH_OWNER_ID"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(config, "reload_env", lambda: None)
-    monkeypatch.setenv("RADIO_MODE", "player")
-    loaded = config.load_settings()
-    assert loaded.mode == config.MODE_PLAYER
-    assert loaded.client_id == "" and loaded.owner_id == ""
+    with pytest.raises(RuntimeError, match="TWITCH_CLIENT_ID"):
+        config.load_settings()
 
 
-def test_twitch_bot_is_the_default_and_still_needs_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
-    for name in (
-        "TWITCH_CLIENT_ID",
-        "TWITCH_CLIENT_SECRET",
-        "TWITCH_BOT_ID",
-        "TWITCH_OWNER_ID",
-        "RADIO_MODE",
-    ):
+def test_the_removed_player_mode_setting_only_warns(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    for name in ("TWITCH_CLIENT_ID", "TWITCH_CLIENT_SECRET", "TWITCH_BOT_ID", "TWITCH_OWNER_ID"):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setattr(config, "reload_env", lambda: None)
-    with pytest.raises(RuntimeError, match="TWITCH_CLIENT_ID"):
+    monkeypatch.setenv("RADIO_MODE", "player")  # left over in an older .env
+    with pytest.raises(RuntimeError, match="TWITCH_CLIENT_ID"):  # no free pass for missing credentials
         config.load_settings()
-    monkeypatch.setenv("RADIO_MODE", "no-such-mode")  # unknown values fall back to the default
-    with pytest.raises(RuntimeError, match="TWITCH_CLIENT_ID"):
-        config.load_settings()
+    assert "RADIO_MODE" in caplog.text
 
 
 def test_overlay_delay_default_and_clamp(monkeypatch: pytest.MonkeyPatch, settings: config.Settings) -> None:
-    assert settings.mode == config.MODE_TWITCH
+    assert not hasattr(settings, "mode")  # no music-player mode any more
     assert settings.overlay_delay_seconds == 4.0
     monkeypatch.setenv("OVERLAY_DELAY_SECONDS", "2.5")
     assert config.load_settings().overlay_delay_seconds == 2.5

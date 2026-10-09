@@ -9,7 +9,7 @@ from twitchio import Chatter
 from twitchio.ext import commands
 
 from twitch_radio.extraction import UnsupportedSourceError
-from twitch_radio.player import QueuedRequest
+from twitch_radio.player import SKIP_NOT_READY_MESSAGE, QueuedRequest, SkipResult
 from twitch_radio.telemetry import counters
 from twitch_radio.toggles import FeatureToggles
 from twitch_radio.tunables import TwitchTunables
@@ -224,8 +224,11 @@ class SongRequestComponent(commands.Component):
             if requester_id != active_id:
                 await self.bot.safe_reply(ctx, "You can only skip your own song — mods can skip anything.")
                 return
-        if self.bot.player.skip_current():
+        result = await self.bot.player.skip()
+        if result is SkipResult.SKIPPED:
             await self.bot.safe_reply(ctx, "Skipped.")
+        elif result is SkipResult.NOT_READY:
+            await self.bot.safe_reply(ctx, SKIP_NOT_READY_MESSAGE)
         else:
             await self.bot.safe_reply(ctx, "Nothing's playing right now.")
 

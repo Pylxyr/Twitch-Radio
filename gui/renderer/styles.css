@@ -5,6 +5,7 @@
   color-scheme: dark light;
   --bg: #0b0b10; --panel: #13131b; --panel2: #191924; --line2: #262634;
   --text: #ececf4; --muted: #8d8da3; --accent: #9146ff; --accent-hi: #ae7bff; --accent-soft: rgba(145,70,255,.16);
+  --btn-accent: #9146ff; --btn-accent-hover: #7c2fe6; --err-fill: #d1364f;
   --accent-text: #d9c4ff; --accent-line: rgba(145,70,255,.45); --accent-faint: rgba(145,70,255,.09); --code: #cdb8ff;
   --ok: #3ddc97; --warn: #f5b84b; --err: #ff5d73; --idle: #6b6b80;
   --warn-soft: rgba(245,184,75,.14); --warn-bg: rgba(245,184,75,.1); --warn-line: rgba(245,184,75,.4);
@@ -25,6 +26,7 @@
   :root {
     --bg: #f3f3f8; --panel: #ffffff; --panel2: #ececf5; --line2: #d9d9e6;
     --text: #1a1a26; --muted: #5f5f78; --accent: #8a3ffc; --accent-hi: #7425f0; --accent-soft: rgba(145,70,255,.12);
+    --btn-accent: #8a3ffc; --btn-accent-hover: #7425f0; --err-fill: #d92d4b;
     --accent-text: #5b21b6; --accent-line: rgba(145,70,255,.4); --accent-faint: rgba(145,70,255,.07); --code: #5b21b6;
     --ok: #1c9f68; --warn: #9a6200; --err: #d92d4b; --idle: #9a9ab0;
     --warn-soft: rgba(183,121,31,.14); --warn-bg: rgba(183,121,31,.1); --warn-line: rgba(183,121,31,.4);
@@ -57,18 +59,9 @@ button, input, select { font: inherit; color: inherit; }
 .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; letter-spacing: .2px; }
 .brand img { width: 22px; height: 22px; }
 .tb-controls { display: flex; align-items: center; gap: 8px; -webkit-app-region: no-drag; }
-.seg { display: flex; padding: 2px; gap: 2px; border-radius: 999px; background: var(--panel2); border: 1px solid var(--line2); margin-right: 4px; }
-.seg button { border: 0; background: transparent; color: var(--muted); padding: 4px 12px; border-radius: 999px; font-size: 12.5px; font-weight: 600; cursor: pointer; }
-.seg button:hover { color: var(--text); }
-.seg button[aria-pressed="true"] { background: var(--accent); color: #fff; }
-.seg.busy { opacity: .6; pointer-events: none; }
 .icon-btn { width: 32px; height: 32px; display: grid; place-items: center; padding: 0; border-radius: 999px; border: 1px solid var(--line2); background: var(--panel2); color: var(--text); cursor: pointer; }
 .icon-btn:hover { background: var(--btn-hover); border-color: var(--btn-hover-line); }
-.icon-btn svg, .vol svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
-.vol { display: flex; align-items: center; gap: 6px; color: var(--muted); }
-.vol input { width: 84px; accent-color: var(--accent); }
-body[data-mode="player"] .twitch-only { display: none !important; }
-body:not([data-mode="player"]) .player-only { display: none !important; }
+.icon-btn svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
 #iconMoon { display: none; }
 @media (prefers-color-scheme: light) { #iconSun { display: none; } #iconMoon { display: block; } }
 .pill { display: flex; align-items: center; gap: 8px; padding: 5px 12px; border-radius: 999px; background: var(--panel2); font-size: 12.5px; font-weight: 600; margin-right: 6px; }
@@ -83,8 +76,9 @@ body:not([data-mode="player"]) .player-only { display: none !important; }
 .btn:hover:not(:disabled) { background: var(--btn-hover); border-color: var(--btn-hover-line); }
 .btn:active:not(:disabled) { transform: translateY(1px); }
 .btn:disabled { opacity: .45; cursor: default; }
-.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-.btn.primary:hover:not(:disabled) { background: var(--accent-hi); border-color: var(--accent-hi); }
+/* White label on a fill that is always dark enough for it (--btn-accent); hover goes darker, never lighter, so the label keeps its contrast. */
+.btn.primary { background: var(--btn-accent); border-color: var(--btn-accent); color: #fff; }
+.btn.primary:hover:not(:disabled) { background: var(--btn-accent-hover); border-color: var(--btn-accent-hover); box-shadow: 0 0 0 3px var(--accent-soft); }
 .btn.danger { background: var(--danger-bg); border-color: var(--danger-line); color: var(--danger-text); }
 .btn.danger:hover:not(:disabled) { background: var(--danger-hover); }
 .btn.ghost { background: transparent; }
@@ -99,7 +93,7 @@ body:not([data-mode="player"]) .player-only { display: none !important; }
 .nav:hover { background: var(--panel); color: var(--text); }
 .nav.active { background: var(--accent-soft); color: var(--accent-text); }
 .nav.active::before { content: ""; position: absolute; left: -10px; top: 9px; bottom: 9px; width: 3px; border-radius: 3px; background: var(--accent); }
-.badge { margin-left: auto; background: var(--err); color: #fff; font-size: 11px; padding: 1px 7px; border-radius: 999px; }
+.badge { margin-left: auto; background: var(--err-fill); color: #fff; font-size: 11px; padding: 1px 7px; border-radius: 999px; }
 .side-foot { margin-top: auto; padding: 8px 12px; }
 
 main { flex: 1; min-width: 0; position: relative; }
@@ -181,7 +175,7 @@ code { font-family: var(--mono); font-size: 12px; color: var(--code); word-break
 .ll.DEBUG .lv { color: var(--log-debug); } .ll.INFO .lv { color: var(--log-info); } .ll.WARNING .lv { color: var(--warn); } .ll.WARNING .m { color: var(--log-warn-text); }
 .ll.ERROR .lv, .ll.CRITICAL .lv { color: var(--err); } .ll.ERROR .m, .ll.CRITICAL .m { color: var(--log-err-text); }
 .ll.cont .t, .ll.cont .lv, .ll.cont .lg { visibility: hidden; } .ll mark { background: var(--mark-bg); color: var(--mark-fg); border-radius: 3px; }
-.jump { position: absolute; right: 22px; bottom: 16px; border: 0; background: var(--accent); color: #fff; padding: 7px 14px; border-radius: 999px; font-weight: 600; cursor: pointer; box-shadow: 0 6px 20px rgba(0,0,0,.4); }
+.jump { position: absolute; right: 22px; bottom: 16px; border: 0; background: var(--btn-accent); color: #fff; padding: 7px 14px; border-radius: 999px; font-weight: 600; cursor: pointer; box-shadow: 0 6px 20px rgba(0,0,0,.4); }
 .empty.overlay { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; }
 .log-foot { display: flex; justify-content: space-between; padding-top: 8px; }
 

@@ -90,14 +90,31 @@ _DECODER_START_TIMEOUT = 20.0
 # chunks normally arrive every _CHUNK_DURATION via ffmpeg's -re pacing, so
 # a real gap that long means the source is actually stuck.
 _STALL_TIMEOUT_SECONDS = 20.0
-# How long before a track ends to start resolving the next one (network only, no decoder yet).
-# Generous on purpose: a lookup that has to wake a sleeping extraction process can take well over
-# ten seconds, and one that is still running when the song ends is a gap in the stream.
+# How long before the current song ends the radio mix is asked for a pick when nothing at all is
+# queued (so autoplay hands over without a gap). Requested songs never wait for this: they are
+# prepared the moment they are queued (see _prepare_pass).
 _PREFETCH_LEAD_SECONDS = 60.0
-# How long before a track ends to start the next decoder and read its first chunk. The decoders
-# have no -re (the player paces everything itself, see _pace), so one started early simply waits
-# with a full pipe until its turn; the lead only has to cover a slow connection to the CDN.
-_DECODER_PREP_LEAD_SECONDS = 8.0
+# Songs waiting in the queue are prepared ahead of time, nearest first:
+#   - the first _RESOLVE_AHEAD get their stream address looked up (network only), and
+#   - the first _WARM_AHEAD of those also get a decoder started with its first audio already
+#     read ("warm"). The decoders have no -re (the player paces everything itself, see _pace), so
+#     a warm one simply waits with a full pipe for its turn.
+# A song is "ready" when it is warm, and only a ready song may take over from one that is cut short
+# (see skip()). Deeper than this is not worth the extraction work and the idle connections.
+_RESOLVE_AHEAD = 4
+_WARM_AHEAD = 2
+# Stream addresses are short-lived; one looked up this long ago is looked up again before it is
+# used, and a decoder that has waited this long is replaced by a fresh one.
+_RESOLVED_MAX_AGE_SECONDS = 1200.0
+_WARM_MAX_AGE_SECONDS = 600.0
+# A song that cannot be prepared is tried this many times (waiting _PREP_RETRY_DELAYS between
+# attempts) before it is taken out of the queue, so one broken entry can never hold skip back.
+_PREP_ATTEMPTS = 3
+_PREP_RETRY_DELAYS = (3.0, 8.0)
+# How long skip() waits for the next song to become ready before it gives up and refuses.
+_SKIP_READY_WAIT_SECONDS = 5.0
+# How long to wait for a killed decoder to be gone (see _reap).
+_REAP_TIMEOUT_SECONDS = 3.0
 
 
 def _ffmpeg() -> str:
@@ -111,6 +128,26 @@ async def _spawn(*args: str, **kwargs: Any) -> asyncio.subprocess.Process:
     otherwise flash for every ffmpeg launched by a windowless parent."""
     # mypy can't rule out a `program=` key inside **kwargs; callers only pass subprocess options.
     return await asyncio.create_subprocess_exec(*args, **hidden_subprocess_kwargs(), **kwargs)  # type: ignore[misc]
+
+
+async def _reap(decoder: asyncio.subprocess.Process) -> None:
+    """Kills a decoder and waits until it is really gone.
+
+    Its output has to be read to the end first. asyncio stops reading a pipe nobody is reading
+    (a decoder that sat ready, or was cut mid-song, has a full one), and wait() only returns once
+    every pipe has reported its end - so a plain kill() + wait() can hang for good.
+    """
+    with contextlib.suppress(ProcessLookupError):
+        decoder.kill()
+
+    async def finish() -> None:
+        if decoder.stdout is not None:
+            while await decoder.stdout.read(65536):
+                pass
+        await decoder.wait()
+
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(finish(), _REAP_TIMEOUT_SECONDS)
 
 
 def _decoder_cmd(stream_url: str) -> list[str]:
@@ -286,18 +323,42 @@ class AudibleView:
     queue: list[QueuedRequest]
 
 
+# What a viewer or the dashboard is told when a skip is refused for want of a ready successor.
+SKIP_NOT_READY_MESSAGE = (
+    "The next song is still loading, so the current one keeps playing. Try again in a moment."
+)
+
+
+class SkipResult(str, Enum):
+    """How a skip request ended (see RadioPlayer.skip)."""
+
+    SKIPPED = "skipped"
+    NOTHING_PLAYING = "nothing_playing"
+    # The song that would play next is not ready yet, so the current one was left playing.
+    NOT_READY = "not_ready"
+
+
+@dataclass(slots=True)
+class _ResolvedAhead:
+    """A queued song whose stream address has been looked up ahead of its turn."""
+
+    request: QueuedRequest
+    track: Track
+    at: float
+
+
 @dataclass(slots=True)
 class _PreparedNext:
-    """A track resolved, decoded, and already producing audio ahead of
-    time — built by _prepare_ahead() while the current track is still
-    playing, so the transition to it can hand off with no silence gap.
-    Discarded (decoder killed) if it turns out not to be what plays next
-    — see _feed_loop's use of it."""
+    """A queued song that is ready to play: resolved, with its decoder running and its first chunk
+    of audio already read. Built by _prepare_pass() while earlier songs are still playing, so the
+    hand-off to it has no silence gap, and so a skip can go straight to it. Discarded (decoder
+    killed) when it stops being one of the first songs in line, or gets too old."""
 
     request: QueuedRequest
     track: Track
     decoder: asyncio.subprocess.Process
     first_chunk: bytes
+    ready_at: float = 0.0
 
 
 class RadioPlayer:
@@ -322,11 +383,10 @@ class RadioPlayer:
         self._overlay_delay = max(0.0, float(overlay_delay_seconds))
         self._audio_bitrate_kbps = audio_bitrate_kbps
         self._pause_when_no_listeners = pause_when_no_listeners
-        # Pointless when Resolver's cache is disabled
-        # (YTDLP_CACHE_TTL_SECONDS=0) — the prefetch's result would just be
-        # discarded instead of reused. See bot.py for how this is computed.
+        # Off only in tests that want the plain "resolve when its turn comes" path. With it off
+        # nothing is ever ready ahead of time, so skip() cannot wait for readiness either.
         self._prefetch_enabled = prefetch_enabled
-        self._prefetch_task: asyncio.Task[None] | None = None
+        self._prep_task: asyncio.Task[None] | None = None
 
         # The one structure representing the queue's play order — also
         # what !sq and the overlay read directly. (Used to
@@ -343,6 +403,10 @@ class RadioPlayer:
         self._backoff = _MIN_BACKOFF
         self._backoff_reset_done = False
         self._current_decoder: asyncio.subprocess.Process | None = None
+        # The decoder of a song that has been cut short (skip, pause) and is still being wound down.
+        # What it had already produced sits in the pipe; the stream loop stops reading it at once
+        # rather than playing out that tail, and a second skip finds the song already gone.
+        self._cut: asyncio.subprocess.Process | None = None
         self._now_playing: NowPlaying | None = None
         # The request occupying the player's one "slot" — set the instant
         # it's dequeued, cleared when done/failed. now_playing alone isn't
@@ -403,8 +467,10 @@ class RadioPlayer:
         # Bytes of the current song handed to the encoder so far; with the song's duration this
         # says how much of it is left, which is what decides when the next song is prepared.
         self._played_bytes = 0
-        # Set whenever the queue or the player's state changes: wakes _prepare_next().
+        # Set whenever the queue or the player's state changes: wakes the preparation loop.
         self._prep_event = asyncio.Event()
+        # Set whenever preparation made progress: wakes a skip() that is waiting for readiness.
+        self._prep_progress = asyncio.Event()
 
         # What listeners hear, which trails what the player is doing by _overlay_delay. Each change
         # of the current song is recorded with the moment it becomes audible; see audible_view().
@@ -417,12 +483,17 @@ class RadioPlayer:
         # subscriber count. Only ever set by an explicit chat command.
         self._paused = False
 
-        # A track resolved, decoded and already producing audio ahead of
-        # the current one ending, set by _prepare_ahead() — see
-        # _PreparedNext. None means nothing's ready; _feed_loop falls back
-        # to resolving fresh (a normal, silence-covered transition) in
-        # that case, same as before this existed.
-        self._prepared: _PreparedNext | None = None
+        # Queued songs prepared ahead of time, keyed by id() of their QueuedRequest (which is
+        # unhashable); see _prepare_pass(). _warm holds the ready ones. A song that is not warm when
+        # its turn comes is resolved fresh (a normal, silence-covered transition), as it always was.
+        self._resolved: dict[int, _ResolvedAhead] = {}
+        self._warm: dict[int, _PreparedNext] = {}
+        # Failed preparation attempts per queued song: (attempts so far, earliest next attempt).
+        self._prep_attempts: dict[int, tuple[int, float]] = {}
+        # A skip() waiting for its successor, shared by every skip asked for meanwhile.
+        self._skip_waiter: asyncio.Task[SkipResult] | None = None
+        # Set by skip() when the queue is empty and the radio mix would supply the next song.
+        self._radio_pick_wanted = False
         # Short-lived fire-and-forget tasks (currently just the now-playing
         # chat announcement) — held here only so asyncio can't garbage-
         # collect one mid-flight; see _fire_and_forget().
@@ -485,6 +556,21 @@ class RadioPlayer:
                     thumbnail_url=current.thumbnail_url,
                 ),
             )
+        elif current is None and self._active_request is not None:
+            # Taken off the queue but still loading: it makes no sound yet, so for a listener it
+            # is still the next song, not something that has already gone by.
+            loading = self._active_request
+            queue.insert(
+                0,
+                QueuedRequest(
+                    webpage_url=loading.webpage_url,
+                    requester_id=loading.requester_id,
+                    requester_name=loading.requester_name,
+                    title=loading.title,
+                    uploader=loading.uploader,
+                    thumbnail_url=loading.thumbnail_url,
+                ),
+            )
         elapsed = max(0.0, time.monotonic() - self._audible_since) if audible is not None else 0.0
         return AudibleView(now=audible, elapsed=elapsed, queue=queue)
 
@@ -528,6 +614,35 @@ class RadioPlayer:
 
     def queued_items(self) -> list[QueuedRequest]:
         return list(self._pending)
+
+    # -- readiness of queued songs -------------------------------------------
+
+    @staticmethod
+    def _decoder_usable(decoder: asyncio.subprocess.Process) -> bool:
+        # Still running (waiting with a full pipe), or finished cleanly with everything it
+        # produced still sitting in the pipe. Anything else died on the way.
+        return decoder.returncode is None or decoder.returncode == 0
+
+    def is_ready(self, request: QueuedRequest) -> bool:
+        """True when this queued song can start playing right now: resolved, decoder running,
+        first audio in hand."""
+        entry = self._warm.get(id(request))
+        return entry is not None and entry.request is request and self._decoder_usable(entry.decoder)
+
+    def _live_pending(self) -> list[QueuedRequest]:
+        return [r for r in self._pending if not r.cancelled]
+
+    def _is_queued(self, request: QueuedRequest) -> bool:
+        return any(r is request for r in self._pending)
+
+    @property
+    def next_ready(self) -> bool:
+        """False while the song that plays after the current one is still being prepared (a skip
+        would be refused). True when it is ready or when nothing is waiting."""
+        if not self._prefetch_enabled:
+            return True
+        live = self._live_pending()
+        return not live or self.is_ready(live[0])
 
     @property
     def listener_count(self) -> int:
@@ -622,8 +737,7 @@ class RadioPlayer:
             ]:
                 filler.cancelled = True
                 self._pending.remove(filler)
-                if self._prepared is not None and self._prepared.request is filler:
-                    self._discard_prepared()
+                self._forget(filler)
             index = next((i for i, r in enumerate(self._pending) if r.requester_id == 0), len(self._pending))
             self._pending.insert(index, request)
         else:
@@ -830,8 +944,7 @@ class RadioPlayer:
             request.cancelled = True
             with contextlib.suppress(ValueError):
                 self._pending.remove(request)
-            if self._prepared is not None and self._prepared.request is request:
-                self._discard_prepared()
+            self._forget(request)
             if request.on_start is not None:
                 with contextlib.suppress(Exception):
                     request.on_start()
@@ -842,16 +955,95 @@ class RadioPlayer:
             self._fire_and_forget(self._persist_queue(), name="persist-queue")
         return removed
 
-    def skip_current(self) -> bool:
-        if self._current_decoder is not None:
+    def _interrupt_current(self) -> bool:
+        """Cuts the current song (or the load of it) short, right now and without asking whether
+        anything is ready to follow. skip() is the gated way in; pause() uses this directly."""
+        decoder = self._current_decoder
+        if decoder is not None:
+            if decoder is self._cut:
+                return True  # already being cut: that is one skip, not two
+            self._cut = decoder
             with contextlib.suppress(ProcessLookupError):
-                self._current_decoder.kill()
+                decoder.kill()
             counters.record("skips")
             return True
         if self._resolving:
-            self._skip_pending = True
-            counters.record("skips")
+            if not self._skip_pending:
+                self._skip_pending = True
+                counters.record("skips")
             return True
+        return False
+
+    async def skip(self, wait: float = _SKIP_READY_WAIT_SECONDS) -> SkipResult:
+        """Skips the current song, but only once the song that follows it is ready to play.
+
+        Cutting a song short while its successor is still being looked up or decoded would leave a
+        silent gap, and everything that follows the player (the overlay, the dashboard, the queue)
+        would be showing a song listeners cannot hear yet - and fast repeated skips would leave
+        them further and further ahead of the sound. So when the successor is not ready, this
+        waits up to `wait` seconds for it (nudging its preparation to the front) and, if it still is
+        not, leaves the current song playing and returns NOT_READY. With nothing queued there is no
+        successor to wait for, unless the radio mix is about to supply one.
+
+        Skips asked for while one is waiting join it instead of each cutting another song.
+        """
+        if self._skip_waiter is not None:
+            return await asyncio.shield(self._skip_waiter)
+        if self._current_decoder is None and not self._resolving:
+            return SkipResult.NOTHING_PLAYING
+        if not self._prefetch_enabled or self._prep_task is None:
+            return SkipResult.SKIPPED if self._interrupt_current() else SkipResult.NOTHING_PLAYING
+        waiter = asyncio.ensure_future(self._skip_when_ready(wait))
+        self._skip_waiter = waiter
+        waiter.add_done_callback(self._skip_waiter_done)
+        return await asyncio.shield(waiter)
+
+    def _skip_waiter_done(self, waiter: asyncio.Future[SkipResult]) -> None:
+        if self._skip_waiter is waiter:
+            self._skip_waiter = None
+        if not waiter.cancelled():
+            waiter.exception()  # retrieved: nobody may be left waiting on it
+
+    async def _skip_when_ready(self, wait: float) -> SkipResult:
+        target = self._active_request
+        deadline = time.monotonic() + wait
+        try:
+            while True:
+                if self._paused:
+                    return SkipResult.NOTHING_PLAYING
+                if self._active_request is not target:
+                    return SkipResult.SKIPPED  # it ended while we waited: never cut the next one short
+                if self._current_decoder is None and not self._resolving:
+                    return SkipResult.NOTHING_PLAYING
+                live = self._live_pending()
+                if not live:
+                    if not await self._radio_may_follow():
+                        break  # nothing will follow: no successor to run ahead of
+                    self._radio_pick_wanted = True
+                elif self.is_ready(live[0]):
+                    break
+                self._prep_event.set()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return SkipResult.NOT_READY
+                self._prep_progress.clear()
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self._prep_progress.wait(), min(remaining, 0.5))
+            # Same turn of the event loop as the check above: the song that follows is ready.
+            return SkipResult.SKIPPED if self._interrupt_current() else SkipResult.NOTHING_PLAYING
+        finally:
+            self._radio_pick_wanted = False
+
+    async def _radio_may_follow(self) -> bool:
+        """True when the radio mix would pick the next song if the queue stayed empty."""
+        if self._radio_suggest is None or self._last_played_webpage_url is None:
+            return False
+        if time.monotonic() - self._radio_fill_failed_at < _RADIO_RETRY_BACKOFF_SECONDS:
+            return False
+        if self._radio_enabled_getter is None:
+            return True
+        with contextlib.suppress(Exception):
+            return bool(await self._radio_enabled_getter())
         return False
 
     def pause(self) -> bool:
@@ -882,11 +1074,11 @@ class RadioPlayer:
             )
             self._pending.insert(0, resumed)
             self._fire_and_forget(self._persist_queue(), name="persist-queue")
-        self.skip_current()
+        self._interrupt_current()
         # Whatever was being prepared for after the interrupted track is no
-        # longer next — the interrupted track is. Free its decoder now
-        # rather than letting it idle for however long the pause lasts.
-        self._discard_prepared()
+        # longer next — the interrupted track is. Free its decoders now
+        # rather than letting them idle for however long the pause lasts.
+        self._discard_warm()
         self._notify_state_changed()
         return True
 
@@ -908,14 +1100,31 @@ class RadioPlayer:
         counters.record("tracks_failed")
         await self._notify(message)
 
-    def _discard_prepared(self) -> None:
-        """Kills and drops whatever's in self._prepared, if anything —
-        called whenever it turns out not to be what plays next (preempted
-        by a real request, cancelled, or we're pausing/stopping)."""
-        prepared, self._prepared = self._prepared, None
-        if prepared is not None:
+    def _discard_warm(
+        self, request: QueuedRequest | None = None, *, reap: bool = True
+    ) -> list[asyncio.subprocess.Process]:
+        """Kills and drops the ready decoder of one queued song, or of all of them - called
+        whenever one turns out not to be among the next to play (preempted by a real request,
+        cancelled, too old) or we're pausing/stopping."""
+        if request is None:
+            entries = list(self._warm.values())
+            self._warm.clear()
+        else:
+            entry = self._warm.pop(id(request), None)
+            entries = [entry] if entry is not None else []
+        decoders = [entry.decoder for entry in entries]
+        for decoder in decoders:
             with contextlib.suppress(ProcessLookupError):
-                prepared.decoder.kill()
+                decoder.kill()
+            if reap:
+                self._fire_and_forget(_reap(decoder), name="radio-player-reap")
+        return decoders
+
+    def _forget(self, request: QueuedRequest) -> None:
+        """Drops everything prepared for a request that has left the queue."""
+        self._resolved.pop(id(request), None)
+        self._prep_attempts.pop(id(request), None)
+        self._discard_warm(request)
 
     def _fire_and_forget(self, coro: Coroutine[Any, Any, None], name: str) -> None:
         task = asyncio.create_task(coro, name=name)
@@ -927,6 +1136,8 @@ class RadioPlayer:
             raise RuntimeError("ffmpeg not found on PATH — required to run the radio player.")
         self._stopping = False
         self._task = asyncio.create_task(self._run_forever(), name="radio-player")
+        if self._prefetch_enabled:
+            self._prep_task = asyncio.create_task(self._prep_loop(), name="radio-player-prepare")
 
     def close_subscribers(self) -> None:
         """Ends every open /stream.opus connection by pushing the empty-bytes
@@ -962,6 +1173,13 @@ class RadioPlayer:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._task
             self._task = None
+        for task in (self._prep_task, self._skip_waiter):
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+        self._prep_task = None
+        self._skip_waiter = None
         if self._radio_fill_task is not None:
             self._radio_fill_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
@@ -977,7 +1195,8 @@ class RadioPlayer:
         if self._background_tasks:
             with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.gather(*self._background_tasks, return_exceptions=True)
-        self._discard_prepared()
+        await asyncio.gather(*(_reap(d) for d in self._discard_warm(reap=False)), return_exceptions=True)
+        self._resolved.clear()
         await self._kill_encoder()
         self.close_subscribers()
         if carry is not None:
@@ -1202,8 +1421,7 @@ class RadioPlayer:
                 await self._write_paced_silence()
                 continue
             if request.cancelled:
-                if self._prepared is not None and self._prepared.request is request:
-                    self._discard_prepared()
+                self._forget(request)
                 continue
             if request.on_start is not None:
                 with contextlib.suppress(Exception):
@@ -1287,124 +1505,213 @@ class RadioPlayer:
             log.exception("Error playing queued request: %s", request.webpage_url)
         finally:
             self._active_request = None
-            # However this track ended, its prefetch is no longer relevant
-            # — the next _play_one_inner schedules its own once it knows
-            # the new track's real duration.
-            task = self._prefetch_task
-            self._prefetch_task = None
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await task
-            self._notify_state_changed()
+            self._notify_state_changed()  # also wakes the preparation loop: the line moved up
 
     def _remaining_seconds(self, duration: float) -> float:
         """How much of the current song is left, by how much of it has actually been played
         (not by the clock, which a stalled source would put ahead of the audio)."""
         return duration - self._played_bytes / _BYTES_PER_SECOND
 
-    async def _prepare_ahead(self, current_duration: int) -> None:
-        """Best effort, runs beside the current song: gets whatever plays next fully ready -
-        resolved, decoded and already producing audio - so the hand-off has no silence in it.
-        Includes a radio-mix pick when the queue is empty, so autoplay is gapless too.
+    # -- preparing queued songs ahead of time ---------------------------------
 
-        It watches the queue instead of making one decision: if a request jumps ahead of what was
-        prepared, or arrives only seconds before the song ends, whatever is first in line now is
-        prepared instead. What it prepares is only used if it is still what plays next when the
-        song ends (see _play_one_inner); on any failure, or if nothing is ready in time, that
-        transition falls back to resolving fresh, exactly as if this never ran. Never raises.
-        """
-        try:
-            await self._prepare_next(current_duration)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            log.debug("Prepare-ahead failed (non-fatal).", exc_info=True)
-
-    async def _prepare_next(self, duration: float) -> None:
-        # Resolving opens a window of _PREFETCH_LEAD_SECONDS before the end of the song, measured on
-        # the audio actually played.
-        while True:
-            ahead = self._remaining_seconds(duration) - _PREFETCH_LEAD_SECONDS
-            if ahead <= 0:
-                break
-            await asyncio.sleep(min(2.0, ahead))
-
-        resolved: tuple[QueuedRequest, Track] | None = None
-        failed_for: QueuedRequest | None = None
-        failures = 0
-        while True:
-            self._prep_event.clear()
-            candidate = self._pending[0] if self._pending else None
-            if candidate is not None and candidate.cancelled:
-                candidate = None
-            if self._prepared is not None and self._prepared.request is not candidate:
-                self._discard_prepared()  # something else is first in line now
-            if resolved is not None and resolved[0] is not candidate:
-                resolved = None
-            if failed_for is not candidate:
-                failed_for, failures = candidate, 0
-
-            wait = 2.0
-            if candidate is None:
-                # Nothing queued: ask the radio for something (the same backoff as everywhere, so
-                # a broken radio source isn't retried on every song change).
-                if time.monotonic() - self._radio_fill_failed_at >= _RADIO_RETRY_BACKOFF_SECONDS:
-                    picked = await self._get_radio_pick()
-                    if picked is not None:
-                        self.enqueue(picked)
-                        log.info("Radio autoplay queued: %s", picked.title)
-                        continue
-            elif self._prepared is None and failures < 2:
-                if resolved is None:
-                    track = await self._resolve_ahead(candidate)
-                    if track is None:
-                        failures += 1  # the normal path resolves it again, and reports if it still fails
-                    else:
-                        resolved = (candidate, track)
-                        continue  # the queue may have changed meanwhile: look again
-                else:
-                    until_spawn = self._remaining_seconds(duration) - _DECODER_PREP_LEAD_SECONDS
-                    if until_spawn > 0:
-                        wait = min(wait, until_spawn)
-                    else:
-                        prepared = await self._spawn_ahead(candidate, resolved[1])
-                        head = self._pending[0] if self._pending else None
-                        if prepared is None:
-                            failures += 1
-                            resolved = None
-                        elif head is candidate and not candidate.cancelled and self._prepared is None:
-                            self._prepared = prepared
-                        else:
-                            with contextlib.suppress(ProcessLookupError):
-                                prepared.decoder.kill()
-                        continue
+    async def _prep_loop(self) -> None:
+        """Runs for the player's whole life, beside whatever is playing. Keeps the songs at the
+        front of the queue resolved and, for the first few, decoded and ready (see _prepare_pass),
+        starting the moment they are queued rather than shortly before they are needed. Wakes on
+        every queue or state change (_prep_event). Never raises."""
+        while not self._stopping:
+            busy = False
+            try:
+                self._prep_event.clear()
+                busy = await self._prepare_pass()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.debug("Preparing queued songs failed (non-fatal).", exc_info=True)
+                await asyncio.sleep(1.0)
+            self._prep_progress.set()
+            if busy:
+                continue
             with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(self._prep_event.wait(), wait)
+                await asyncio.wait_for(self._prep_event.wait(), _IDLE_TICK_SECONDS)
 
-    async def _resolve_ahead(self, request: QueuedRequest) -> Track | None:
-        """The resolve+validate half of what _play_one_inner always ran
-        inline, extracted so _prepare_ahead can run it early — network-
-        only, no decoder yet (see _DECODER_PREP_LEAD_SECONDS for why
-        that's spawned separately, later). Silent on failure (just a
-        debug log) and touches none of the active-track state
-        (_resolving, _current_decoder, _skip_pending) — this request
-        isn't active yet, so a failure here isn't a user-facing event;
-        _play_one_inner will notice nothing was prepared and resolve it
-        fresh, with its usual chat notification if that fails too."""
+    def _feed_loop_starts_head_itself(self) -> bool:
+        """True while the player is idle and the feed loop will start the first queued song within
+        a tick: preparing that one here as well would only duplicate what it is about to do."""
+        return (
+            not self._paused
+            and self._now_playing is None
+            and self._active_request is None
+            and not (self._pause_when_no_listeners and not self._subscribers)
+        )
+
+    def _fresh_resolved(self, request: QueuedRequest) -> _ResolvedAhead | None:
+        entry = self._resolved.get(id(request))
+        if entry is None or entry.request is not request:
+            return None
+        if time.monotonic() - entry.at > _RESOLVED_MAX_AGE_SECONDS:
+            return None
+        return entry
+
+    def _prune(self, live: list[QueuedRequest]) -> None:
+        """Drops preparation that no longer fits the queue: songs that left it, decoders that died
+        or grew old, and warm decoders of songs that are no longer among the first in line."""
+        now = time.monotonic()
+        live_ids = {id(r) for r in live}
+        warm_ids = {id(r) for r in live[:_WARM_AHEAD]}
+        for key in [
+            k
+            for k, e in self._resolved.items()
+            if k not in live_ids or now - e.at > _RESOLVED_MAX_AGE_SECONDS
+        ]:
+            del self._resolved[key]
+        for key in [k for k in self._prep_attempts if k not in live_ids]:
+            del self._prep_attempts[key]
+        for key, entry in list(self._warm.items()):
+            if (
+                key not in warm_ids
+                or not self._decoder_usable(entry.decoder)
+                or now - entry.ready_at > _WARM_MAX_AGE_SECONDS
+            ):
+                self._discard_warm(entry.request)
+
+    async def _prepare_pass(self) -> bool:
+        """One step of preparation, nearest song first. Returns True when it did work, so the loop
+        goes round again at once; False when everything wanted is done (or waiting to be retried).
+
+        The first _WARM_AHEAD queued songs are made ready (resolved, decoder running, first chunk
+        read); the next ones up to _RESOLVE_AHEAD only get their stream address. It looks at the
+        queue afresh after every step, so a request that jumps ahead, or a skip, changes what is
+        prepared next. Whatever is warm is used when its song's turn comes (see _play_one_inner)
+        and is what makes skip() safe."""
+        live = self._live_pending()
+        self._prune(live)
+        if self._paused:
+            return False
+        now = time.monotonic()
+        idle_head = self._feed_loop_starts_head_itself()
+        for index, request in enumerate(live[:_RESOLVE_AHEAD]):
+            if index == 0 and idle_head:
+                continue
+            if self._prep_attempts.get(id(request), (0, 0.0))[1] > now:
+                continue
+            warm = index < _WARM_AHEAD
+            if warm and self.is_ready(request):
+                continue
+            if not warm and self._fresh_resolved(request) is not None:
+                continue
+            await self._prepare_one(request, warm=warm)
+            return True
+        if not live:
+            return await self._prepare_radio_pick()
+        return False
+
+    async def _prepare_one(self, request: QueuedRequest, *, warm: bool) -> None:
+        key = id(request)
+        resolved = self._fresh_resolved(request)
+        if resolved is None:
+            track, problem = await self._resolve_ahead(request)
+            if request.cancelled or not self._is_queued(request):
+                return  # it left the queue while we were looking it up
+            if track is None:
+                await self._prep_failed(request, problem)
+                return
+            resolved = _ResolvedAhead(request=request, track=track, at=time.monotonic())
+            self._resolved[key] = resolved
+            if not warm:
+                self._prep_attempts.pop(key, None)
+                return
+        if not warm:
+            return
+        entry = await self._spawn_ahead(request, resolved.track)
+        in_window = any(r is request for r in self._live_pending()[:_WARM_AHEAD])
+        if entry is None:
+            self._resolved.pop(key, None)  # the address may be what is wrong: look it up again
+            if in_window:
+                await self._prep_failed(request, "unavailable")
+            return
+        if not in_window or request.cancelled or key in self._warm:
+            self._fire_and_forget(
+                _reap(entry.decoder), name="radio-player-reap"
+            )  # the line changed meanwhile
+            return
+        entry.ready_at = time.monotonic()
+        self._warm[key] = entry
+        self._prep_attempts.pop(key, None)
+        self._prep_progress.set()
+
+    async def _prep_failed(self, request: QueuedRequest, problem: str | None) -> None:
+        """A queued song could not be prepared. Transient trouble is retried a few times with a
+        pause in between; a song that turns out to be a livestream or too long is dropped at once.
+        A song that finally cannot be prepared leaves the queue with the same notice it would have
+        got at play time, so one broken entry never holds up the ones behind it - or a skip."""
+        key = id(request)
+        definitive = problem in ("live", "too_long")
+        attempts = _PREP_ATTEMPTS if definitive else self._prep_attempts.get(key, (0, 0.0))[0] + 1
+        if attempts < _PREP_ATTEMPTS:
+            delay = _PREP_RETRY_DELAYS[min(attempts - 1, len(_PREP_RETRY_DELAYS) - 1)]
+            self._prep_attempts[key] = (attempts, time.monotonic() + delay)
+            return
+        notices = {
+            "live": f"Skipped {request.requester_name}'s song — it's a livestream now.",
+            "too_long": f"Skipped {request.requester_name}'s song — it's too long to play now.",
+        }
+        message = notices.get(problem or "", f"Couldn't load {request.requester_name}'s song — skipping it.")
+        log.warning(
+            "Dropping %s from the queue: it could not be prepared (%s).", request.webpage_url, problem
+        )
+        removed = self.purge_pending(lambda r: r is request)
+        if removed:
+            if request.requester_id != 0:
+                await self._notify_failed(message)
+            else:
+                counters.record("tracks_failed")  # radio-mix filler: nobody asked for it, nobody is told
+
+    async def _prepare_radio_pick(self) -> bool:
+        """With nothing queued, asks the radio mix for the next song - shortly before the current
+        one ends, or at once when a skip is waiting for something to follow."""
+        if self._radio_suggest is None:
+            return False
+        near_end = (
+            self._current_decoder is not None
+            and self._now_playing is not None
+            and self._now_playing.duration > 0
+            and self._remaining_seconds(self._now_playing.duration) <= _PREFETCH_LEAD_SECONDS
+        )
+        if not (near_end or self._radio_pick_wanted) or self._radio_fill_task is not None:
+            return False
+        if time.monotonic() - self._radio_fill_failed_at < _RADIO_RETRY_BACKOFF_SECONDS:
+            return False
+        picked = await self._get_radio_pick()
+        if picked is None:
+            return False
+        if self._pending:
+            return True  # a request (or the idle backstop) filled the queue while we asked
+        self.enqueue(picked)
+        log.info("Radio autoplay queued: %s", picked.title)
+        return True
+
+    async def _resolve_ahead(self, request: QueuedRequest) -> tuple[Track | None, str | None]:
+        """The resolve+validate half of what _play_one_inner runs inline, run early. Network
+        only, no decoder. Returns the track, or None with what was wrong: "live", "too_long",
+        "unavailable" (nothing found) or "error" (the lookup itself failed, worth retrying). Touches
+        none of the active-track state (_resolving, _current_decoder, _skip_pending): this request
+        isn't active yet, so a failure here is no user-facing event until _prep_failed says so."""
         try:
             track = await self._resolver(request.webpage_url, request.requester_id)
         except asyncio.CancelledError:
             raise
         except Exception:
             log.debug("Prepare-ahead resolve failed for %s (non-fatal).", request.webpage_url, exc_info=True)
-            return None
-        if track is None or track.is_live or request.cancelled:
-            return None
+            return None, "error"
+        if track is None:
+            return None, "unavailable"
+        if track.is_live:
+            return None, "live"
         duration_limit = await self._current_duration_limit()
         if 0 < duration_limit < track.duration:
-            return None
-        return track
+            return None, "too_long"
+        return track, None
 
     async def _spawn_ahead(self, request: QueuedRequest, track: Track) -> _PreparedNext | None:
         """The decoder-spawn+first-chunk half — see _resolve_ahead."""
@@ -1439,20 +1746,17 @@ class RadioPlayer:
             return result
         finally:
             if decoder is not None:
-                with contextlib.suppress(ProcessLookupError):
-                    decoder.kill()
-                with contextlib.suppress(Exception):
-                    await decoder.wait()
+                await _reap(decoder)
 
     def _maybe_start_radio_fill(self) -> None:
         """Kicks off a background radio-suggestion lookup when the queue is
         empty and nothing's already in flight — _feed_loop's idle-branch
-        backstop for whenever _prepare_ahead's own attempt (above) didn't
+        backstop for whenever _prepare_radio_pick's own attempt (above) didn't
         run or didn't catch it in time (e.g. a track too short for
         _PREFETCH_LEAD_SECONDS to matter, or radio toggled on mid-track).
         Guarded so the two can't double-queue a pick.
 
-        _feed_loop can never reach this while paused, but _prepare_ahead
+        _feed_loop can never reach this while paused, but the preparation loop
         is a background task scheduled minutes earlier and could still
         fire mid-pause, so the guard is repeated here too."""
         if self._paused or self._radio_fill_task is not None or self._pending:
@@ -1474,7 +1778,7 @@ class RadioPlayer:
 
     async def _get_radio_pick(self) -> QueuedRequest | None:
         """The actual "ask for one radio-autoplay suggestion" step, shared
-        by _run_radio_fill's fire-and-forget backstop and _prepare_ahead's
+        by _run_radio_fill's fire-and-forget backstop and _prepare_radio_pick's
         own direct attempt at a gapless autoplay transition. None (and the
         retry backoff armed) covers everything from "radio's off" to a
         failed lookup."""
@@ -1506,16 +1810,24 @@ class RadioPlayer:
         return 0
 
     async def _play_one_inner(self, request: QueuedRequest) -> None:
-        prepared, self._prepared = self._prepared, None
-        if prepared is not None and (prepared.request is not request or request.cancelled):
-            # Belonged to a different track than the one actually about to
-            # play — a real request preempted it, or it was cancelled
-            # while sitting ready. Not usable; free it and fall through to
-            # resolving `request` fresh below, same as if nothing had
-            # been prepared at all.
-            with contextlib.suppress(ProcessLookupError):
-                prepared.decoder.kill()
+        key = id(request)
+        prepared = self._warm.pop(key, None)
+        resolved = self._resolved.pop(key, None)
+        self._prep_attempts.pop(key, None)
+        if prepared is not None and (
+            prepared.request is not request or request.cancelled or not self._decoder_usable(prepared.decoder)
+        ):
+            # Cancelled while sitting ready, or the decoder died while it waited. Not usable: free
+            # it and fall through to resolving `request` fresh below, as if nothing had been prepared.
+            self._fire_and_forget(_reap(prepared.decoder), name="radio-player-reap")
             prepared = None
+        reusable: Track | None = None
+        if (
+            resolved is not None
+            and resolved.request is request
+            and time.monotonic() - resolved.at <= _RESOLVED_MAX_AGE_SECONDS
+        ):
+            reusable = resolved.track  # looked up ahead of time; only the decoder is missing
 
         if prepared is not None:
             await self._start_and_stream(prepared.track, prepared.decoder, prepared.first_chunk, request)
@@ -1531,7 +1843,7 @@ class RadioPlayer:
         self._resolving = True
         try:
             try:
-                track = await self._resolver(request.webpage_url, request.requester_id)
+                track = reusable or await self._resolver(request.webpage_url, request.requester_id)
             except Exception:
                 log.exception("Failed to re-resolve queued request: %s", request.webpage_url)
                 await self._notify_failed(f"Couldn't load {request.requester_name}'s song — skipping it.")
@@ -1567,9 +1879,7 @@ class RadioPlayer:
             if self._skip_pending:
                 self._skip_pending = False
                 log.info("Skipped %s right after its decoder started (mid-spawn skip).", track.title)
-                with contextlib.suppress(ProcessLookupError):
-                    decoder.kill()
-                await decoder.wait()
+                await _reap(decoder)
                 self._current_decoder = None
                 decoder = None
                 return
@@ -1583,9 +1893,7 @@ class RadioPlayer:
                 await self._notify_failed(
                     f"Skipped {request.requester_name}'s song — it took too long to start."
                 )
-                with contextlib.suppress(ProcessLookupError):
-                    decoder.kill()
-                await decoder.wait()
+                await _reap(decoder)
                 self._current_decoder = None
                 decoder = None
                 return
@@ -1608,7 +1916,7 @@ class RadioPlayer:
     ) -> None:
         """Common tail for both playback paths — a freshly resolved-and-
         spawned track (the slow path above) and one handed off from
-        self._prepared (the gapless path) arrive here identically: a
+        self._warm (the gapless path) arrive here identically: a
         track, a live decoder, and its first chunk already in hand."""
         assert decoder.stdout is not None
         stdout = decoder.stdout
@@ -1636,14 +1944,11 @@ class RadioPlayer:
         self._fire_and_forget(
             self._announce_now_playing(request, track), name="radio-player-announce-now-playing"
         )
-        if self._prefetch_enabled:
-            self._prefetch_task = asyncio.create_task(
-                self._prepare_ahead(track.duration), name="radio-player-prepare-ahead"
-            )
+        self._prep_event.set()  # a place in line opened up: prepare whatever moved to the front
 
         try:
             chunk = first_chunk
-            while chunk:
+            while chunk and decoder is not self._cut:
                 await self._write_pcm(chunk)
                 self._played_bytes += len(chunk)
                 await self._pace(len(chunk) / _BYTES_PER_SECOND)
@@ -1667,10 +1972,10 @@ class RadioPlayer:
             # Recorded first: this is the moment the song's last audio went out, which is what
             # the audible timeline (and so the overlay) counts from.
             self._set_now_playing(None)
-            with contextlib.suppress(ProcessLookupError):
-                decoder.kill()
-            await decoder.wait()
+            await _reap(decoder)
             self._current_decoder = None
+            if self._cut is decoder:
+                self._cut = None
 
     async def _announce_now_playing(self, request: QueuedRequest, track: Track) -> None:
         counters.record("tracks_played")

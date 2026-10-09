@@ -29,10 +29,10 @@ import aiohttp
 
 from twitch_radio.admin.app import run_admin_server
 from twitch_radio.chatbot import TwitchChatBot
-from twitch_radio.config import MODE_PLAYER, Settings, token_status
+from twitch_radio.config import Settings, token_status
 from twitch_radio.extraction import Resolver, UnsupportedSourceError
 from twitch_radio.lookahead import RadioLookahead
-from twitch_radio.player import QueuedRequest, RadioPlayer
+from twitch_radio.player import SKIP_NOT_READY_MESSAGE, QueuedRequest, RadioPlayer, SkipResult
 from twitch_radio.radio import RadioSuggester
 from twitch_radio.store import JsonStore
 from twitch_radio.telemetry import counters
@@ -156,8 +156,16 @@ class BotRuntime:
         log.info("Stopping: %s", reason)
         self._stop.set()
 
-    def skip(self) -> bool:
-        return bool(self._player and self._player.skip_current())
+    async def skip(self) -> dict[str, Any]:
+        """Skips the current song once the next one is ready (see RadioPlayer.skip). The answer
+        says which: `ok` is True only when a song was actually skipped."""
+        if self._player is None:
+            return {"ok": False, "result": SkipResult.NOTHING_PLAYING.value}
+        result = await self._player.skip()
+        reply: dict[str, Any] = {"ok": result is SkipResult.SKIPPED, "result": result.value}
+        if result is SkipResult.NOT_READY:
+            reply["error"] = SKIP_NOT_READY_MESSAGE
+        return reply
 
     def pause(self) -> bool:
         return bool(self._player and self._player.pause())
@@ -287,7 +295,7 @@ class BotRuntime:
                 hint="Another copy of the bot (or another program) is using it. Close it, "
                 "or change the port in Settings > Network.",
             )
-        if s.mode != MODE_PLAYER and port_in_use("127.0.0.1", OAUTH_PORT):
+        if port_in_use("127.0.0.1", OAUTH_PORT):
             raise StartupError(
                 f"Port {OAUTH_PORT} (Twitch sign-in) is already in use.",
                 code=EXIT_CONFIG,
@@ -307,7 +315,6 @@ class BotRuntime:
             resolver=self._resolver.resolve,
             audio_bitrate_kbps=s.audio_bitrate_kbps,
             pause_when_no_listeners=s.pause_when_no_listeners,
-            prefetch_enabled=s.ytdlp_cache_ttl_seconds > 0,
             overlay_delay_seconds=s.overlay_delay_seconds,
         )
         suggester = RadioSuggester(self._resolver)
@@ -375,18 +382,6 @@ class BotRuntime:
                 hint="Change the port in Settings > Network.",
             ) from exc
         if self._stop.is_set():
-            return
-
-        if s.mode == MODE_PLAYER:
-            # A plain music player: nothing connects to Twitch, nothing needs signing in to.
-            async def _say(message: str) -> None:
-                if "Now Playing" not in message:  # the player already logs what it starts
-                    log.info("%s", message)
-
-            player.set_track_failure_notifier(_say)
-            self._set_phase("running")
-            log.info("Music player is ready. Add a song from the dashboard.")
-            await self._stop.wait()
             return
 
         bot = self._bot = TwitchChatBot(
@@ -612,11 +607,12 @@ class BotRuntime:
                 "listeners": player.listener_count,
                 "encoder_running": player.encoder_running,
                 "encoder_starts": player.encoder_starts,
+                # False while the next song is still being prepared: a skip would be refused.
+                "next_ready": player.next_ready,
             }
         base = f"http://{LOCAL_HOST}:{s.nowplaying_port}"
         return {
             "t": "state",
-            "mode": s.mode,
             "phase": self._phase,
             "uptime": round(time.monotonic() - self._started_at, 1),
             "player": player_info,

@@ -13,7 +13,7 @@ const fs = require('fs');
 const readline = require('readline');
 const { spawn, execFile } = require('child_process');
 const { checkForAppUpdate, shouldAutoCheck, shouldAutoCheckYtdlp } = require('./updates');
-const { cleanQuery, normalizeLookahead, isTheme, isMode, isSkin, normalizeVolume, VOLUME_DEFAULT } = require('./validate');
+const { cleanQuery, normalizeLookahead, isTheme, isSkin } = require('./validate');
 const { windowColorsFor, resolveTheme } = require('./theme');
 
 const IS_WIN = process.platform === 'win32';
@@ -35,7 +35,6 @@ const DEFAULT_PREFS = {
   startBotOnLaunch: false,
   theme: 'system', // 'system' | 'light' | 'dark'
   skin: 'default', // colour style, see renderer/skins.js
-  volume: VOLUME_DEFAULT, // Music player mode, 0 to 1
   launchAtLogin: false,
   checkAppUpdates: true, // at most once a day
   checkYtdlpOnStartup: true,
@@ -48,6 +47,7 @@ let prefs = { ...DEFAULT_PREFS };
 function loadPrefs() {
   try {
     prefs = { ...DEFAULT_PREFS, ...JSON.parse(fs.readFileSync(prefsFile(), 'utf8')) };
+    delete prefs.volume; // left by the removed music player mode
     if (!isTheme(prefs.theme)) prefs.theme = DEFAULT_PREFS.theme;
     if (!isSkin(prefs.skin)) prefs.skin = DEFAULT_PREFS.skin;
   } catch {
@@ -182,7 +182,6 @@ function setPhase(phase) {
   if (core.phase === phase) return;
   core.phase = phase;
   broadcastStatus();
-  syncAudioHost();
 }
 function broadcastStatus() {
   send('bot:status', status());
@@ -260,7 +259,6 @@ function onCoreLine(line) {
     case 'state':
       core.lastState = msg;
       send('bot:state', msg);
-      syncAudioHost();
       break;
     case 'fatal':
       core.fatal = { message: msg.message, hint: msg.hint, code: msg.code };
@@ -391,7 +389,7 @@ function updateWatching(force = false) {
 
 // ------------------------------------------------------- configuration ---
 const ENV_KEYS = new Set([
-  'RADIO_MODE', 'OVERLAY_DELAY_SECONDS',
+  'OVERLAY_DELAY_SECONDS',
   'TWITCH_CLIENT_ID', 'TWITCH_CLIENT_SECRET', 'TWITCH_BOT_ID', 'TWITCH_OWNER_ID',
   'AUDIO_BITRATE_KBPS', 'PAUSE_QUEUE_WHEN_NO_LISTENERS', 'TWITCH_NOWPLAYING_PORT',
   'YTDLP_COOKIES_FILE', 'YTDLP_CONCURRENCY', 'YTDLP_WORKER_IDLE_SECONDS', 'YTDLP_EXTRACT_TIMEOUT_SECONDS',
@@ -617,73 +615,6 @@ function send(channel, payload) {
 function currentWindowColors() {
   return windowColorsFor(prefs.skin, resolveTheme(prefs.theme, nativeTheme.shouldUseDarkColors));
 }
-// ------------------------------------------------------------------ mode ---
-// "twitch": the song-request bot (chat, OBS audio source, overlay). "player": a plain music player
-// that plays through this PC's speakers. The core reads RADIO_MODE from the .env when it starts, so a
-// change restarts a running bot.
-let currentMode = 'twitch';
-async function loadMode() {
-  const result = await runCore(['--env-json']);
-  const values = lastJsonLine(result.stdout) || {};
-  currentMode = isMode(values.RADIO_MODE) ? values.RADIO_MODE : 'twitch';
-}
-async function setMode(mode) {
-  if (!isMode(mode)) return { ok: false, error: 'Unknown mode.' };
-  if (mode === currentMode) return { ok: true, mode };
-  const wasRunning = core.phase === 'running' || core.phase === 'starting';
-  if (core.child) await stopBot();
-  const result = await runCore(['--env-update-stdin'], JSON.stringify({ RADIO_MODE: mode }));
-  if (result.code !== 0) return { ok: false, error: (result.stderr || '').trim() || "Couldn't switch the mode." };
-  currentMode = mode;
-  lastPreflight = null; // what is required differs between the modes
-  guiLog('INFO', `Mode: ${mode === 'player' ? 'Music player' : 'Twitch bot'}.`);
-  send('app:mode', mode);
-  refreshTray();
-  if (wasRunning) startBot();
-  return { ok: true, mode };
-}
-
-// Music player mode plays the radio's own stream in a hidden window of the app, so the sound goes
-// on when the main window is closed to the tray. The window exists only while the player runs.
-let audioWin = null;
-let audioBase = '';
-function applyVolume() {
-  if (!audioWin || audioWin.isDestroyed()) return;
-  audioWin.webContents.executeJavaScript(`window.setVolume && window.setVolume(${normalizeVolume(prefs.volume)})`).catch(() => {});
-}
-function closeAudioHost() {
-  if (audioWin && !audioWin.isDestroyed()) audioWin.destroy();
-  audioWin = null;
-  audioBase = '';
-}
-function syncAudioHost() {
-  const http = core.lastState && core.lastState.http;
-  if (currentMode !== 'player' || core.phase !== 'running' || !http || !http.up || !http.base) {
-    closeAudioHost();
-    return;
-  }
-  if (audioWin && !audioWin.isDestroyed() && audioBase === http.base) return;
-  closeAudioHost();
-  audioBase = http.base;
-  audioWin = new BrowserWindow({
-    show: false,
-    width: 1,
-    height: 1,
-    skipTaskbar: true,
-    webPreferences: {
-      sandbox: true,
-      contextIsolation: true,
-      nodeIntegration: false,
-      autoplayPolicy: 'no-user-gesture-required',
-      backgroundThrottling: false,
-    },
-  });
-  audioWin.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
-  audioWin.webContents.on('will-navigate', (event) => event.preventDefault());
-  audioWin.webContents.on('did-finish-load', applyVolume);
-  audioWin.loadURL(`${http.base}/player`).catch((error) => guiLog('WARNING', `The audio player could not load: ${error.message}`));
-}
-
 /**
  * Applies the Appearance setting. nativeTheme.themeSource makes the page's prefers-color-scheme
  * follow it (the stylesheet has a dark and a light palette and nothing else), and the window's own
@@ -820,13 +751,6 @@ function refreshTray() {
       { label: 'Start', enabled: !core.child, click: () => startBot() },
       { label: 'Stop', enabled: running, click: () => stopBot() },
       { type: 'separator' },
-      {
-        label: 'Mode',
-        submenu: [
-          { label: 'Twitch bot', type: 'radio', checked: currentMode === 'twitch', click: () => setMode('twitch') },
-          { label: 'Music player', type: 'radio', checked: currentMode === 'player', click: () => setMode('player') },
-        ],
-      },
       { label: 'Dark mode', type: 'checkbox', checked: nativeTheme.shouldUseDarkColors, click: () => toggleTheme() },
       { type: 'separator' },
       { label: 'Quit', click: () => app.quit() },
@@ -904,8 +828,6 @@ function registerIpc() {
   ipcMain.handle('config:saveLive', (_e, payload) => saveLive(payload));
 
   ipcMain.handle('window:hideToTray', () => hideToTray());
-  ipcMain.handle('mode:get', () => currentMode);
-  ipcMain.handle('mode:set', (_e, mode) => setMode(mode));
 
   ipcMain.handle('prefs:get', () => prefs);
   ipcMain.handle('prefs:set', (_e, patch) => {
@@ -914,10 +836,8 @@ function registerIpc() {
     }
     if (!isTheme(prefs.theme)) prefs.theme = DEFAULT_PREFS.theme;
     if (!isSkin(prefs.skin)) prefs.skin = DEFAULT_PREFS.skin;
-    prefs.volume = normalizeVolume(prefs.volume);
     savePrefs();
     applyTheme();
-    applyVolume();
     if (app.isPackaged && (IS_WIN || process.platform === 'darwin')) app.setLoginItemSettings({ openAtLogin: !!prefs.launchAtLogin, args: ['--hidden'] });
     return prefs;
   });
@@ -979,7 +899,6 @@ if (!app.requestSingleInstanceLock()) {
   app.whenReady().then(async () => {
     loadPrefs();
     applyTheme();
-    await loadMode();
     nativeTheme.on('updated', () => {
       syncWindowColors();
       refreshTray();

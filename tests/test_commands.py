@@ -15,6 +15,7 @@ from twitchio import Chatter
 from twitchio.ext import commands
 
 from twitch_radio.components.song_requests import SongRequestComponent
+from twitch_radio.player import SKIP_NOT_READY_MESSAGE, SkipResult
 from twitch_radio.store import JsonStore
 from twitch_radio.toggles import FeatureToggles
 
@@ -32,7 +33,9 @@ def _chatter(user_id: int = 100, *, moderator: bool = False, broadcaster: bool =
 def _make(tmp_path: Path, *, active_requester_id: int | None = None, queued: list | None = None):
     player = MagicMock()
     player.active_requester_id = active_requester_id
-    player.skip_current.return_value = active_requester_id is not None
+    player.skip = AsyncMock(
+        return_value=SkipResult.SKIPPED if active_requester_id is not None else SkipResult.NOTHING_PLAYING
+    )
     player.queued_items.return_value = queued or []
     player.apply_radio_lookahead = AsyncMock()
     bot = SimpleNamespace(
@@ -74,7 +77,7 @@ def test_requester_can_skip_their_own_song(tmp_path: Path) -> None:
     async def go() -> None:
         component, bot = _make(tmp_path, active_requester_id=100)
         await component.skip.callback(component, _ctx(_chatter(100)))
-        bot.player.skip_current.assert_called_once()
+        bot.player.skip.assert_awaited_once()
         assert "Skipped" in _reply_text(bot)
 
     run(go())
@@ -84,7 +87,7 @@ def test_other_viewer_cannot_skip(tmp_path: Path) -> None:
     async def go() -> None:
         component, bot = _make(tmp_path, active_requester_id=100)
         await component.skip.callback(component, _ctx(_chatter(200)))
-        bot.player.skip_current.assert_not_called()
+        bot.player.skip.assert_not_awaited()
         assert "only skip your own" in _reply_text(bot)
 
     run(go())
@@ -95,7 +98,7 @@ def test_mod_and_broadcaster_can_skip_anything(tmp_path: Path, role: str) -> Non
     async def go() -> None:
         component, bot = _make(tmp_path, active_requester_id=100)
         await component.skip.callback(component, _ctx(_chatter(200, **{role: True})))
-        bot.player.skip_current.assert_called_once()
+        bot.player.skip.assert_awaited_once()
         assert "Skipped" in _reply_text(bot)
 
     run(go())
@@ -105,8 +108,19 @@ def test_skip_with_nothing_playing(tmp_path: Path) -> None:
     async def go() -> None:
         component, bot = _make(tmp_path, active_requester_id=None)
         await component.skip.callback(component, _ctx(_chatter(100)))
-        bot.player.skip_current.assert_not_called()
+        bot.player.skip.assert_not_awaited()
         assert "Nothing's playing" in _reply_text(bot)
+
+    run(go())
+
+
+def test_a_refused_skip_tells_the_viewer_the_song_keeps_playing(tmp_path: Path) -> None:
+    async def go() -> None:
+        component, bot = _make(tmp_path, active_requester_id=100)
+        bot.player.skip.return_value = SkipResult.NOT_READY
+        await component.skip.callback(component, _ctx(_chatter(100)))
+        assert _reply_text(bot) == SKIP_NOT_READY_MESSAGE
+        assert "Skipped" not in _reply_text(bot)
 
     run(go())
 

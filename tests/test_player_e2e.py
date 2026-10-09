@@ -347,3 +347,111 @@ def test_no_silence_between_songs_even_when_the_reported_duration_is_wrong(tmp_p
 
 def run_long(coro: Awaitable[Any]) -> Any:
     return asyncio.run(asyncio.wait_for(coro, timeout=90))  # type: ignore[arg-type]
+
+
+def _production_player(env: Env, names: list[str], seconds: int, **kwargs: Any) -> RadioPlayer:
+    tracks = {name: env.track(name, seconds) for name in names}
+
+    async def resolver(query: str, requester_id: int) -> Track | None:
+        return tracks.get(query.rsplit("/", 1)[-1])
+
+    return RadioPlayer(resolver=resolver, audio_bitrate_kbps=96, prefetch_enabled=True, **kwargs)
+
+
+def test_skip_goes_straight_to_the_song_that_was_prepared_while_the_first_one_played(tmp_path: Path) -> None:
+    """Songs are prepared when they are queued, not shortly before the current one ends, so a skip a
+    few seconds into the first song lands on a ready one: no gap, no encoder restart."""
+    names = ["a.webm", "b.webm", "c.webm"]
+    for name in names:
+        make_audio(tmp_path / name, 30)
+
+    async def scenario() -> None:
+        async with Env(tmp_path) as env:
+            player = _production_player(env, names, 30)
+            player.start()
+            try:
+                queue = player.subscribe()
+
+                async def drain() -> None:
+                    while True:
+                        await queue.get()
+
+                drainer = asyncio.create_task(drain())
+                for name in names:
+                    player.enqueue(request(name))
+                await until(lambda: player.now_playing is not None and player.now_playing.title == "a.webm")
+                await until(lambda: player.next_ready, timeout=10)  # b is warm long before a is near its end
+                started = asyncio.get_running_loop().time()
+                assert await player.skip() is player_mod.SkipResult.SKIPPED
+                await until(
+                    lambda: player.now_playing is not None and player.now_playing.title == "b.webm", timeout=3
+                )
+                assert asyncio.get_running_loop().time() - started < 2.0
+                assert player.encoder_starts == 1
+                drainer.cancel()
+            finally:
+                await player.stop()
+
+    run(scenario())
+
+
+def test_rapid_skips_never_get_ahead_of_the_audio(tmp_path: Path) -> None:
+    """Hammering skip: every skip that is accepted lands on the next song, which really starts; the
+    ones that are refused leave the current song alone; and what the overlay shows never loses a song."""
+    names = [f"{c}.webm" for c in "abcdef"]
+    for name in names:
+        make_audio(tmp_path / name, 30)
+
+    async def scenario() -> None:
+        async with Env(tmp_path) as env:
+            player = _production_player(env, names, 30, overlay_delay_seconds=0.5)
+            player.start()
+            try:
+                queue = player.subscribe()
+
+                async def drain() -> None:
+                    while True:
+                        await queue.get()
+
+                drainer = asyncio.create_task(drain())
+                for name in names:
+                    player.enqueue(request(name))
+                await until(lambda: player.now_playing is not None and player.now_playing.title == "a.webm")
+
+                accepted = refused = 0
+                for _ in range(40):  # as fast as the answers come back, until the last song is reached
+                    assert player.now_playing is not None
+                    before = player.now_playing.title
+                    if before == names[-1]:
+                        break
+                    result = await player.skip(wait=0.3)
+                    if result is player_mod.SkipResult.SKIPPED:
+                        accepted += 1
+                        expected = names[names.index(before) + 1]
+                        await until(
+                            lambda e=expected: (
+                                player.now_playing is not None and player.now_playing.title == e
+                            ),
+                            timeout=5,
+                        )
+                    else:
+                        refused += 1
+                        assert result is player_mod.SkipResult.NOT_READY
+                        assert player.now_playing is not None and player.now_playing.title == before
+                    current = player.now_playing.title
+                    # nothing that has not played yet has disappeared from what listeners are shown
+                    view = player.audible_view()
+                    shown = {item.title for item in view.queue} | ({view.now.title} if view.now else set())
+                    assert set(names[names.index(current) :]) <= shown, (current, shown)
+                assert accepted >= 1
+                final = player.now_playing
+                assert final is not None and final.title == names[accepted], (
+                    "every accepted skip moved on by exactly one song"
+                )
+                assert player.queue_size() == len(names) - 1 - accepted
+                assert player.encoder_starts == 1
+                drainer.cancel()
+            finally:
+                await player.stop()
+
+    run(scenario())

@@ -68,37 +68,8 @@
   }
   const running = () => status.phase === 'running' || status.phase === 'starting';
 
-  // ------------------------------------------------------- mode & appearance ---
-  // The title bar holds the two things worth reaching in one click: which job the app is doing (a
-  // Twitch bot, or a plain music player) and light or dark.
-  let mode = 'twitch';
-  function renderMode() {
-    document.body.dataset.mode = mode;
-    for (const button of $$('#modeSwitch button')) button.setAttribute('aria-pressed', String(button.dataset.mode === mode));
-    renderDashboard();
-    renderSetup();
-  }
-  $('#modeSwitch').addEventListener('click', async (event) => {
-    const button = event.target.closest('button[data-mode]');
-    if (!button || button.dataset.mode === mode) return;
-    const switcher = $('#modeSwitch');
-    switcher.classList.add('busy'); // a running bot restarts to change mode: don't stack clicks
-    try {
-      const result = await api.setMode(button.dataset.mode);
-      if (result && result.ok) {
-        mode = result.mode;
-        renderMode();
-        toast(mode === 'player' ? 'Music player: songs you add play through this PC.' : 'Twitch bot: requests come from chat.', 'ok');
-      } else {
-        toast((result && result.error) || "Couldn't switch the mode.", 'err');
-      }
-    } catch (error) {
-      toast(`Couldn't switch the mode: ${error.message}`, 'err');
-    } finally {
-      switcher.classList.remove('busy');
-    }
-  });
-
+  // ------------------------------------------------------------ appearance ---
+  // The title bar keeps light or dark one click away; Settings > Appearance has System and the colour styles.
   const darkQuery = window.matchMedia('(prefers-color-scheme: dark)');
   // A colour style (renderer/skins.js) overrides some of the palette's variables on <html>; which values
   // depends on light or dark, so this runs again whenever that changes.
@@ -132,13 +103,6 @@
   });
 
   $('#btnTray').addEventListener('click', () => api.hideToTray());
-
-  let volumeTimer = 0;
-  $('#volume').addEventListener('input', (event) => {
-    clearTimeout(volumeTimer);
-    const volume = Number(event.target.value) / 100;
-    volumeTimer = setTimeout(() => api.setPrefs({ volume }).then((next) => (prefs = next)), 120);
-  });
 
   // --------------------------------------------------------------- tabs ---
   let currentTab = 'dashboard';
@@ -243,9 +207,7 @@
     const items = [];
     const add = (name, state, value) => items.push({ name, state, value });
 
-    if (mode === 'player') {
-      // a music player has no chat to connect to
-    } else if (!live) add('Twitch chat', 'idle', 'Offline');
+    if (!live) add('Twitch chat', 'idle', 'Offline');
     else if (s && s.chat.ready && s.chat.subscribed) add('Twitch chat', 'ok', 'Connected');
     else if (s && s.chat.ready) add('Twitch chat', 'warn', 'Waiting for sign-in');
     else add('Twitch chat', 'warn', 'Connecting…');
@@ -254,10 +216,8 @@
       if (tok.readable === false) add(name, 'err', 'Token file unreadable');
       else add(name, ok ? 'ok' : pre && pre.config_ok ? 'warn' : 'idle', ok ? 'Authorized' : 'Not authorized');
     };
-    if (mode !== 'player') {
-      signIn('Bot account sign-in', !!tok.bot);
-      signIn('Broadcaster sign-in', !!tok.owner);
-    }
+    signIn('Bot account sign-in', !!tok.bot);
+    signIn('Broadcaster sign-in', !!tok.owner);
 
     if (!live) add('Audio encoder', 'idle', 'Idle');
     else if (s && s.player.encoder_running) add('Audio encoder', s.player.encoder_starts > 1 ? 'warn' : 'ok', s.player.encoder_starts > 1 ? `Restarted ${s.player.encoder_starts - 1}×` : 'Running');
@@ -321,7 +281,7 @@
 
   function renderSetup() {
     const card = $('#setupCard');
-    if (!pre || mode === 'player') {
+    if (!pre) {
       card.hidden = true;
       return;
     }
@@ -517,12 +477,11 @@
     // now playing
     const np = live && s ? s.now : null;
     $('#nowTitle').textContent = np ? np.title : live ? 'Waiting for a request…' : 'Nothing playing';
-    const asPlayer = mode === 'player';
     $('#nowSub').textContent = np
       ? np.uploader || ''
       : live
-        ? asPlayer ? 'Search for a song above and add it.' : 'Add a song above, or type !sr <song or link> in your chat.'
-        : asPlayer ? 'Press Start, then search for a song above.' : 'Start the bot, then add a song above or use !sr in chat.';
+        ? 'Add a song above, or type !sr <song or link> in your chat.'
+        : 'Start the bot, then add a song above or use !sr in chat.';
     const tags = $('#nowTags');
     tags.replaceChildren();
     if (np) {
@@ -544,6 +503,8 @@
     }
     $('#btnPause').textContent = s && s.player.paused ? 'Resume' : 'Pause';
     $('#btnSkip').disabled = !np;
+    // A skip only goes through once the next song is ready, so say so while it is still loading.
+    $('#btnSkip').title = np && s && s.player.next_ready === false ? 'The next song is still loading; skip will wait for it.' : '';
     $('#btnClear').disabled = !(live && s && s.queue_size > 0);
     $('#btnPause').disabled = !live;
     tickProgress();
@@ -767,7 +728,7 @@
       title: 'Audio & playback',
       fields: [
         { key: 'AUDIO_BITRATE_KBPS', label: 'Audio bitrate (kbps)', type: 'number', min: 64, max: 256, placeholder: '160', hint: 'Opus quality of the stream sent to OBS.' },
-        { key: 'OVERLAY_DELAY_SECONDS', label: 'Overlay delay (seconds)', type: 'number', min: 0, max: 15, placeholder: '4', hint: 'The overlay and dashboard trail the player by this much, to match what you hear (OBS buffers the stream). Raise it if they change before the sound does; lower it if they lag.' },
+        { key: 'OVERLAY_DELAY_SECONDS', label: 'Overlay delay (seconds)', type: 'number', min: 0, max: 15, placeholder: '4', hint: 'The overlay and dashboard trail the player by this much, to match what you hear (OBS buffers the stream). It only makes up for OBS: a skip waits for the next song to be ready on its own. Raise it if they change before the sound does; lower it if they lag.' },
         { key: 'PAUSE_QUEUE_WHEN_NO_LISTENERS', label: 'Pause when nobody is listening', type: 'bool', def: false, hint: 'Holds the queue while OBS has no audio source connected.' },
       ],
     },
@@ -785,7 +746,7 @@
         { key: 'YTDLP_CONCURRENCY', label: 'Parallel lookups', type: 'number', min: 1, max: 8, placeholder: '2', hint: 'The most lookups that may run at once. Each runs in its own process (roughly 50-100 MB) that is started when needed and exits when idle.' },
         { key: 'YTDLP_WORKER_IDLE_SECONDS', label: 'Lookup process idle exit (s)', type: 'number', min: 15, max: 3600, placeholder: '120', hint: 'How long an unused lookup process stays loaded before it frees its memory.' },
         { key: 'YTDLP_EXTRACT_TIMEOUT_SECONDS', label: 'Lookup timeout (s)', type: 'number', min: 10, max: 120, placeholder: '45' },
-        { key: 'YTDLP_CACHE_TTL_SECONDS', label: 'Result cache (s)', type: 'number', min: 0, max: 3600, placeholder: '900', hint: '0 turns caching and next-song prefetching off.' },
+        { key: 'YTDLP_CACHE_TTL_SECONDS', label: 'Result cache (s)', type: 'number', min: 0, max: 3600, placeholder: '900', hint: '0 turns caching off. Queued songs are still prepared ahead of time.' },
       ],
     },
     {
@@ -1181,8 +1142,6 @@
       renderLookahead();
     }).catch(() => {});
     $('#sideVersion').textContent = `v${appInfo.version}`;
-    mode = (await api.getMode()) || 'twitch';
-    $('#volume').value = String(Math.round((typeof prefs.volume === 'number' ? prefs.volume : 0.8) * 100));
     renderTheme();
     const current = await api.getStatus();
     status = current.status;
@@ -1192,7 +1151,8 @@
     unseenErrors = 0; // history from before the window opened isn't news
     renderBadge();
     renderStatus();
-    renderMode();
+    renderDashboard();
+    renderSetup();
 
     let lastPhase = status.phase;
     api.onStatus((next) => {
@@ -1207,12 +1167,6 @@
       snap = next;
       snapAt = Date.now();
       renderDashboard();
-    });
-    api.onMode((next) => {
-      // switched from the tray: the bot restarts, and what Settings requires changes with it
-      mode = next;
-      renderMode();
-      refreshPreflight(true);
     });
     api.onLogs(addLogs);
     // Nothing polls. The report is refreshed when something changed (start/stop, a save)
